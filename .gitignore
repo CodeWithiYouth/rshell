@@ -1,0 +1,16 @@
+# 构建产物
+build_cmake/
+build_tmp/
+build_tmp_out/
+build/
+out/
+cmake-build-*/
+
+# Python 测试产生的缓存
+__pycache__/
+*.pyc
+
+# IDE
+.vs/
+.vscode/
+*.user

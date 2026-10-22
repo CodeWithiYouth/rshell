@@ -1,0 +1,7 @@
+// rshell.rc - 应用资源
+//
+// 只放图标：exe 文件本身、任务栏、Alt+Tab、窗口标题栏都用这一份。
+// 图标是 tools/make_icon.py 生成的（多尺寸 ICO：16~256），改设计后重跑脚本即可。
+#include "resource.h"
+
+IDI_RSHELL ICON "res/rshell.ico"

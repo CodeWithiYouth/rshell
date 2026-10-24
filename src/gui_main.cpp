@@ -663,23 +663,25 @@ inline COLORREF toColorRef(std::uint32_t c) {
 
 // ---------------------------------------------------------------- 主题与绘制原语
 
-// 界面配色：与终端 ANSI 调色板同源（GitHub Dark 系），界面和终端不会割裂。
+// 界面配色：深石板灰底色，亮蓝用于文字/焦点，深蓝实心按钮保证白字对比度。
 // 全部是编译期常量，换主题只动这里。
 namespace ui {
 using std::uint32_t;
 
-constexpr uint32_t bgApp = 0x0C1018;       // 窗口底色
-constexpr uint32_t bgPanel = 0x151B27;     // 侧栏 / 标题栏
-constexpr uint32_t bgCard = 0x1B2332;      // 卡片
-constexpr uint32_t bgHover = 0x242E42;     // hover 叠加
-constexpr uint32_t bgActive = 0x293552;    // 选中叠加
-constexpr uint32_t border = 0x303C52;      // 常规描边
-constexpr uint32_t borderSoft = 0x222C3D;  // 弱描边
-constexpr uint32_t text = 0xE8EDF7;        // 主文字
-constexpr uint32_t textDim = 0xA6B2C8;     // 次要文字
-constexpr uint32_t textFaint = 0x8391AA;   // 提示文字
-constexpr uint32_t accent = 0x6574E8;      // 主色
-constexpr uint32_t accentDeep = 0x5060CF;  // 主色（按下）
+constexpr uint32_t bgApp = 0x0C121B;       // 窗口底色
+constexpr uint32_t bgPanel = 0x141E2B;     // 侧栏 / 标题栏
+constexpr uint32_t bgCard = 0x1E2C3E;      // 卡片 / 次级按钮
+constexpr uint32_t bgHover = 0x2B4059;     // 悬停
+constexpr uint32_t bgActive = 0x1E416B;    // 选中
+constexpr uint32_t border = 0x485E7B;      // 常规描边
+constexpr uint32_t borderSoft = 0x2C3D53;  // 弱描边
+constexpr uint32_t text = 0xF1F5FC;        // 主文字
+constexpr uint32_t textDim = 0xBDCADC;     // 次要文字
+constexpr uint32_t textFaint = 0x99ABC3;   // 提示文字
+constexpr uint32_t accent = 0x8AB8FF;      // 深色底上的强调文字 / 焦点
+constexpr uint32_t action = 0x2563EB;      // 实心主操作
+constexpr uint32_t actionHover = 0x2D6BEA; // 主操作悬停
+constexpr uint32_t actionPressed = 0x1D4ED8;
 constexpr uint32_t success = 0x61D5AC;
 constexpr uint32_t warn = 0xE5B76A;
 constexpr uint32_t danger = 0xF07888;
@@ -1831,8 +1833,8 @@ LRESULT CALLBACK terminalProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_KEYDOWN:
-            handleKeyDown(hwnd, wp, false);
-            return 0;
+            if (handleKeyDown(hwnd, wp, false)) return 0;
+            break;  // 未处理的按键交给默认窗口过程，供 IMM/TSF 输入法接管
         case WM_SYSKEYDOWN:
             // Alt+方向键等：先尝试发送到远端；Alt+F4 等交给系统
             if (handleKeyDown(hwnd, wp, true)) return 0;
@@ -2313,7 +2315,7 @@ void connectToSession(const Session& session, const std::wstring& password,
 namespace dlg {
 
 constexpr std::uint32_t bgCard = ui::bgPanel;  // 卡片底色
-constexpr std::uint32_t bgInput = 0x10141D;    // 输入框底色
+constexpr std::uint32_t bgInput = 0x0E1723;    // 输入框底色
 constexpr std::uint32_t bgBtn = ui::bgCard;   // 次级按钮
 
 HBRUSH editBrush() {
@@ -2431,23 +2433,25 @@ void paintButton(HDC dc, const RECT& rc, const std::wstring& label, bool primary
     std::uint32_t fg = 0;
     std::uint32_t border = 0;
     if (primary) {
-        bg = pressed ? ui::accentDeep : (hover ? ui::mix(ui::accent, 0xFFFFFF, 0.14) : ui::accent);
+        bg = pressed ? ui::actionPressed : (hover ? ui::actionHover : ui::action);
         fg = 0xFFFFFF;
+        border = ui::mix(ui::action, ui::accent, 0.35);
         if (!enabled) {
-            bg = ui::mix(ui::accent, bgCard, 0.65);
+            bg = ui::mix(ui::action, bgCard, 0.65);
             fg = ui::mix(0xFFFFFF, bgCard, 0.45);
+            border = ui::borderSoft;
         }
     } else {
         bg = pressed ? ui::mix(bgBtn, 0x000000, 0.2) : (hover ? ui::bgHover : bgBtn);
-        fg = enabled ? ui::text : ui::textFaint;
-        border = hover ? ui::border : 0;
+        fg = enabled ? ui::text : ui::mix(ui::textFaint, bgCard, 0.5);
+        border = enabled ? (hover ? ui::accent : ui::border) : ui::borderSoft;
     }
     fillRoundRect(dc, rc, dp(7), bg, border);
     if (focused && enabled) {
         // 只加一圈内描边，不能再用 fillRoundRect 的填充色（会盖成黑色）
         RECT inner = rc;
         InflateRect(&inner, -dp(2), -dp(2));
-        fillRoundRect(dc, inner, dp(5), bg, ui::mix(0xFFFFFF, bg, 0.45));
+        fillRoundRect(dc, inner, dp(5), bg, ui::accent);
     }
     drawText(dc, label, rc, fg, g_app.uiFontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 }
@@ -3290,7 +3294,7 @@ void paintCheckbox(HDC dc, const RECT& rc, const std::wstring& label, bool check
     const int top = rc.top + (rc.bottom - rc.top - box) / 2;
     const RECT boxRc{rc.left, top, rc.left + box, top + box};
     if (checked) {
-        fillRoundRect(dc, boxRc, dp(4), pressed ? ui::accentDeep : ui::accent, ui::accent);
+        fillRoundRect(dc, boxRc, dp(4), pressed ? ui::actionPressed : ui::action, ui::accent);
         HPEN pen = CreatePen(PS_SOLID, std::max<int>(1, dp(2)), toColorRef(0xFFFFFF));
         HGDIOBJ oldPen = SelectObject(dc, pen);
         POINT check[3] = {{boxRc.left + dp(4), boxRc.top + dp(8)},
@@ -3486,7 +3490,7 @@ MgrLayout mgrLayout() {
     l.labelSave = RECT{fieldX, actionY, l.remove.left - dp(12), actionY + dp(32)};
 
     const int bottomY = mgrHeight() - pad - dp(32);
-    l.btnNew = RECT{pad, bottomY, pad + dp(100), bottomY + dp(32)};
+    l.btnNew = RECT{pad, bottomY, pad + dp(120), bottomY + dp(32)};
     l.btnConnect = RECT{fieldRight - dp(96), bottomY, fieldRight, bottomY + dp(32)};
     l.btnClose = RECT{l.btnConnect.left - dp(10) - dp(84), bottomY, l.btnConnect.left - dp(10),
                       bottomY + dp(32)};
@@ -3956,10 +3960,10 @@ LRESULT CALLBACK sessionMgrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                  rc.bottom - rc.top, primary);
             };
             button(ID_MGR_BROWSE, L"浏览", l.browse);
-            button(ID_MGR_SAVE, L"保存", l.save, true);
+            button(ID_MGR_SAVE, L"保存", l.save);
             button(ID_MGR_DELETE, L"删除", l.remove);
             g_mgr.pwdClear = button(ID_MGR_CLEAR_PWD, L"清除密码", l.pwdClear);
-            button(ID_MGR_NEW, L"新建会话", l.btnNew);
+            button(ID_MGR_NEW, L"＋ 新建会话", l.btnNew, true);
             button(ID_MGR_CLOSE, L"关闭", l.btnClose);
             button(ID_MGR_CONNECT, L"连接", l.btnConnect, true);
 
@@ -6698,13 +6702,13 @@ void paintButtons(HDC dc) {
         const bool primarySolid = b.primary && !connected;
         if (primarySolid) {
             if (!enabled) {
-                bg = ui::mix(ui::accent, ui::bgApp, 0.62);
+                bg = ui::mix(ui::action, ui::bgApp, 0.62);
                 fg = ui::mix(0xFFFFFF, ui::bgApp, 0.35);
             } else if (pressed) {
-                bg = ui::accentDeep;
+                bg = ui::actionPressed;
                 fg = 0xFFFFFF;
             } else {
-                bg = hovered ? ui::mix(ui::accent, 0xFFFFFF, 0.14) : ui::accent;
+                bg = hovered ? ui::actionHover : ui::action;
                 fg = 0xFFFFFF;
             }
         } else if (b.primary) {
@@ -8308,12 +8312,10 @@ void applyDarkFrame(HWND hwnd) {
 void hardenProcess() {
     const auto setPolicy = wincompat::api().setMitigation;
     if (!setPolicy) return;  // Win7 不提供这些策略；不影响主密码保险库加密。
-    // 1) 禁用 AppInit_DLLs 等传统扩展点注入
-    PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY extension{};
-    extension.DisableExtensionPoints = 1;
-    setPolicy(ProcessExtensionPointDisablePolicy, &extension, sizeof(extension));
+    // 不启用 ProcessExtensionPointDisablePolicy：它会阻断自绘终端使用的
+    // IMM/TSF 兼容输入路径，导致微软拼音在终端中失效（原生 EDIT 仍可用）。
 
-    // 2) 禁止本进程生成/切换可执行内存：shellcode 注入后没法直接跑起来。
+    // 1) 禁止本进程生成/切换可执行内存：shellcode 注入后没法直接跑起来。
     //    该策略生效后不可撤销。rshell 不依赖 JIT，实测启动和渲染正常。
     PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dynamicCode{};
     dynamicCode.ProhibitDynamicCode = 1;   // 不允许 VirtualAlloc(PAGE_EXECUTE_*) / 改可执行属性
@@ -8321,13 +8323,13 @@ void hardenProcess() {
     dynamicCode.AllowRemoteDowngrade = 0;  // 不允许调试器远程降级
     setPolicy(ProcessDynamicCodePolicy, &dynamicCode, sizeof(dynamicCode));
 
-    // 3) 不从不信任的位置加载 DLL：网络路径、低完整性级别目录
+    // 2) 不从不信任的位置加载 DLL：网络路径、低完整性级别目录
     PROCESS_MITIGATION_IMAGE_LOAD_POLICY imageLoad{};
     imageLoad.NoRemoteImages = 1;
     imageLoad.NoLowMandatoryLabelImages = 1;
     setPolicy(ProcessImageLoadPolicy, &imageLoad, sizeof(imageLoad));
 
-    // 4) 只允许微软签名的二进制：默认关闭。
+    // 3) 只允许微软签名的二进制：默认关闭。
     //    GUI 会经 COM 加载第三方 shell 扩展（文件对话框、缩略图、杀软 hook），
     //    打开后可能让"另存为/打开"直接失败，所以做成显式开关：
     //      set RSHELL_ENFORCE_MS_SIGNED=1

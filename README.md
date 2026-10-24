@@ -6,9 +6,9 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 ## 下载
 
-**Windows 10/11，64 位：** [下载 rshell v1.0.1](https://github.com/CodeWithiYouth/rshell/releases/download/v1.0.1/rshell-windows-x64.zip)。
+**Windows 10/11，64 位：** [下载 rshell v1.0.2](https://github.com/CodeWithiYouth/rshell/releases/download/v1.0.2/rshell-windows-x64.zip)。
 
-压缩包包含桌面程序 `rshell-gui.exe` 和命令行工具 `rshell.exe`。解压后即可运行，无需安装。校验值见 [SHA256SUMS.txt](https://github.com/CodeWithiYouth/rshell/releases/download/v1.0.1/SHA256SUMS.txt)。
+压缩包包含桌面程序 `rshell-gui.exe` 和命令行工具 `rshell.exe`。解压后即可运行，无需安装。校验值见 [SHA256SUMS.txt](https://github.com/CodeWithiYouth/rshell/releases/download/v1.0.2/SHA256SUMS.txt)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 

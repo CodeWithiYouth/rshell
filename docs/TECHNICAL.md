@@ -431,10 +431,12 @@ libssh2 会话里的认证上下文、进程转储，以及 `--password` 参数�
 
 | 策略 | 效果 |
 | --- | --- |
-| `ProcessExtensionPointDisablePolicy` | 禁用 AppInit_DLLs 等传统扩展点注入 |
 | `ProcessDynamicCodePolicy` | 禁止本进程生成/切换可执行内存，注入的 shellcode 无法直接执行 |
 | `ProcessImageLoadPolicy` | 不从 UNC 网络路径、低完整性目录加载 DLL |
 | `ProcessSignaturePolicy` | 只允许微软签名二进制，**默认关闭**；`set RSHELL_ENFORCE_MS_SIGNED=1` 开启（会挡掉第三方 shell 扩展，文件对话框可能失败） |
+
+GUI 不启用 `ProcessExtensionPointDisablePolicy`：这项策略会影响自绘终端的
+IMM/TSF 兼容输入路径，造成微软拼音无法组字，而原生编辑框仍可输入中文。
 
 需要说清楚边界：这些策略挡不住同一用户下的 `OpenProcess` + `ReadProcessMemory`，
 只是提高门槛。它们也不能替代“不落盘”的存储方案。

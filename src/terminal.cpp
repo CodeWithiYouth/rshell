@@ -306,6 +306,37 @@ std::string Terminal::plainLine(std::size_t index) const {
     return out;
 }
 
+std::vector<TerminalMatch> Terminal::findAll(const std::u32string& query) const {
+    std::vector<TerminalMatch> matches;
+    if (query.empty()) return matches;
+    std::u32string text;
+    std::vector<int> columns;
+    for (std::size_t line = 0; line < lineCount(); ++line) {
+        text.clear();
+        columns.clear();
+        const auto& cells = lineAt(line);
+        for (int col = 0; col < static_cast<int>(cells.size()); ++col) {
+            const Cell& cell = cells[static_cast<std::size_t>(col)];
+            if (cell.flags & kFlagWideTail) continue;
+            text.push_back(cell.ch == 0 ? U' ' : cell.ch);
+            columns.push_back(col);
+        }
+        // 去掉未使用的行尾空格，避免查找空格时把整片空屏当成结果。
+        while (!text.empty() && text.back() == U' ') {
+            text.pop_back();
+            columns.pop_back();
+        }
+        for (std::size_t pos = text.find(query); pos != std::u32string::npos;
+             pos = text.find(query, pos + 1)) {
+            const int first = columns[pos];
+            const std::size_t last = pos + query.size() - 1;
+            const int end = columns[last] + ((cells[columns[last]].flags & kFlagWide) ? 2 : 1);
+            matches.push_back(TerminalMatch{line, first, end - first});
+        }
+    }
+    return matches;
+}
+
 void Terminal::scrollView(int deltaLines) {
     int maxOffset = static_cast<int>(history_.size());
     scrollOffset_ = std::clamp(scrollOffset_ + deltaLines, 0, maxOffset);

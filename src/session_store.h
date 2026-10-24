@@ -14,9 +14,10 @@ struct Session {
     std::string note;
     int port = 22;
     // 密码本身不写进 sessions.ini：这里只是“已经保存过密码”的标记。
-    // 真正的密码由 credential_store.cpp 交给 Windows 凭据管理器或（GUI 解锁后）
-    // 密码保险库保管。
+    // 真正的密码由 credential_store.cpp 交给密码保险库保管。
     bool savePassword = false;
+    // 私钥口令同理：sessions.ini 只记标记，口令本体在密码保险库。
+    bool saveKeyPassphrase = false;
 };
 
 class SessionStore {

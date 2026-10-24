@@ -22,12 +22,14 @@
 #include "credential_store.h"
 #include "protected_secret.h"
 #include "session_store.h"
+#include "ssh_session.h"
 #include "terminal.h"
 #include "util.h"
 #include "vault.h"
 #ifdef _WIN32
 #include <windows.h>
 #include "dnd_virtual_file.h"
+#include "win_compat.h"
 #endif
 
 using namespace rshell;
@@ -318,7 +320,7 @@ void testRshellSettings() {
     fs::remove(utf8ToPath(path));
 }
 
-// 会话文件只记 savepassword 标记，密码本体交给系统凭据存储
+// 会话文件只记 savepassword 标记，密码本体存在密码保险库里
 void testSessionStorePasswordFlag() {
     const std::string ini =
         "# rshell 会话\n"
@@ -327,6 +329,7 @@ void testSessionStorePasswordFlag() {
         "user = root\n"
         "port = 2222\n"
         "savepassword=1\n"
+        "savekeypassphrase=1\n"
         "\n"
         "[session:plain]\n"
         "host = 10.0.0.6\n";
@@ -338,17 +341,22 @@ void testSessionStorePasswordFlag() {
     CHECK(prod != nullptr);
     if (prod) {
         CHECK(prod->savePassword);
+        CHECK(prod->saveKeyPassphrase);
         CHECK_EQ(prod->port, 2222);
     }
     const Session* plain = store.find("plain");
     CHECK(plain != nullptr);
-    if (plain) CHECK(!plain->savePassword);
+    if (plain) {
+        CHECK(!plain->savePassword);
+        CHECK(!plain->saveKeyPassphrase);
+    }
 
     // 写回时同样只有标记，文件里不该出现任何口令
     Session changed;
     changed.name = "plain";
     changed.host = "10.0.0.6";
     changed.savePassword = true;
+    changed.saveKeyPassphrase = true;
     store.upsert(changed);
     CHECK(store.save());
 
@@ -358,44 +366,67 @@ void testSessionStorePasswordFlag() {
     in.close();  // Windows 上文件还开着时删不掉
     const std::string saved = content.str();
     CHECK(saved.find("savepassword=1") != std::string::npos);
+    CHECK(saved.find("savekeypassphrase=1") != std::string::npos);
     CHECK(saved.find("savepassword=0") == std::string::npos);
 
     SessionStore reloaded = SessionStore::load(path);
     const Session* again = reloaded.find("plain");
     CHECK(again != nullptr);
-    if (again) CHECK(again->savePassword);
+    if (again) {
+        CHECK(again->savePassword);
+        CHECK(again->saveKeyPassphrase);
+    }
 
     std::error_code ec;
     fs::remove(utf8ToPath(path), ec);
     CHECK(!ec);
 }
 
-// 凭据条目名 + 保存/读取/删除往返（Windows 上真的写一次凭据管理器，用完即删）
+// 私钥是否带口令：GUI 连接前用它决定是否弹口令框
+void testPrivateKeyNeedsPassphrase() {
+    const std::string plain = writeTempFile(
+        "rshell_key_plain.pem",
+        "-----BEGIN RSA PRIVATE KEY-----\nAAAA\n-----END RSA PRIVATE KEY-----\n");
+    CHECK(!privateKeyNeedsPassphrase(plain));
+
+    const std::string encrypted = writeTempFile(
+        "rshell_key_enc.pem",
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        "Proc-Type: 4,ENCRYPTED\n"
+        "DEK-Info: AES-128-CBC,00000000000000000000000000000000\n"
+        "\nAAAA\n-----END RSA PRIVATE KEY-----\n");
+    CHECK(privateKeyNeedsPassphrase(encrypted));
+
+    std::error_code ec;
+    fs::remove(utf8ToPath(plain), ec);
+    ec.clear();
+    fs::remove(utf8ToPath(encrypted), ec);
+    CHECK(!ec);
+}
+
+// 条目名 + 未接保险库时读写都失败（不再回退到 Windows 凭据管理器）
 void testCredentialStore() {
     CHECK_EQ(credentialTarget("prod"), std::string("rshell/prod"));
     CHECK_EQ(credentialTarget(""), std::string("rshell/"));
+    CHECK_EQ(keyPassphraseTarget("prod"),
+             std::string("rshell/prod/key-passphrase"));
 
-#ifdef _WIN32
-    const std::string target = "rshell/selftest-" + std::to_string(GetCurrentProcessId());
-    const std::string password = "p@ss 中文 word";  // 顺带验证 UTF-16 往返
+    setCredentialVault(nullptr);
+    CHECK(!credentialVaultActive());
+
+    const std::string target = "rshell/no-vault";
+    const std::string password = "p@ss 中文 word";
     std::string error;
-    if (!saveCredential(target, "selftest@127.0.0.1:22", password, &error)) {
-        // 凭据管理器被组策略禁用时不该让单元测试失败
-        std::cout << "SKIP 凭据管理器不可用：" << error << "\n";
-        return;
-    }
-    CHECK(hasCredential(target));
+    CHECK(!saveCredential(target, password, &error));
+    CHECK(!error.empty());
+
     std::string loaded;
-    CHECK(loadCredential(target, loaded, &error));
-    CHECK_EQ(loaded, password);
-    CHECK(deleteCredential(target, &error));
+    CHECK(!loadCredential(target, loaded, &error));
     CHECK(!hasCredential(target));
-    // 再删一次也算成功：条目不存在就是想要的状态
-    CHECK(deleteCredential(target, &error));
-#endif
+    CHECK(!deleteCredential(target, &error));
 }
 
-// 保险库接成后端之后：保存/读取/删除都由保险库承担，凭据管理器里不再留副本
+// 保险库接成后端之后：保存/读取/删除都只由保险库承担
 void testCredentialVaultRouting() {
     namespace fs = std::filesystem;
     const fs::path dir = fs::temp_directory_path() / "rshell_vault_routing";
@@ -415,7 +446,7 @@ void testCredentialVaultRouting() {
 
     const std::string target = "rshell/unit-routing-test";
     const std::string password = "p@ss 中文 routing";
-    CHECK(saveCredential(target, "routing@127.0.0.1:22", password, &error));
+    CHECK(saveCredential(target, password, &error));
     CHECK(vault.has(target));  // 口令真的落在保险库里
 
     std::string loaded;
@@ -424,24 +455,30 @@ void testCredentialVaultRouting() {
     wipeString(loaded);
     CHECK(hasCredential(target));
 
-    // 只删凭据管理器那份：保险库里的还在，说明凭据管理器本来就没这条
-    CHECK(deleteManagedCredential(target, &error));
-    CHECK(hasCredential(target));
+    // 空密码等于删除：避免下次静默用旧口令
+    CHECK(saveCredential(target, "", &error));
+    CHECK(!vault.has(target));
+    CHECK(!hasCredential(target));
+    CHECK(deleteCredential(target, &error));  // 条目不存在也算成功
 
-    // 正常删除两个后端都不留
+    // 删除后保险库里不留条目
+    CHECK(saveCredential(target, password, &error));
     CHECK(deleteCredential(target, &error));
     CHECK(!vault.has(target));
     CHECK(!hasCredential(target));
 
-    // 断开后端：退回凭据管理器，刚才那条只在保险库里活过，这里读不到
+    // 断开后端：所有读写都失败，不会偷偷写别的地方
     setCredentialVault(nullptr);
     CHECK(!credentialVaultActive());
     CHECK(!loadCredential(target, loaded, &error));
+    CHECK(!saveCredential(target, password, &error));
 
     // 锁着的保险库即使接上也不生效（Vault::unlocked() 是路由的前提）
-    Vault lockedVault;
-    setCredentialVault(&lockedVault);
+    vault.lock();
+    setCredentialVault(&vault);
     CHECK(!credentialVaultActive());
+    CHECK(!loadCredential(target, loaded, &error));
+    CHECK(!saveCredential(target, password, &error));
     setCredentialVault(nullptr);
 
     fs::remove_all(dir, ec);
@@ -1428,6 +1465,83 @@ void testPasteNormalize() {
     CHECK_EQ(pasteTerm.plainLine(1), std::string("pwd"));
 }
 
+#ifdef _WIN32
+UINT WINAPI fakeSystemDpi() { return 144; }
+UINT WINAPI fakeWindowDpi(HWND) { return 192; }
+UINT WINAPI zeroDpi() { return 0; }
+UINT WINAPI zeroWindowDpi(HWND) { return 0; }
+int WINAPI fakeMetric(int, UINT dpi) { return static_cast<int>(dpi / 12); }
+int WINAPI zeroMetric(int, UINT) { return 0; }
+BOOL WINAPI fakeDpiContext(HANDLE context) {
+    CHECK(context == reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-4)));
+    return TRUE;
+}
+
+void testWindowsCompatibility() {
+    // 空函数表模拟 Win7，避免仅在新系统上测试可用 API 的分支。
+    wincompat::Api legacy;
+    wincompat::initializeDpi(legacy);
+    const UINT fallback = wincompat::systemDpi(legacy);
+    CHECK(fallback > 0);
+    CHECK_EQ(wincompat::windowDpi(nullptr, legacy), fallback);
+    CHECK_EQ(wincompat::systemMetric(SM_CXSIZEFRAME, fallback, legacy), GetSystemMetrics(SM_CXSIZEFRAME));
+    CHECK_EQ(wincompat::systemMetric(SM_CXSIZEFRAME, fallback * 2, legacy), GetSystemMetrics(SM_CXSIZEFRAME) * 2);
+    CHECK(legacy.setMitigation == nullptr);
+
+    wincompat::Api modern;
+    modern.setDpiContext = fakeDpiContext;
+    modern.getSystemDpi = fakeSystemDpi;
+    modern.getWindowDpi = fakeWindowDpi;
+    modern.getMetric = fakeMetric;
+    wincompat::initializeDpi(modern);
+    CHECK_EQ(wincompat::systemDpi(modern), 144u);
+    CHECK_EQ(wincompat::windowDpi(nullptr, modern), 192u);
+    CHECK_EQ(wincompat::systemMetric(SM_CXSIZEFRAME, 192, modern), 16);
+    modern.getSystemDpi = zeroDpi;
+    modern.getWindowDpi = zeroWindowDpi;
+    CHECK_EQ(wincompat::systemDpi(modern), fallback);
+    CHECK_EQ(wincompat::windowDpi(nullptr, modern), fallback);
+    modern.getMetric = zeroMetric;
+    CHECK_EQ(wincompat::systemMetric(SM_CXPADDEDBORDER, 96, modern), 0);
+    CHECK(wincompat::systemDpi() > 0);
+}
+#endif
+
+void testTerminalSearch() {
+    Terminal term(24, 3, 8);
+    CHECK(term.findAll(U"").empty());
+    CHECK(term.findAll(U" ").empty());
+    term.feed("banana BANANA\r\n中文🙂test\r\nlast");
+    const auto overlap = term.findAll(U"ana");
+    CHECK_EQ(overlap.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(overlap[0].column, 1);
+    CHECK_EQ(overlap[1].column, 3);
+    CHECK_EQ(overlap[0].width, 3);
+    CHECK_EQ(term.findAll(U"BANANA").size(), static_cast<std::size_t>(1));
+    const auto wide = term.findAll(U"文🙂t");
+    CHECK_EQ(wide.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(wide[0].line, static_cast<std::size_t>(1));
+    CHECK_EQ(wide[0].column, 2);
+    CHECK_EQ(wide[0].width, 5);
+    CHECK(term.findAll(U"missing").empty());
+    term.feed("\r\nnext\r\nfinal");
+    CHECK(term.scrollbackCount() > 0);
+    CHECK_EQ(term.findAll(U"banana")[0].line, static_cast<std::size_t>(0));
+    CHECK_EQ(term.findAll(U"final").size(), static_cast<std::size_t>(1));
+    term.reset();
+    CHECK(term.findAll(U"banana").empty());
+    term.feed("\x1b[31mred\x1b[0m");
+    CHECK_EQ(term.findAll(U"red")[0].column, 0);
+    term.feed("\x1b[?1049halt");
+    CHECK(term.findAll(U"red").empty());
+    CHECK_EQ(term.findAll(U"alt").size(), static_cast<std::size_t>(1));
+    term.feed("\x1b[?1049l");
+    CHECK_EQ(term.findAll(U"red").size(), static_cast<std::size_t>(1));
+    Terminal limited(10, 2, 1);
+    limited.feed("old\r\na\r\nb\r\nc");
+    CHECK(limited.findAll(U"old").empty());
+}
+
 }  // namespace
 
 int main() {
@@ -1443,6 +1557,7 @@ int main() {
     testSshConfig();
     testRshellSettings();
     testSessionStorePasswordFlag();
+    testPrivateKeyNeedsPassphrase();
     testCredentialStore();
     testCredentialVaultRouting();
     testProtectedSecret();
@@ -1453,7 +1568,9 @@ int main() {
     testTerminalResizeKeepsContent();
     testTerminalAltScreenAndMisc();
     testTerminalTuiCompat();
+    testTerminalSearch();
 #ifdef _WIN32
+    testWindowsCompatibility();
     testVirtualFileDrag();
 #endif
 

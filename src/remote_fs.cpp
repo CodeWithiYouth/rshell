@@ -118,6 +118,8 @@ void RemoteFs::start(const ConnectionOptions& options) {
     // 口令单独以密文保存；options_ 里只留 host/port/user/keyPath 这类非敏感字段
     password_.assignUtf8(options_.password);
     wipeString(options_.password);
+    keyPassphrase_.assignUtf8(options_.keyPassphrase);
+    wipeString(options_.keyPassphrase);
     // 建连超时压短一点：断开时 worker 最多等这么久
     if (options_.timeoutSec > 10 || options_.timeoutSec <= 0) options_.timeoutSec = 10;
     running_ = true;
@@ -146,7 +148,8 @@ void RemoteFs::stop() {
     ready_ = false;
     sftpReady_ = false;
     statsPending_ = false;
-    password_.clear();  // 断开后不再需要这份口令
+    password_.clear();  // 断开后不再需要这两份口令
+    keyPassphrase_.clear();
 }
 
 void RemoteFs::listDir(const std::string& path) {
@@ -474,6 +477,9 @@ void RemoteFs::workerLoop() {
         std::string utf8Password = password_.revealUtf8();
         conn.password = utf8Password;
         wipeString(utf8Password);
+        std::string utf8KeyPassphrase = keyPassphrase_.revealUtf8();
+        conn.keyPassphrase = utf8KeyPassphrase;
+        wipeString(utf8KeyPassphrase);
         session_ = std::make_unique<SshSession>(conn);
         session_->connect();
     } catch (const std::exception& ex) {

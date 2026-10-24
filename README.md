@@ -11,27 +11,70 @@
 
 ## 构建
 
+默认构建 Windows 10/11 版，Win7 兼容版用 `-Win7`：
+
 ```powershell
-cmake -S . -B build_cmake            # 需要 CMake 3.20+ 与支持 C++17 的编译器
-cmake --build build_cmake --config Release
+.\build.ps1                 # Windows 10/11 版 -> build\modern\rshell-gui.exe
+.\build.ps1 -Win7           # Win7 兼容版 -> build\win7\rshell-gui.exe
+.\build.ps1 -Test           # 构建后跑单元测试
+.\build.ps1 -Clean -Test    # 删除构建目录后干净重建并测试
 ```
 
-产物：
+（`-Modern` 仍可显式使用，等同于默认。）
+
+脚本统一用 NMake 单配置构建：默认模式用 Visual Studio 当前默认 MSVC；
+`-Win7` 要求 MSVC 14.44 或更早（优先仓库内 `build_tmp\msvc143`，否则用 VS 已安装的
+v143 14.44），并在链接后自动跑导入表检查。脚本结束时打印产物目录。
+`-BuildDir` 可改目录；换过工具链或生成器导致缓存不匹配时加 `-Clean`。
+
+需要 Visual Studio 生成器时可以手动 CMake，请用单独的目录，不要和脚本共用：
+
+```powershell
+# Windows 10/11（默认推荐）
+cmake -S . -B build/modern-vs -DRSHELL_WINDOWS7_COMPAT=OFF
+cmake --build build/modern-vs --config Release
+
+# Win7 兼容：VS 2026 中需先添加可选的「MSVC v143 - VS 2022 C++ x64/x86 build tools (v14.44)」
+cmake -S . -B build/win7-vs -G "Visual Studio 18 2026" -T "v143,version=14.44" -DRSHELL_WINDOWS7_COMPAT=ON -DRSHELL_CRYPTO_BACKEND=WinCNG
+cmake --build build/win7-vs --config Release
+```
+
+使用 VS 2022 时，把生成器换成 `Visual Studio 17 2022`、工具集用 `-T v143`。
+Win7 兼容构建会设置 Windows 7 API 目标并检查 GUI/CLI 导入表中的常见新版 API；
+MSVC 14.50+ 的标准库已取消 Win7 支持，兼容模式会拒绝该工具集。
+
+WinCNG 的 ECDH/ECDSA 依赖 Windows 10+ 的 CNG 接口：默认（modern）构建已开启
+（`RSHELL_WINCNG_ECDSA=ON`）。另外 Windows 构建内嵌了 Monocypher/Argon2，WinCNG 后端自带
+curve25519-sha256 KEX（`-Win7` 兼容构建也有），所以只开放 curve25519 的服务器两个构建都能连；
+只有服务器仅保留 ECDH（不含 curve25519/DH）时，才需要 modern 构建或让服务器放开算法。
+
+脚本产物在构建目录根下；手动 VS 构建在各自的 `Release\` 下：
 
 | 文件 | 说明 |
 | --- | --- |
-| `build_cmake/Release/rshell.exe` | 命令行工具 |
-| `build_cmake/Release/rshell-gui.exe` | 图形界面（Windows） |
-| `build_cmake/Release/rshell_tests.exe` | 单元测试 |
-| `build_cmake/Release/rshell_shell_probe.exe` | 无界面的 shell 通道冒烟测试 |
+| `build\modern\rshell.exe` | 命令行工具（Windows 10/11） |
+| `build\modern\rshell-gui.exe` | 图形界面（Windows 10/11） |
+| `build\modern\rshell_tests.exe` | 单元测试 |
+| `build\modern\rshell_shell_probe.exe` | 无界面的 shell 通道冒烟测试 |
+| `build\win7\rshell*.exe` | 同上，`-Win7` 兼容构建的输出 |
 
-libssh2 默认静态编译（Windows 使用 WinCNG，无需 OpenSSL）。如需 Ed25519 /
-OpenSSH 新格式私钥，使用 `-DRSHELL_CRYPTO_BACKEND=OpenSSL` 并在系统中准备 OpenSSL。
+下文示例统一用 `build\modern`；Win7 兼容版把路径换成 `build\win7` 即可。
+
+libssh2 默认静态编译（Windows 使用 WinCNG，无需 OpenSSL）。Windows 构建内嵌 Monocypher
+（BSD-2-Clause/CC0）和 Argon2（CC0/Apache-2.0），WinCNG 后端现在支持：
+
+- Ed25519 / X25519：Ed25519 私钥登录、Ed25519 主机密钥、curve25519 KEX；
+- OpenSSH 新格式私钥：RSA / ECDSA / Ed25519（含 bcrypt 口令）；
+- SEC1 `BEGIN EC PRIVATE KEY` 的 ECDSA（modern 构建）；
+- PuTTY PPK v2 / v3：RSA / ECDSA / Ed25519，含 Argon2id/Argon2i/Argon2d 口令保护。
+
+单文件合计只增加约 100 KB。仍不支持 FIDO `sk-*`、PKCS#8 私钥和 PuTTY PPK v1；
+需要完整覆盖时用 `-DRSHELL_CRYPTO_BACKEND=OpenSSL` 并在系统中准备 OpenSSL。
 
 Windows 下默认 `/MT` 静态链接 MSVC 运行库：单文件分发，目标机不需要安装 VC++ 运行库
 （需要 `/MD` 时加 `-DRSHELL_STATIC_CRT=OFF`）。注意 `CRYPTO_BACKEND` 为空时 libssh2 会
 **优先尝试 OpenSSL**，找不到才回退 WinCNG——换构建环境后请用
-`dumpbin /dependents build_cmake\Release\rshell-gui.exe` 复核，确认没有多出
+`dumpbin /dependents build\modern\rshell-gui.exe` 复核，确认没有多出
 `libcrypto-*.dll` 依赖。
 
 ## 运行环境要求
@@ -40,13 +83,23 @@ Windows 下默认 `/MT` 静态链接 MSVC 运行库：单文件分发，目标�
 
 | 项 | 要求 |
 | --- | --- |
-| 操作系统 | Windows 10 1703（build 15063）/ Windows Server 2016 及以上，**64 位** |
+| 操作系统 | 默认构建：Windows 10/11 **64 位**（启用 CNG ECDH，要求 Win10+）；`-Win7` 兼容构建：Windows 7 SP1 / Server 2008 R2 SP1 及以上 |
 | C++ 运行库 | **无**（默认 `/MT` 静态链接 CRT，单个 exe 即可运行） |
 | 网络 | 能出站访问 SSH 端口（默认 22）；程序不监听任何端口 |
 | 权限 | 普通用户。读写 `%USERPROFILE%\.rshell\`、`%USERPROFILE%\.ssh\`、`%TEMP%\rshell-drag\` |
 
-系统下限由 `SetProcessDpiAwarenessContext`（Windows 10 1703 起提供）决定，它是**静态导入**，
-因此在 Win8.1 / Win7 或 Win10 1607 上会直接启动失败（提示"无法定位程序输入点"）。
+新版 DPI 与进程加固 API 改为运行时探测，不再导致 Win7 因缺少入口点而在启动前失败。
+Win10/11 保留按监视器 DPI 渲染；旧系统回退到系统 DPI，不能随显示器自动切换缩放。
+旧系统不支持的暗色窗口属性、圆角和进程加固策略会跳过，主窗口和功能仍使用 GDI 自绘。
+Win7 控制台不支持 ANSI 转义，CLI 会自动改为纯文本输出（不再显示颜色或原始转义序列）。
+主密码保险库的 AES-GCM / PBKDF2 与 `CryptProtectMemory` 在 Win7 可用，TPM 解锁仍为可选项；
+缺少相应字体时，Win7 上的部分 emoji 可能显示为单色或缺字。API 回退与导入检查不能替代
+Win7 实机回归，发布前应在 Win7 SP1 上验证启动、SSH/SFTP、中文输入、缩放、拖放和保险库。
+
+Win7 兼容构建的 KEX 有 `diffie-hellman-*` 和 `curve25519-sha256`（内嵌 X25519），但没有 ECDH。
+服务器如果只保留 ECDH（不含 curve25519/DH），仍会报
+`SSH 握手失败：Unable to exchange encryption keys`——这是双方算法没有交集，
+不是私钥或密码错误。默认（modern）构建支持 ECDH，或改服务器配置即可。
 
 除下列系统 DLL 外没有其它依赖：`USER32` `GDI32` `gdiplus` `dwmapi` `ole32` `comdlg32`
 `shell32` `bcrypt` `ws2_32` `crypt32` `KERNEL32`。libssh2 静态链接，加密走系统 WinCNG
@@ -70,9 +123,9 @@ Windows 下默认 `/MT` 静态链接 MSVC 运行库：单文件分发，目标�
 运行时文件位置：会话列表 `~/.rshell/sessions.ini`（`RSHELL_SESSIONS` 可覆盖）、
 日志 `~/.rshell/gui.log`、拖出下载的临时文件 `%TEMP%\rshell-drag\`、
 `~/.ssh/config` 与 `~/.ssh/known_hosts`（首次连接会写入）。
-勾选过「记住密码」的会话，密码不在这些文件里：默认交给 Windows 凭据管理器
-（条目名 `rshell/<会话名>`），解锁「密码保险库」之后改存到
-`%LOCALAPPDATA%\rshell\vault.dat`（主密码加密）。
+勾选过「记住密码」的会话，密码不在这些文件里：只存在密码保险库
+`%LOCALAPPDATA%\rshell\vault.dat`（主密码加密，可选 TPM 解锁）。
+不使用 Windows 凭据管理器。
 
 ## 图形界面
 
@@ -85,9 +138,11 @@ Windows 下默认 `/MT` 静态链接 MSVC 运行库：单文件分发，目标�
 2. 新建会话字段为名称、主机、端口、用户、私钥、备注；快捷键 `Ctrl+N`。
    会话保存在 `~/.rshell/sessions.ini`（可用环境变量 `RSHELL_SESSIONS` 覆盖）。
 3. 在管理窗口里点「连接」（或双击会话）开始连接：
-   - 未配置私钥时弹出密码框：勾选「记住密码」后，**连接成功**才会把口令写进
-     当前口令后端——默认是 Windows 凭据管理器，解锁密码保险库后则是保险库，
-     下次连接自动使用（服务器拒绝的口令不会被保存）；
+   - 配置了带口令私钥时弹出「私钥口令」框：勾选「记住私钥口令」后会存进密码保险库，
+     下次自动使用；不勾选则只在内存里用到断开为止。会话管理里可随时清除已保存的口令；
+   - 未配置私钥时弹出密码框：勾选「记住密码」后，如果保险库还没创建/解锁，
+     会先弹出新建/解锁对话框（取消则本次不保存）；**连接成功**后才把口令写进
+     密码保险库，下次连接自动使用（服务器拒绝的口令不会被保存）；
    - 密码框里不勾选就只在内存里用到断开为止，不落盘；
    - 首次连接新主机会显示指纹并询问是否写入 `~/.ssh/known_hosts`；
    - 连接失败时弹出错误详情，并写入 `~/.rshell/gui.log`。
@@ -113,28 +168,48 @@ Windows 下默认 `/MT` 静态链接 MSVC 运行库：单文件分发，目标�
      TUI 开启鼠标上报后拖动交给远端，按住 `Shift` 拖动可强制本地选择；
    - `Ctrl++` / `Ctrl+-` / `Ctrl+0` 缩放字体；
    - `Ctrl+Shift+C` 复制、`Ctrl+Shift+A` 全选、滚轮或 `PageUp/PageDown` 翻历史；
+   - `Ctrl+Shift+F` 打开历史搜索条，精确查找当前屏幕与最多 5000 行回滚输出（区分大小写，
+     按屏幕行匹配，不跨折行）。支持中文、emoji 和重叠匹配，全部命中高亮，当前命中用亮色；
+     `Enter` / `Shift+Enter` 或 `F3` / `Shift+F3` 前后循环定位，`Esc` 关闭，`Tab` 回到终端；
+   - 断线后在终端与状态栏显示原因（远端退出附带退出码、读写错误或发送超时），
+     `Ctrl+Shift+R`、右键菜单或「重新连接」按钮可连接当前会话。重连复用原有密钥与
+     密码保险库流程，未保存的密码需要重新输入；不会自动重发旧命令；
    - 按键遵循 xterm 约定：`Backspace` 发 `0x7F`、`Shift+Tab` 发 `ESC[Z`、
      `Alt+字母` 发 `ESC` 前缀、带修饰键的箭头/Home/End/F1-F12 发 `CSI 1;<mod>X`；
    - 拖动窗口边缘会通过 SSH window-change 通知远端调整行列数。
+     输入发送与尺寸更新都交给 SSH 工作线程，界面线程只入队；待发送数据上限为 8 MiB，
+     超出时提示本次输入未发送，持续 30 秒无发送进展时断开并报告原因。
 
 界面说明：
 
+- 使用统一的深蓝灰工作区与蓝紫强调色，SFTP 文件面板和 SSH 终端各有独立标题，
+  文件与会话选中项带强调标记；空终端显示 `Ctrl+O` 打开会话、`Ctrl+N` 新建会话引导。
+  所有装饰继续复用系统 GDI/GDI+，不新增 UI 库、字体包或图片资源。
 - 主界面分两栏：左侧**始终是 SFTP 文件浏览器**（未连接时显示提示与「打开会话列表…」），
-  右侧是终端。底部状态栏在连接后显示远端机器的负载 / CPU / 内存 / 磁盘 / 采样延迟。
+  右侧是终端。底栏左侧常驻连接状态与当前会话，右侧固定为传输入口，断线后可直接点
+  「重新连接」。中间默认显示 CPU、内存/磁盘占用百分比与采样耗时；宽度不足时先隐藏
+  磁盘，再逐步隐藏次要指标，保留完整数字。采样耗时包含远端命令执行，不是纯网络 RTT。
+- 复制、保存等普通提示在底栏中间显示约 4 秒后自动消退，不覆盖左侧连接状态；错误用
+  醒目文字保留，直到下一条操作提示或点击旁边的 `×`。终端尺寸/字号只在调整后短暂显示。
+  鼠标停留底栏可查看系统、核心数、负载、内存用量、终端尺寸/历史/字号等完整说明；
+  保险库解锁时仍有常驻标记。
 - 标题栏是自绘的（无系统边框）：拖动空白处移动窗口、双击最大化/还原，
   右侧依次是 `☰` 菜单、最小化、最大化/还原、关闭，关闭按钮悬停会变红。
   `☰` 弹出的是自绘菜单（hover 高亮、右对齐快捷键、`↑`/`↓`/`Enter`/`Esc` 可用），
   不再调用系统 `TrackPopupMenu`——后者在暗色窗口上会被画成一条几乎空白的细线。
+- 终端右键菜单复用相同的自绘菜单，包含复制、粘贴、全选、历史搜索和重新连接；
+  不可用的动作置灰。TUI 开启鼠标上报时仍优先把右键交给远端程序。
 - 深色主题与终端配色同源，标题栏右侧是连接状态药丸（未连接 / 连接中 / 已连接）。
 - 终端是一张圆角卡片：四周留白，右侧是自绘滚动条（有历史记录时出现，可拖动）。
 - 文件面板的所有操作都在**右键菜单**里（上传文件…、新建文件夹…、下载到本地…、
   删除、复制路径、转到目录…（`Ctrl+L`）、刷新、断开连接），底部只留一个动作按钮
-  （未连接 = 打开会话列表，已连接 = 断开连接）。双击目录进入、双击文件下载；
+  （未选择会话 = 打开会话列表，有当前会话但已断线 = 重新连接，已连接 = 断开连接）。双击目录进入、双击文件下载；
   键盘上 `↑` `↓` 选择、`Enter` 打开、`Backspace` 上级、`F5` 刷新、`Delete` 删除，
   `↑` 小按钮回上级。
-- 面板顶部的**路径条**既显示当前目录，也接受输入：点一下弹出输入框，`/` 开头是绝对
-  路径、`~` 是 home、其余按当前目录解析，`..` / 多重斜杠会被规范化。路径太长时中间
-  省略、保留尾部的目录名。
+- 面板顶部的**路径条**支持原位编辑：点击路径条，或在文件面板按 `Ctrl+L`，即可输入
+  路径并按回车跳转，无需弹窗；`Esc`、`Tab` 或失去焦点时取消编辑。`/` 开头是绝对路径、
+  `~` 是 home，其余按当前目录解析，`..` / 多重斜杠会被规范化。未编辑时，长路径中间
+  省略、保留尾部目录名；编辑时可水平滚动查看完整路径。
 - **终端目录跟随（单向）**：在终端里 `cd` 到别处，文件面板会跟着切到同一个目录；
   反过来在面板里翻目录不会影响终端。实现方式是连接后往远端 shell 注入一个 `OSC 7`
   （`file://host/path`）钩子——bash 走 `PROMPT_COMMAND`、zsh 走 `precmd`，每次画提示符
@@ -157,6 +232,8 @@ Windows 下默认 `/MT` 静态链接 MSVC 运行库：单文件分发，目标�
   胶囊（`↓` / `↑` / `⇅` + 进行中的项数与总百分比），点开是逐项列表，每行显示文件名、
   方向箭头、进度条和「已传 / 总量」，并可以单独取消；上传取消时远端半截文件会被清掉
   （目标原本就存在时不删，避免误删原文件）。
+- 传输入口在空闲时也保持原位置，点击可查看空列表；存在失败任务时优先显示失败标记，
+  取消的任务不会被标成「已完成」。
 - 文件通道是**独立的 SSH 连接**，所以列大目录、传大文件都不会拖慢终端输入输出；
   打开 SFTP 失败时终端仍然可用，左侧会显示原因。
 - 所有弹窗（会话管理、密码、主机指纹确认、错误与确认框、新建文件夹、关于）
@@ -173,46 +250,33 @@ Windows 下默认 `/MT` 静态链接 MSVC 运行库：单文件分发，目标�
   python tools\make_icon.py            # 默认输出 src\res\rshell.ico
   ```
 
-### 保存密码用的 Windows API
+### 口令存储：只用密码保险库
 
-Windows 10/11 没有“让应用明文保管密码”的接口，能公开调用的只有这两套：
+rshell **不使用 Windows 凭据管理器**（`CredWriteW` / `CredReadW` /
+`CredDeleteW` 那一套）。凭据管理器按「当前登录用户」解密，同一账户下运行的
+任何程序调一次 `CredReadW` 就能读到口令，安全边界太弱。这里只保留密码保险库
+（`src/credential_store.cpp` 负责接入，`src/vault.{h,cpp}` 负责加密）：
 
-| 方案 | API | 特点 |
-| --- | --- | --- |
-| 凭据管理器 | `CredWriteW` / `CredReadW` / `CredDeleteW`（`wincred.h`，`advapi32.lib`） | 系统按当前用户用 DPAPI 密钥加密后存进凭据库；用户在「控制面板 → 凭据管理器 → Windows 凭据」里能看到、改、删 |
-| DPAPI | `CryptProtectData` / `CryptUnprotectData`（`dpapi.h`，`crypt32.lib`） | 只提供加密原语，密文放哪、怎么清理和迁移都得应用自己管 |
-
-rshell 默认用前者（`src/credential_store.cpp`）：不用自己维护密文文件，用户也能
-自己审计和删除。解锁密码保险库之后，同一组函数会把口令改存到保险库（见下面的
-「后端切换与迁移」）。实现细节：
-
-- 条目名 `rshell/<会话名>`，「用户名」列显示 `user@host:port`，方便在凭据管理器里
-  一眼认出是哪台机器；
-- 密码以 UTF-16LE 写进 Generic Credential 的 `CredentialBlob`，凭据管理器界面
-  能正常显示和编辑；`Persist = CRED_PERSIST_LOCAL_MACHINE`，不随域账号漫游；
-- `sessions.ini` 只写 `savepassword=1` 这个标记，口令本身不写进会话文件；
-- 勾选「记住密码」后要**连接成功**才写入，避免把被服务器拒绝的口令存下来；
-  取消勾选、删除会话、改主机/端口/用户/私钥都会同步删除条目，只改会话名则把
+- `sessions.ini` 只写 `savepassword=1` / `savekeypassphrase=1` 标记，口令本身不写进会话文件；
+- 登录密码条目名 `rshell/<会话名>`，私钥口令条目名 `rshell/<会话名>/key-passphrase`，
+  都保存在 `%LOCALAPPDATA%\rshell\vault.dat`；
+- 保险库未解锁时 `credential_store` 的所有读写都失败，GUI 会引导用户新建/解锁；
+- 勾选「记住密码」或「记住私钥口令」后要**连接成功**才写入，避免把被服务器拒绝的口令存下来；
+  取消勾选、删除会话、改主机/端口/用户/私钥都会同步处理条目，只改会话名则把
   条目搬到新名字下；
-- 也可以手工管理：
+- 不再调用任何 `Cred*` API，也不会读取或删除旧版本留在凭据管理器里的条目
+  （它们会原样留在系统里，需要时可用 `cmdkey /delete:rshell/<会话名>` 手工清理）。
 
-  ```powershell
-  cmdkey /list | Select-String rshell    # 查看
-  cmdkey /delete:rshell/<会话名>         # 删除
-  ```
-
-安全边界：凭据按「当前 Windows 用户 + 本机」解密，换用户或换机器都读不出来；
-但同一个登录用户下运行的其它程序同样能调用 `CredReadW` 读到它——这是凭据管理器
-本身的模型。不想留下任何持久化口令时不要勾选即可（默认不勾），密码只留在内存里
-用到断开连接为止。
+安全边界：抗暴力破解能力取决于主密码强度；保险库解锁期间 DEK 在进程内存里，
+同一账户的 `ReadProcessMemory` 仍可能拿到它。不想留下任何持久化口令时不要勾选
+「记住密码」/「记住私钥口令」（默认都不勾），口令只留在内存里用到断开连接为止。
 
 ### 密码保险库（主密码 + 可选 TPM）
 
 凭据管理器的模型是「系统按当前登录用户解密」，所以同一账户下运行的其它程序
-调一次 `CredReadW` 也能读到密码。若要「文件被别人拷走也解不开」，就得再加一层
-只有用户知道的密钥：`src/vault.{h,cpp}` 实现了这种容器（`Vault` 类）。
-GUI 里新建/解锁保险库之后，口令存储会自动切到保险库，并把凭据管理器里的旧条目
-一次性迁进来（见下面的「后端切换与迁移」）。
+调一次 `CredReadW` 也能读到密码。这里改用一层只有用户知道的密钥：
+`src/vault.{h,cpp}` 实现了这种容器（`Vault` 类）。GUI 里新建/解锁保险库之后，
+口令存储自动接入保险库（见下面的「后端接入与条目清理」）。
 
 文件布局（小端、字段紧凑排列）：
 
@@ -297,40 +361,39 @@ Vault::open(path, L"主密码", reopened, &error);  // 口令错、文件被改�
   只拒绝空口令），窗口里还有一个「同时启用 TPM 解锁」勾选框——只在本机
   TPM 可用时出现，勾上会在创建后顺手 `enableTpm()`（首次约 3 秒，进度写在
   框里）；TPM 失败不影响保险库本身，关窗后单独提示；
-- 解锁时口令错了不关窗：错误原因就地显示、输入框内容全选，直接重输即可。
-  文件里带 TPM slot 且本机 TPM 可用时，左下角多一个「用 TPM 解锁」按钮，
-  失败原因（例如换了机器、密钥被清掉）也显示在同一行提示里；
+- 解锁时默认**先用 TPM**：文件里带 TPM slot 且本机 TPM 可用时，打开对话框就
+  自动在后台尝试 TPM 解锁（实测 0.4~0.8 秒），成功后直接关窗；这期间点「取消」
+  就改用主密码，TPM 失败（例如换了机器、密钥被清掉）也会自动落回主密码输入，
+  失败原因显示在提示行里。左下角保留「用 TPM 解锁」按钮，失败后可以重试；
+- 主密码口令错了不关窗：错误原因就地显示、输入框内容全选，直接重输即可；
 - 口令只在内存里活到 `Vault::open()`/`create()` 返回，控件销毁前会先清空；
   解锁成功后状态栏右侧常驻一个「保险库 已解锁」标记，提醒此时 DEK 还在进程里；
 - 对话框关闭、慢操作（PBKDF2 / TPM）进行中都不响应关闭：那时候口令已经交出去，
   关掉窗口只会让用户以为操作被取消了。
 
-### 后端切换与迁移
+### 后端接入与条目清理
 
-口令存储只有一套 API（`credential_store.h`），后端由 `setCredentialVault()`
-切换，所有调用点（连接、会话编辑、删除会话、清除密码）都不用改：
+口令存储只有一套 API（`credential_store.h`），并且只有一个后端：密码保险库。
+`setCredentialVault()` 的语义是「接入 / 断开」，不是切换两套存储：
 
-| 时机 | 后端 | 行为 |
+| 时机 | 状态 | 行为 |
 | --- | --- | --- |
-| 启动、保险库锁定 | Windows 凭据管理器 | 与旧版本完全一致 |
-| 保险库解锁 / 新建成功 | 密码保险库 | `save` 写进 vault 并立刻原子落盘；`load` 先查保险库，查不到再回退凭据管理器 |
-| 手动锁定 / 退出程序 | Windows 凭据管理器 | 先 `setCredentialVault(nullptr)`，再 `Vault::lock()` 抹掉 DEK |
+| 启动、保险库锁定 | 未接入 | 所有读写失败，界面提示先新建/解锁 |
+| 保险库解锁 / 新建成功 | 已接入 | `save` 写进 vault 并立刻原子落盘；`load/delete` 只查保险库 |
+| 手动锁定 / 退出程序 | 断开 | 先 `setCredentialVault(nullptr)`，再 `Vault::lock()` 抹掉 DEK |
 
-- 解锁时做一次迁移：遍历 `sessions.ini` 里 `savepassword=1` 的会话，把
-  `rshell/<会话名>` 从凭据管理器读出来写进保险库；**全部写盘成功后**才删掉
-  凭据管理器里的旧副本，中途失败只是少搬几条，下次解锁再试；
-- 迁移同时清理保险库里的孤儿条目（会话已删、或已取消「记住密码」）——锁定期间
+- 勾选「记住密码」时如果保险库还没创建/解锁，会自动弹出新建/解锁对话框；
+  用户取消则本次连接照常进行，只是不保存口令；
+- 连接一个已保存密码的会话时，如果 `vault.dat` 存在且锁着，GUI 会就地弹
+  解锁对话框（取消则退回手输密码），不必先去菜单解锁；
+- 解锁时清理保险库里的孤儿条目（会话已删、或已取消「记住密码」）——锁定期间
   删不掉保险库里的条目，只能等下次解锁；
-- 解锁状态下删除会话 / 清除密码 / 改主机，都直接改保险库并落盘；锁定状态下这些
-  操作只作用于凭据管理器，保险库里的残留条目在下次解锁时清掉；
-- 界面文案跟着后端走：会话管理里的「密码：已保存到 …」、密码框的
-  「记住密码（保存到 …）」、删除/清除确认框都写当前后端，不再固定写
-  「Windows 凭据管理器」；保险库锁着时提示「当前已锁定，连接前需要先解锁」；
-- 连接一个已保存密码的会话时，如果读不到口令、而 `vault.dat` 存在且锁着，
-  GUI 会就地弹解锁对话框（取消则退回手输密码），不必先去菜单解锁；
-- **CLI（`rshell.exe`）不接保险库**：它没有主密码入口，仍只认凭据管理器。
-  口令迁进保险库之后，CLI 的自动登录对这些会话会失败，需要显式传 `--password`
-  或改用私钥认证。
+- 解锁状态下删除会话 / 清除密码 / 改主机，都直接改保险库并落盘；锁定状态下
+  会先复位 `savepassword` 标记，残留条目在下次解锁时清理；
+- 界面文案固定写「密码保险库」，不再出现凭据管理器；保险库锁着时提示
+  「已锁定，连接前需要先解锁」；
+- **CLI（`rshell.exe`）不接保险库**：它没有主密码入口，不会读写 `vault.dat`，
+  只能用 `--password` 或交互式输入，或改用私钥认证。
 
 安全边界：
 
@@ -387,7 +450,7 @@ libssh2 会话里的认证上下文、进程转储，以及 `--password` 参数�
 
 ```powershell
 $env:RSHELL_GUI_DEMO = "1"
-.\build_cmake\Release\rshell-gui.exe
+.\build\modern\rshell-gui.exe
 ```
 
 TUI 显示异常时，可以设置 `RSHELL_TERM_DUMP=<文件路径>` 启动 GUI，程序会把
@@ -395,23 +458,23 @@ TUI 显示异常时，可以设置 `RSHELL_TERM_DUMP=<文件路径>` 启动 GUI�
 
 ```powershell
 $env:RSHELL_TERM_DUMP = "$env:TEMP\rshell-dump.bin"
-.\build_cmake\Release\rshell-gui.exe
+.\build\modern\rshell-gui.exe
 ```
 
 抓到的 dump 可以离屏复核，不必再连一次服务器：
 
 ```powershell
 # 文本网格（列对齐、光标位置、属性统计）
-.\build_cmake\Release\rshell_term_replay.exe "$env:TEMP\rshell-dump.bin" 92 34
+.\build\modern\rshell_term_replay.exe "$env:TEMP\rshell-dump.bin" 92 34
 
 # 像素级出图（与 GUI 共用同一份 GDI 绘制代码）
-.\build_cmake\Release\rshell-gui.exe --render "$env:TEMP\rshell-dump.bin" .\dump.bmp 92 34
+.\build\modern\rshell-gui.exe --render "$env:TEMP\rshell-dump.bin" .\dump.bmp 92 34
 
 # 想知道某个字符用了哪个字体（缺字形会退回 Consolas 画 .notdef 方框）
 $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe UI Symbol
 
 # 文件类型图标总览（16/24/32/48 四档 × 12 种类型），调图标时用
-.\build_cmake\Release\rshell-gui.exe --icons .\icons.bmp
+.\build\modern\rshell-gui.exe --icons .\icons.bmp
 ```
 
 字形回退：正文字体是 `Consolas`，它没有 `❯`（U+276F）、`▶`、`⏵`、`✓` 和中文，
@@ -450,9 +513,11 @@ rshell sftp user@host          # 交互式 sftp
 ## 测试
 
 ```powershell
-build_cmake\Release\rshell_tests.exe          # 单元测试
+build\modern\rshell_tests.exe         # 单元测试
 python tests/e2e_test.py                      # 端到端（需要 paramiko）
-cmake --build build_cmake --config Release --target rshell_e2e
+cmake --build build\modern --target rshell_e2e
 ```
 
 详见 `tests/README.md`。
+
+

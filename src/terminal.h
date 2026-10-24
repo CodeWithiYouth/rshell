@@ -27,6 +27,12 @@ struct Cell {
     std::uint8_t flags = 0;
 };
 
+struct TerminalMatch {
+    std::size_t line = 0;
+    int column = 0;
+    int width = 0;
+};
+
 // 终端配色（0-15 基础色由调用方给出，其余按 xterm 标准生成）
 struct TerminalTheme {
     std::uint32_t fg = 0xD0D0D0;
@@ -111,6 +117,8 @@ public:
                           int endCol) const;
     // 取某行的可见文本（去掉行尾空白），用于调试/测试
     std::string plainLine(std::size_t index) const;
+    // 精确匹配可见字符，跳过宽字符尾格；返回历史与当前屏幕的网格位置。
+    std::vector<TerminalMatch> findAll(const std::u32string& query) const;
 
     // ---- 供单元测试使用 --------------------------------------------------
     static bool isWideChar(char32_t ch);

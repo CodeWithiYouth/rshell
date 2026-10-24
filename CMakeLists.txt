@@ -7,6 +7,34 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(RSHELL_BUILD_TESTS "Build rshell unit tests" ON)
+option(RSHELL_WINDOWS7_COMPAT "Target Windows 7 SP1 / Server 2008 R2 SP1 (requires MSVC v143 or older)" ON)
+
+# WinCNG 的 ECDH/ECDSA 依赖 BCryptDeriveKey 的 RAW_SECRET（Windows 10+）。
+# 只开放 curve25519/ECDH 的服务器必须打开它；Win7 兼容构建不能用。
+if(RSHELL_WINDOWS7_COMPAT)
+    set(RSHELL_WINCNG_ECDSA_DEFAULT OFF)
+else()
+    set(RSHELL_WINCNG_ECDSA_DEFAULT ON)
+endif()
+option(RSHELL_WINCNG_ECDSA
+    "WinCNG ECDH/ECDSA support (Windows 10+; needed for servers that only offer ECDH, incompatible with Windows 7)" ${RSHELL_WINCNG_ECDSA_DEFAULT})
+
+if(WIN32 AND RSHELL_WINCNG_ECDSA AND RSHELL_WINDOWS7_COMPAT)
+    message(FATAL_ERROR
+        "RSHELL_WINCNG_ECDSA 需要 Windows 10+ 的 CNG 接口，不能与 RSHELL_WINDOWS7_COMPAT=ON 同时开启。"
+        "Win7 构建请加 -DRSHELL_WINCNG_ECDSA=OFF；要连接只开放 curve25519/ECDH 的服务器，"
+        "请用 -DRSHELL_WINDOWS7_COMPAT=OFF 构建（默认启用 CNG ECDH）。")
+endif()
+
+if(WIN32 AND RSHELL_WINDOWS7_COMPAT)
+    if(MSVC AND MSVC_VERSION GREATER_EQUAL 1950)
+        message(FATAL_ERROR
+            "Windows 7 compatibility requires MSVC v143 (14.44) or older; MSVC 14.50+ removed legacy Windows support. "
+            "Install the v143 toolset and configure a fresh build directory with -T v143,version=14.44. "
+            "Use -DRSHELL_WINDOWS7_COMPAT=OFF only for a modern-Windows build.")
+    endif()
+    add_compile_definitions(WINVER=0x0601 _WIN32_WINNT=0x0601 NTDDI_VERSION=0x06010000)
+endif()
 
 # 图标资源（src/rshell.rc -> src/res/rshell.ico）需要 RC 语言；
 # 图标由 tools/make_icon.py 生成，改了设计重跑一次脚本即可。
@@ -74,6 +102,10 @@ if(NOT RSHELL_HAVE_SYSTEM_LIBSSH2)
     set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
     set(ENABLE_ZLIB_COMPRESSION OFF CACHE BOOL "" FORCE)
     set(CLEAR_MEMORY ON CACHE BOOL "" FORCE)
+    if(WIN32 AND (NOT RSHELL_CRYPTO_BACKEND OR RSHELL_CRYPTO_BACKEND STREQUAL "WinCNG"))
+        # 把 rshell 的选项转给 vendored libssh2；OpenSSL 后端自带 ECDH，不需要这个开关。
+        set(ENABLE_ECDSA_WINCNG ${RSHELL_WINCNG_ECDSA} CACHE BOOL "WinCNG ECDSA support" FORCE)
+    endif()
     if(RSHELL_CRYPTO_BACKEND)
         set(CRYPTO_BACKEND ${RSHELL_CRYPTO_BACKEND} CACHE STRING "" FORCE)
     endif()
@@ -89,6 +121,41 @@ if(NOT RSHELL_HAVE_SYSTEM_LIBSSH2)
         FetchContent_MakeAvailable(libssh2)
     endif()
     set(RSHELL_LIBSSH2_TARGET libssh2)
+
+    # 内嵌 Monocypher 提供 Ed25519/X25519，补上 WinCNG 后端缺失的密钥登录算法。
+    if(WIN32 AND (NOT RSHELL_CRYPTO_BACKEND OR RSHELL_CRYPTO_BACKEND STREQUAL "WinCNG"))
+        set(RSHELL_MONOCYPHER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/monocypher")
+        # libssh2 是别名，真正的静态库目标名是 libssh2_static。
+        target_compile_definitions(libssh2_static PRIVATE LIBSSH2_ED25519_MONOCYPHER)
+        target_sources(libssh2_static PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libssh2/src/wincng_ed25519.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libssh2/src/wincng_keys.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/libssh2/src/wincng_ppk.c"
+            "${RSHELL_MONOCYPHER_DIR}/monocypher.c"
+            "${RSHELL_MONOCYPHER_DIR}/monocypher-ed25519.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/argon2.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/core.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/encoding.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/ref.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/thread.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/blake2/blake2b.c")
+        target_include_directories(libssh2_static PRIVATE
+            "${RSHELL_MONOCYPHER_DIR}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/blake2")
+        target_compile_definitions(libssh2_static PRIVATE
+            LIBSSH2_ED25519_MONOCYPHER ARGON2_NO_THREADS)
+        set_source_files_properties(
+            "${RSHELL_MONOCYPHER_DIR}/monocypher.c"
+            "${RSHELL_MONOCYPHER_DIR}/monocypher-ed25519.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/argon2.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/core.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/encoding.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/ref.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/thread.c"
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/argon2/blake2/blake2b.c"
+            PROPERTIES C_STANDARD 99)
+    endif()
 endif()
 
 message(STATUS "libssh2 target: ${RSHELL_LIBSSH2_TARGET}")
@@ -119,7 +186,7 @@ target_link_libraries(rshell_core PUBLIC ${RSHELL_LIBSSH2_TARGET})
 
 
 if(WIN32)
-    target_link_libraries(rshell_core PUBLIC ws2_32 crypt32 advapi32 shell32 bcrypt ncrypt)
+    target_link_libraries(rshell_core PUBLIC ws2_32 crypt32 shell32 bcrypt ncrypt)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -154,6 +221,19 @@ if(WIN32)
     )
     target_link_libraries(rshell_gui PRIVATE rshell_core comdlg32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32)
     set_target_properties(rshell_gui PROPERTIES OUTPUT_NAME "rshell-gui")
+endif()
+
+# 检查标准库/第三方静态库是否意外引入 Win8+ API，不能只检查我们自己的源码。
+if(WIN32 AND MSVC AND RSHELL_WINDOWS7_COMPAT)
+    get_filename_component(RSHELL_LINKER_DIRECTORY "${CMAKE_LINKER}" DIRECTORY)
+    find_program(RSHELL_DUMPBIN dumpbin HINTS "${RSHELL_LINKER_DIRECTORY}" REQUIRED)
+    foreach(target rshell rshell_gui)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND}
+                "-DEXECUTABLE=$<TARGET_FILE:${target}>" "-DDUMPBIN=${RSHELL_DUMPBIN}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_win7_imports.cmake"
+            VERBATIM)
+    endforeach()
 endif()
 
 # ---------------------------------------------------------------------------

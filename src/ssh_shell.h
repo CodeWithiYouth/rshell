@@ -4,6 +4,8 @@
 #include <libssh2.h>
 
 #include <atomic>
+#include <condition_variable>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -32,8 +34,8 @@ public:
     void start(const ConnectionOptions& options, const std::string& term, int cols, int rows);
     void setCallbacks(ShellCallbacks callbacks);
 
-    // 线程安全：把键盘输入送到远端
-    void write(const std::string& data);
+    // 线程安全：只入队，不在调用线程执行网络 I/O；队列满/断线返回 false。
+    bool write(const std::string& data);
     // 线程安全：通知远端窗口大小变化
     void resize(int cols, int rows);
     // 关闭通道并等待读线程退出
@@ -44,15 +46,20 @@ public:
     const std::string& fingerprint() const { return fingerprint_; }
     const std::string& kex() const { return kex_; }
     const std::string& serverBanner() const { return banner_; }
-    const std::string& closedReason() const { return closedReason_; }
+    std::string closedReason() const;
 
 private:
     void readerLoop();
-    bool writeRaw(const char* data, std::size_t len);
 
     std::unique_ptr<SshSession> session_;
     LIBSSH2_CHANNEL* channel_ = nullptr;
-    std::mutex mutex_;  // 保护 libssh2 调用（读线程与 UI 线程共享会话）
+    // 通道 I/O 全部归 reader_；mutex_ 只保护队列、尺寸请求与关闭原因。
+    mutable std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<std::string> outgoing_;
+    std::size_t queuedBytes_ = 0;
+    int resizeCols_ = 0;
+    int resizeRows_ = 0;
     std::thread reader_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_{false};

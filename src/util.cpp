@@ -455,7 +455,12 @@ bool stdoutIsTty() {
 
 bool stdinIsTty() {
 #ifdef _WIN32
-    return _isatty(_fileno(stdin)) != 0;
+    // 不能用 _isatty：重定向到 NUL 时它也返回真（NUL 是字符设备），
+    // 结果 CLI 会去读控制台口令并一直等不到输入。只有真正的控制台句柄才算交互。
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h == INVALID_HANDLE_VALUE || h == nullptr) return false;
+    DWORD mode = 0;
+    return GetConsoleMode(h, &mode) != 0;
 #else
     return isatty(STDIN_FILENO) != 0;
 #endif
@@ -576,7 +581,14 @@ namespace {
 bool colorEnabled() {
     static const bool enabled = [] {
 #ifdef _WIN32
-        return _isatty(_fileno(stderr)) != 0;
+        // 颜色都写到 stderr：只有真正的控制台、并且成功开启 VT 转义处理时才上色。
+        // Windows 7 的 SetConsoleMode 不认识 ENABLE_VIRTUAL_TERMINAL_PROCESSING，
+        // 直接输出 ANSI 会露出 “[32m” 这样的原始转义序列。
+        HANDLE h = GetStdHandle(STD_ERROR_HANDLE);
+        DWORD mode = 0;
+        if (h == INVALID_HANDLE_VALUE || h == nullptr || !GetConsoleMode(h, &mode)) return false;
+        if ((mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) return true;
+        return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
 #else
         return isatty(STDERR_FILENO) != 0;
 #endif

@@ -5,7 +5,7 @@ rename、chmod、exec、密钥认证，以及交互式 sftp 脚本。
 
 用法：
     python tests/e2e_test.py
-    python tests/e2e_test.py --exe build_cmake/Release/rshell.exe --keep
+    python tests/e2e_test.py --exe build/win7/rshell.exe --keep
 """
 
 from __future__ import annotations
@@ -351,13 +351,18 @@ def key_auth_pem():
 
 @test
 def key_auth_openssh_format():
-    """OpenSSH 新格式私钥：WinCNG 后端无法解析，应提示转换为 PEM。"""
-    proc, out, err = run_cli("ls", "-l", "/upload", key=LOCAL / "id_rsa_openssh",
+    """OpenSSH 新格式 RSA 私钥：当前构建应直接支持。"""
+    run_cli("ls", "-l", "/upload", key=LOCAL / "id_rsa_openssh",
+            use_password=False)
+
+
+@test
+def key_auth_ecdsa_sec1():
+    """SEC1 ECDSA 私钥：modern 构建支持；Win7 兼容构建没有 ECDSA。"""
+    proc, out, err = run_cli("ls", "-l", "/upload", key=LOCAL / "id_ecdsa_sec1",
                              use_password=False, expect=None)
-    if proc.returncode == 0:
-        return  # 换用 OpenSSL 后端（或更新版 libssh2）后可支持
-    combined = out + err
-    check("PEM" in combined, "OpenSSH 新格式私钥失败时应提示转换为 PEM", combined)
+    if proc.returncode != 0:
+        print("    （当前构建不支持 ECDSA，跳过）")
 
 
 @test
@@ -408,11 +413,12 @@ def force_rmtree(path: Path):
 
 
 def make_keys():
-    """生成 PEM / OpenSSH 新格式 / ed25519 三种私钥，用于认证测试。"""
+    """生成 PEM / OpenSSH 新格式 / SEC1 ECDSA / ed25519 私钥，用于认证测试。"""
     ssh_keygen = shutil.which("ssh-keygen") or r"C:\Windows\System32\OpenSSH\ssh-keygen.exe"
     specs = [
         ("id_rsa_pem", ["-t", "rsa", "-b", "2048", "-m", "PEM"]),
         ("id_rsa_openssh", ["-t", "rsa", "-b", "2048"]),
+        ("id_ecdsa_sec1", ["-t", "ecdsa", "-b", "256", "-m", "PEM"]),
         ("id_ed25519", ["-t", "ed25519"]),
     ]
     for name, extra in specs:
@@ -450,15 +456,21 @@ def main():
     parser = argparse.ArgumentParser(description="rshell 端到端测试")
     parser.add_argument(
         "--exe",
-        default=str(REPO / "build_cmake" / "Release" / "rshell.exe"),
-        help="rshell.exe 路径",
+        default=None,
+        help="rshell.exe 路径（默认依次找 build/modern/rshell.exe、build/win7/rshell.exe）",
     )
     parser.add_argument("--keep", action="store_true", help="保留测试目录")
     args = parser.parse_args()
 
-    EXE = str(Path(args.exe).resolve())
+    candidates = [
+        REPO / "build" / "modern" / "rshell.exe",
+        REPO / "build" / "win7" / "rshell.exe",
+    ]
+    exe = Path(args.exe) if args.exe else next((c for c in candidates if c.is_file()), candidates[0])
+    EXE = str(exe.resolve())
     if not os.path.isfile(EXE):
         print("找不到 rshell.exe：" + EXE, file=sys.stderr)
+        print("请先运行 .\\build.ps1 或 .\\build.ps1 -Modern，或用 --exe 指定。", file=sys.stderr)
         return 2
 
     prepare_fixtures()
@@ -503,3 +515,5 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+

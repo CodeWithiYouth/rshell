@@ -275,7 +275,21 @@ class TestSSHServer(paramiko.ServerInterface):
                             channel.shutdown_write()
                             channel.close()
                             return
-                        if command.startswith("echo "):
+                        if command.startswith("probe-sink "):
+                            # 制造 SSH 窗口背压，验证客户端入队不阻塞 UI、数据顺序完整。
+                            remaining = int(command.split()[1])
+                            total = remaining
+                            channel.sendall(b"sink-ready\r\n")
+                            time.sleep(0.35)
+                            valid = True
+                            while remaining:
+                                chunk = channel.recv(min(65536, remaining))
+                                if not chunk:
+                                    return
+                                remaining -= len(chunk)
+                                valid = valid and chunk == b"q" * len(chunk)
+                            channel.sendall(f"sink:{total}:{'ok' if valid else 'bad'}\r\n".encode())
+                        elif command.startswith("echo "):
                             channel.sendall(command[5:].encode("utf-8") + b"\r\n")
                         elif command == "pwd":
                             channel.sendall(self.root.encode("utf-8") + b"\r\n")
@@ -478,7 +492,8 @@ def start_server(
     """启动服务器线程，返回 (host, port, stop_event, thread)。port=0 表示随机端口。"""
     os.makedirs(root, exist_ok=True)
     if host_key_path and os.path.exists(host_key_path):
-        host_key = paramiko.RSAKey(filename=host_key_path)
+        # 允许用任意类型的测试主机密钥（ed25519/ecdsa/rsa）。
+        host_key = paramiko.PKey.from_path(host_key_path)
     else:
         host_key = paramiko.RSAKey.generate(2048)
         if host_key_path:

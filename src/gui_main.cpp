@@ -8,6 +8,7 @@
 
 #include <windows.h>
 #include <commdlg.h>
+#include <commctrl.h>
 #include <dwmapi.h>
 #include <imm.h>
 #include <shellapi.h>
@@ -48,6 +49,7 @@
 #include "terminal.h"
 #include "util.h"
 #include "vault.h"
+#include "win_compat.h"
 
 using namespace rshell;
 
@@ -65,6 +67,7 @@ enum : UINT {
     WM_FS_EVENT = WM_APP + 5,     // lParam = FsEvent*（UI 线程负责释放）
     WM_FS_STATS = WM_APP + 6,     // lParam = RemoteStats*（UI 线程负责释放）
     WM_ASK_HOSTKEY = WM_APP + 7,  // lParam = HostKeyRequest*（工作线程同步等待）
+    WM_VAULT_TPM_DONE = WM_APP + 8,  // lParam = std::shared_ptr<TpmAttempt>*（UI 线程释放）
 };
 
 // 终端目录跟随钩子的注入分三步走（每次一个定时器，避免一次写完 shell 还没执行完）
@@ -82,6 +85,7 @@ enum : int {
     ID_BTN_FS_UP,       // 文件面板：上级目录
     ID_STATUS,
     ID_TERM,
+    ID_SEARCH_EDIT,
     IDM_CONNECT = 2001,
     IDM_DISCONNECT,
     IDM_OPEN,
@@ -94,6 +98,8 @@ enum : int {
     IDM_ZOOM_IN,
     IDM_ZOOM_OUT,
     IDM_ZOOM_RESET,
+    IDM_SEARCH,
+    IDM_RECONNECT,
     IDM_ABOUT,
     IDM_EXIT,
     // 文件面板右键菜单（都在 popup::Item 里，走同一个 WM_COMMAND 分发）
@@ -112,6 +118,7 @@ struct App {
     HINSTANCE inst = nullptr;
     HWND main = nullptr;
     HWND list = nullptr;
+    HWND fsPathEdit = nullptr;
     HWND term = nullptr;
     HWND status = nullptr;
     HWND btnNew = nullptr;
@@ -128,6 +135,13 @@ struct App {
     std::string currentSession;
     std::wstring windowTitle = L"rshell";
     std::wstring statusText = L"就绪";
+    bool statusError = false;
+    ULONGLONG statusUntil = 0;
+    ULONGLONG terminalInfoUntil = 0;
+    int statusFontSize = 16;
+    HWND statusHint = nullptr;
+    std::wstring statusHintText;
+    int hoverStatusAction = 0;
 
     HFONT font = nullptr;
     HFONT fontBold = nullptr;
@@ -190,6 +204,13 @@ struct App {
     int sbDragStartOffset = 0;
 
     bool connecting = false;
+    UINT_PTR connectionId = 0;
+    HWND searchEdit = nullptr;
+    bool searchOpen = false;
+    bool searchDirty = false;
+    std::vector<TerminalMatch> searchMatches;
+    int searchIndex = -1;
+    RECT searchBox{}, searchPrev{}, searchNext{}, searchClose{};
     bool cursorOn = true;
     // 终端目录跟随：连接后往远端 shell 注入一段 OSC 7 钩子（bash/zsh），
     // 每次画提示符时把 $PWD 报回来。注入要等 shell 真的开始说话（rc 跑完），
@@ -272,23 +293,34 @@ struct App {
 
 App g_app;
 
-void connectToSession(const Session& session, const std::wstring& password);
+void connectToSession(const Session& session, const std::wstring& password,
+                      const std::wstring& keyPassphrase);
 void stopRemoteFs();
-void startRemoteFs(const Session& session, const std::wstring& password);
+void startRemoteFs(const Session& session, const std::wstring& password,
+                   const std::wstring& keyPassphrase);
 
-// 密码只在内存里留到断开连接：文件通道要用同一个凭据再连一次
-ProtectedSecret g_currentPassword;  // 会话期间只存密文，用时才 reveal 出临时明文
+// 密码/私钥口令只在内存里留到断开连接：文件通道要用同一个凭据再连一次
+ProtectedSecret g_currentPassword;       // 登录密码
+ProtectedSecret g_currentKeyPassphrase;  // 私钥口令
 
-// 用户在密码框里勾了「记住密码」时，先记下要写的条目，等连接成功再落库：
+// 用户在密码框里勾了「记住密码/记住私钥口令」时，先记下要写的条目，等连接成功再落库：
 // 口令刚被服务器拒绝的话不该被保存下来。
 std::string g_pendingCredentialTarget;
 std::string g_pendingCredentialSession;
+std::string g_pendingKeyCredentialTarget;
+std::string g_pendingKeyCredentialSession;
 void disconnectSession();
 void updateButtons();
 void doCopy();
 void doPaste();
 void doSelectAll();
 void onConnectCommand();
+void connectStoredSession(const std::string& name);
+void openTerminalMenu(HWND hwnd, POINT screenPt);
+void showTerminalSearch(bool show);
+void refreshTerminalSearch(bool reveal = true);
+void stepTerminalSearch(int direction);
+void hideStatusHint();
 void openMainMenu(HWND hwnd);
 void layoutMain(HWND hwnd);
 bool askHostKey(const std::string& host, const std::string& keyType,
@@ -329,21 +361,10 @@ std::string toUtf8(const wchar_t* text) { return text ? toUtf8(std::wstring(text
 // 宽字符串清零后再释放：密码用完别留在堆里等下次分配捡到
 void wipeWide(std::wstring& text) { wipeWideString(text); }
 
-// 凭据管理器「用户名」列显示的内容：user@host:port（user 为空时退回当前 Windows 用户）
-std::string sessionCredentialLabel(const Session& session) {
-    std::string user = session.user;
-    if (user.empty()) {
-        if (const char* env = std::getenv("USERNAME")) user = env;
-    }
-    std::string label = user.empty() ? session.host : user + "@" + session.host;
-    return label + ":" + std::to_string(session.port > 0 ? session.port : 22);
-}
-
 // ---------------------------------------------------------------- 口令存放位置
 //
-// 口令可能落在两处：Windows 凭据管理器（默认），或解锁后的密码保险库
-// （主菜单解锁后由 credential_store 的路由改用保险库）。界面上的提示文字都
-// 由下面两个函数生成，避免解锁之后还写着“保存到凭据管理器”。
+// 口令只有一处持久化位置：密码保险库（vault.dat）。未解锁时读不到条目，
+// 界面上的提示文字都由下面几个函数生成，避免写成“已保存”却其实还没解锁。
 
 bool vaultFileExists(const std::wstring& path) {
     const DWORD attr = GetFileAttributesW(path.c_str());
@@ -364,22 +385,55 @@ bool vaultFilePresent() { return vaultFileExists(vaultPath()); }
 std::wstring savedPasswordLocation() {
     if (g_app.vault.unlocked()) return L"密码保险库";
     if (vaultFilePresent()) return L"密码保险库（已锁定，连接前需要先解锁）";
-    return L"Windows 凭据管理器";
+    return L"密码保险库（尚未创建）";
 }
 
-// 这一次操作实际会动到的后端：锁定状态下路由会退回凭据管理器（见
-// credential_store.cpp），勾选框和删除确认要用这个说法才准确。
-std::wstring activePasswordBackend() {
-    return g_app.vault.unlocked() ? L"密码保险库" : L"Windows 凭据管理器";
-}
+// 这一次操作实际会动到的后端：保险库没解锁时不会写任何地方。
+std::wstring activePasswordBackend() { return L"密码保险库"; }
 
 std::wstring rememberPasswordCheckboxText() {
-    return L"记住密码（保存到 " + activePasswordBackend() + L"）";
+    if (g_app.vault.unlocked()) return L"记住密码（保存到密码保险库）";
+    if (vaultFilePresent()) return L"记住密码（连接时解锁密码保险库）";
+    return L"记住密码（连接时创建密码保险库）";
 }
 
-void setStatus(const std::wstring& text) {
+std::wstring rememberKeyPassphraseCheckboxText() {
+    if (g_app.vault.unlocked()) return L"记住私钥口令（保存到密码保险库）";
+    if (vaultFilePresent()) return L"记住私钥口令（连接时解锁密码保险库）";
+    return L"记住私钥口令（连接时创建密码保险库）";
+}
+
+// 后面几个函数会用到：有 vault.dat 时弹出解锁对话框，成功返回 true。
+bool ensureVaultUnlocked();
+
+// 主菜单的保险库入口：没有文件就新建，有文件且锁定就解锁，已解锁则锁定。
+void vaultCommand();
+
+void setStatus(const std::wstring& text, bool error = false) {
+    hideStatusHint();
     g_app.statusText = text;
+    g_app.statusError = error && !text.empty();
+    g_app.statusUntil = !error && !text.empty() ? GetTickCount64() + 4000 : 0;
     if (g_app.status) SetWindowTextW(g_app.status, text.c_str());
+    if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
+}
+
+bool statusNoticeActive(ULONGLONG now) {
+    return !g_app.statusText.empty() && (g_app.statusError || now < g_app.statusUntil);
+}
+
+void expireStatusNotices(ULONGLONG now) {
+    bool changed = false;
+    if (g_app.statusUntil && now >= g_app.statusUntil) {
+        g_app.statusText.clear();
+        g_app.statusUntil = 0;
+        changed = true;
+    }
+    if (g_app.terminalInfoUntil && now >= g_app.terminalInfoUntil) {
+        g_app.terminalInfoUntil = 0;
+        changed = true;
+    }
+    if (changed && g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
 }
 
 // 调试用：设置 RSHELL_TERM_DUMP=<文件> 可把远端原始输出保存下来，便于排查渲染问题
@@ -614,21 +668,21 @@ inline COLORREF toColorRef(std::uint32_t c) {
 namespace ui {
 using std::uint32_t;
 
-constexpr uint32_t bgApp = 0x010409;       // 窗口底色（比终端再暗一档，让终端卡片浮起来）
-constexpr uint32_t bgPanel = 0x161B22;     // 侧栏 / 标题栏
-constexpr uint32_t bgCard = 0x1C2128;      // 卡片
-constexpr uint32_t bgHover = 0x22272E;     // hover 叠加
-constexpr uint32_t bgActive = 0x1F2A37;    // 选中叠加
-constexpr uint32_t border = 0x30363D;      // 常规描边
-constexpr uint32_t borderSoft = 0x21262D;  // 弱描边
-constexpr uint32_t text = 0xE6EDF3;        // 主文字
-constexpr uint32_t textDim = 0x8B949E;     // 次要文字
-constexpr uint32_t textFaint = 0x6E7681;   // 提示文字
-constexpr uint32_t accent = 0x2F81F7;      // 主色
-constexpr uint32_t accentDeep = 0x1F6FEB;  // 主色（按下）
-constexpr uint32_t success = 0x3FB950;
-constexpr uint32_t warn = 0xD29922;
-constexpr uint32_t danger = 0xF85149;
+constexpr uint32_t bgApp = 0x0C1018;       // 窗口底色
+constexpr uint32_t bgPanel = 0x151B27;     // 侧栏 / 标题栏
+constexpr uint32_t bgCard = 0x1B2332;      // 卡片
+constexpr uint32_t bgHover = 0x242E42;     // hover 叠加
+constexpr uint32_t bgActive = 0x293552;    // 选中叠加
+constexpr uint32_t border = 0x303C52;      // 常规描边
+constexpr uint32_t borderSoft = 0x222C3D;  // 弱描边
+constexpr uint32_t text = 0xE8EDF7;        // 主文字
+constexpr uint32_t textDim = 0xA6B2C8;     // 次要文字
+constexpr uint32_t textFaint = 0x8391AA;   // 提示文字
+constexpr uint32_t accent = 0x6574E8;      // 主色
+constexpr uint32_t accentDeep = 0x5060CF;  // 主色（按下）
+constexpr uint32_t success = 0x61D5AC;
+constexpr uint32_t warn = 0xE5B76A;
+constexpr uint32_t danger = 0xF07888;
 
 // t=0 取 a，t=1 取 b
 inline uint32_t mix(uint32_t a, uint32_t b, double t) {
@@ -977,6 +1031,20 @@ void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome 
     const std::size_t history = term.scrollbackCount();
     const int offset = std::min<int>(term.scrollOffset(), static_cast<int>(history));
     const std::size_t firstLine = history - static_cast<std::size_t>(offset);
+    std::vector<std::uint32_t> searchColors;
+    if (chrome && g_app.searchOpen && !g_app.searchMatches.empty()) {
+        searchColors.resize(static_cast<std::size_t>(rows * cols));
+        auto it = std::lower_bound(g_app.searchMatches.begin(), g_app.searchMatches.end(), firstLine,
+                                  [](const TerminalMatch& m, std::size_t line) { return m.line < line; });
+        for (; it != g_app.searchMatches.end() && it->line < firstLine + rows; ++it) {
+            const bool current = it - g_app.searchMatches.begin() == g_app.searchIndex;
+            for (int col = it->column; col < std::min(cols, it->column + it->width); ++col)
+                searchColors[(it->line - firstLine) * cols + col] = current ? ui::warn : 0x514326;
+        }
+    }
+    auto searchColor = [&](int row, int col) -> std::uint32_t {
+        return searchColors.empty() ? 0 : searchColors[static_cast<std::size_t>(row * cols + col)];
+    };
     SetBkMode(mem, TRANSPARENT);
     // 基线对齐：不同回退字体的 ascent 不同，按基线绘制才能保证同一行文字上下对齐
     SetTextAlign(mem, TA_LEFT | TA_BASELINE);
@@ -995,6 +1063,7 @@ void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome 
                 const Cell& c = cells[static_cast<std::size_t>(col)];
                 bg = (c.flags & kFlagReverse) ? c.fg : c.bg;
             }
+            if (searchColor(row, col)) bg = searchColor(row, col);
             if (isSelectedLine(lineIndex, col)) bg = term.theme().selection;
             int end = col + 1;
             while (end < cols) {
@@ -1003,6 +1072,7 @@ void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome 
                     const Cell& c = cells[static_cast<std::size_t>(end)];
                     other = (c.flags & kFlagReverse) ? c.fg : c.bg;
                 }
+                if (searchColor(row, end)) other = searchColor(row, end);
                 if (isSelectedLine(lineIndex, end)) other = term.theme().selection;
                 if (other != bg) break;
                 ++end;
@@ -1017,6 +1087,7 @@ void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome 
         while (col < cols && col < static_cast<int>(cells.size())) {
             const Cell& first = cells[static_cast<std::size_t>(col)];
             std::uint32_t fg = (first.flags & kFlagReverse) ? first.bg : first.fg;
+            if (searchColor(row, col)) fg = searchColor(row, col) == ui::warn ? 0x10141D : ui::text;
             if (isSelectedLine(lineIndex, col)) fg = term.theme().fg;
             const std::uint8_t flags = first.flags;
             const bool bold = (flags & kFlagBold) != 0;
@@ -1028,6 +1099,7 @@ void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome 
             while (end < cols && end < static_cast<int>(cells.size())) {
                 const Cell& c = cells[static_cast<std::size_t>(end)];
                 std::uint32_t cfg = (c.flags & kFlagReverse) ? c.bg : c.fg;
+                if (searchColor(row, end)) cfg = searchColor(row, end) == ui::warn ? 0x10141D : ui::text;
                 if (isSelectedLine(lineIndex, end)) cfg = term.theme().fg;
                 const bool sameStyle = (cfg == fg) &&
                                        ((c.flags & ~kFlagWideTail) == (flags & ~kFlagWideTail));
@@ -1131,6 +1203,36 @@ void paintTerminal(HWND hwnd) {
     }
 
     drawTerminalGrid(g_app.memDC, width, height, GetFocus() == hwnd, true);
+    // 仅在首次打开的空终端显示引导，保留断开后的全部输出。
+    if (g_app.currentSession.empty() && !g_app.connecting && !g_app.shell.running() &&
+        g_app.termData.scrollbackCount() == 0 && width >= dp(320) && height >= dp(220)) {
+        bool blank = true;
+        for (int row = 0; row < g_app.termData.rows() && blank; ++row)
+            blank = g_app.termData.plainLine(static_cast<std::size_t>(row)).empty();
+        if (blank) {
+            HDC mem = g_app.memDC;
+            const int saved = SaveDC(mem);
+            SetTextAlign(mem, TA_LEFT | TA_TOP);
+            fillRoundRect(mem, RECT{0, 0, width - 1, height - 1}, dp(10),
+                          g_app.termData.theme().bg, ui::border);
+            const int center = width / 2;
+            const int top = std::max(dp(20), height / 2 - dp(100));
+            const RECT icon{center - dp(26), top, center + dp(26), top + dp(52)};
+            fillRoundRect(mem, icon, dp(14), ui::bgActive, ui::border);
+            drawText(mem, L">_", icon, ui::accent, g_app.titleFont,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            drawText(mem, L"连接你的下一台主机", RECT{dp(16), top + dp(72), width - dp(16), top + dp(104)},
+                     ui::text, g_app.titleFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            drawText(mem, L"选择一个会话，开始 SSH 终端与文件管理。",
+                     RECT{dp(16), top + dp(110), width - dp(16), top + dp(136)},
+                     ui::textDim, g_app.tinyFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            const RECT shortcut{center - dp(124), top + dp(156), center + dp(124), top + dp(188)};
+            fillRoundRect(mem, shortcut, dp(7), ui::bgPanel, ui::borderSoft);
+            drawText(mem, L"Ctrl+O  打开会话     Ctrl+N  新建", shortcut,
+                     ui::textDim, g_app.tinyFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            RestoreDC(mem, saved);
+        }
+    }
     BitBlt(dc, 0, 0, width, height, g_app.memDC, 0, 0, SRCCOPY);
     EndPaint(hwnd, &ps);
 }
@@ -1153,7 +1255,7 @@ bool renderDumpToBmp(const std::wstring& dumpPath, const std::wstring& outPath, 
     const std::string data((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     if (data.empty()) return false;
 
-    if (g_app.dpi <= 0) g_app.dpi = GetDpiForSystem();
+    if (g_app.dpi <= 0) g_app.dpi = wincompat::systemDpi();
     createFonts();
     g_app.termData.reset();
     g_app.termData.resize(cols, rows);
@@ -1251,7 +1353,7 @@ void flushTerminalResponse() {
 void sendInput(const std::string& text) {
     if (text.empty()) return;
     if (g_app.shell.running()) {
-        g_app.shell.write(text);
+        if (!g_app.shell.write(text)) setStatus(L"发送队列已满或连接已断开，本次输入未发送", true);
     } else {
         setStatus(L"尚未连接：请先选择一个会话并连接");
     }
@@ -1297,6 +1399,7 @@ void sendMouse(int button, bool press, int x, int y) {
 }
 
 void layoutTerminal(HWND hwnd) {
+    if (g_app.searchOpen) g_app.searchDirty = true;
     RECT rc;
     GetClientRect(hwnd, &rc);
     g_app.termPadX = dp(10);
@@ -1312,7 +1415,11 @@ void layoutTerminal(HWND hwnd) {
     const int availH = std::max(dp(20), static_cast<int>(rc.bottom) - g_app.termPadY * 2);
     int cols = std::max(20, availW / cw);
     int rows = std::max(5, availH / ch);
-    if (cols != g_app.termData.cols() || rows != g_app.termData.rows()) {
+    if (cols != g_app.termData.cols() || rows != g_app.termData.rows() ||
+        g_app.statusFontSize != g_app.fontSize) {
+        g_app.statusFontSize = g_app.fontSize;
+        g_app.terminalInfoUntil = GetTickCount64() + 2000;
+        if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
         g_app.termData.resize(cols, rows);
         if (g_app.shell.running()) g_app.shell.resize(cols, rows);
         InvalidateRect(hwnd, nullptr, FALSE);
@@ -1399,7 +1506,7 @@ void doCopy() {
                                                 g_app.selEndLine, g_app.selEndCol);
     if (text.empty()) return;
     if (!copyTextToClipboard(toWide(text))) {
-        setStatus(L"复制失败：剪贴板正被其它程序占用");
+        setStatus(L"复制失败：剪贴板正被其它程序占用", true);
         return;
     }
     setStatus(L"已复制选中内容（Ctrl+V 粘贴）");
@@ -1469,6 +1576,21 @@ bool handleKeyDown(HWND hwnd, WPARAM key, bool alt) {
     const bool modified = mod != 1;
 
     if (alt && key == VK_F4) return false;  // 保留系统 Alt+F4 关闭窗口
+    if (ctrl && shift && !alt && key == 'F') {
+        g_app.swallowChar = 0x06;
+        showTerminalSearch(true);
+        return true;
+    }
+    if (ctrl && shift && !alt && key == 'R') {
+        g_app.swallowChar = 0x12;
+        PostMessageW(g_app.main, WM_COMMAND, IDM_RECONNECT, 0);
+        return true;
+    }
+    if (g_app.searchOpen && !ctrl && !alt && (key == VK_F3 || key == VK_ESCAPE)) {
+        if (key == VK_F3) stepTerminalSearch(shift ? -1 : 1);
+        else { g_app.swallowChar = 0x1B; showTerminalSearch(false); }
+        return true;
+    }
 
     if (ctrl && !alt && (key == VK_OEM_PLUS || key == VK_ADD)) {
         g_app.fontSize = std::min(40, g_app.fontSize + 2);
@@ -1994,16 +2116,18 @@ LRESULT CALLBACK terminalProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 sendMouse(2, false, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
                 return 0;
             }
-            HMENU menu = CreatePopupMenu();
-            AppendMenuW(menu, MF_STRING, IDM_COPY, L"复制\tCtrl+Shift+C");
-            AppendMenuW(menu, MF_STRING, IDM_PASTE, L"粘贴\tCtrl+V");
-            AppendMenuW(menu, MF_STRING, IDM_SELECT_ALL, L"全选\tCtrl+Shift+A");
             POINT pt;
             GetCursorPos(&pt);
-            TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
-            DestroyMenu(menu);
+            openTerminalMenu(hwnd, pt);
             return 0;
         }
+        case WM_CONTEXTMENU:
+            if (GET_X_LPARAM(lp) == -1 && GET_Y_LPARAM(lp) == -1) {
+                POINT pt{g_app.termPadX, g_app.termPadY};
+                ClientToScreen(hwnd, &pt);
+                openTerminalMenu(hwnd, pt);
+            }
+            return 0;
         case WM_GETDLGCODE:
             return DLGC_WANTALLKEYS;
         case WM_COMMAND:
@@ -2016,6 +2140,10 @@ LRESULT CALLBACK terminalProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case IDM_SELECT_ALL:
                     doSelectAll();
+                    return 0;
+                case IDM_SEARCH:
+                case IDM_RECONNECT:
+                    PostMessageW(g_app.main, WM_COMMAND, wp, lp);
                     return 0;
                 default:
                     return 0;
@@ -2033,6 +2161,7 @@ const Session* selectedSession() { return g_app.store.find(g_app.currentSession)
 
 // 自绘按钮的可用状态由按钮自己算，这里只负责触发重绘
 void updateButtons() {
+    if (!g_app.fsReady && g_app.fsPathEdit) ShowWindow(g_app.fsPathEdit, SW_HIDE);
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
     if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
 }
@@ -2076,19 +2205,28 @@ void sendCwdHookScript() {
 
 void disconnectSession() {
     stopCwdHook();
+    ++g_app.connectionId;
     if (g_app.shell.running() || g_app.connecting) {
         g_app.shell.close();
         g_app.connecting = false;
         setStatus(L"已断开连接");
+        g_app.termData.feed("\r\n[已主动断开连接]\r\n");
+        g_app.searchDirty = g_app.searchOpen;
+        InvalidateRect(g_app.term, nullptr, FALSE);
     }
     stopRemoteFs();
     g_currentPassword.clear();
+    g_currentKeyPassphrase.clear();
+    layoutMain(g_app.main);
     updateButtons();
 }
 
-void connectToSession(const Session& session, const std::wstring& password) {
+void connectToSession(const Session& session, const std::wstring& password,
+                      const std::wstring& keyPassphrase) {
     if (g_app.connecting) return;
     if (g_app.shell.running()) disconnectSession();
+    const UINT_PTR connectionId = ++g_app.connectionId;
+    g_app.shell.close();  // 等旧工作线程结束后才能替换回调。
 
     ConnectionOptions options;
     options.host = session.host;
@@ -2100,6 +2238,9 @@ void connectToSession(const Session& session, const std::wstring& password) {
     std::string utf8Password = toUtf8(password);
     options.password = utf8Password;
     wipeString(utf8Password);
+    std::string utf8KeyPassphrase = toUtf8(keyPassphrase);
+    options.keyPassphrase = utf8KeyPassphrase;
+    wipeString(utf8KeyPassphrase);
     options.timeoutSec = 20;
     options.allowDefaultKeys = true;
 
@@ -2118,35 +2259,47 @@ void connectToSession(const Session& session, const std::wstring& password) {
     };
 
     g_app.shell.setCallbacks(ShellCallbacks{
-        [mainWindow](std::string data) {
+        [mainWindow, connectionId](std::string data) {
             auto* payload = new std::string(std::move(data));
-            if (!PostMessageW(mainWindow, WM_SHELL_DATA, 0, reinterpret_cast<LPARAM>(payload))) {
+            if (!PostMessageW(mainWindow, WM_SHELL_DATA, connectionId, reinterpret_cast<LPARAM>(payload))) {
                 delete payload;
             }
         },
-        [mainWindow]() { PostMessageW(mainWindow, WM_SHELL_CLOSED, 0, 0); }});
+        [mainWindow, connectionId]() {
+            auto* reason = new std::string(g_app.shell.closedReason());
+            if (!PostMessageW(mainWindow, WM_SHELL_CLOSED, connectionId, reinterpret_cast<LPARAM>(reason)))
+                delete reason;
+        }});
 
     g_app.connecting = true;
     g_app.currentSession = session.name;
     g_currentPassword.assign(password);
+    g_currentKeyPassphrase.assign(keyPassphrase);
     g_app.termData.reset();
+    g_app.hasSelection = false;
+    g_app.searchMatches.clear();
+    g_app.searchIndex = -1;
+    g_app.searchDirty = g_app.searchOpen;
     guiLog("开始连接 " + options.user + "@" + options.host + ":" +
            std::to_string(options.port) + " key=" + options.keyPath +
-           (options.password.empty() ? " (无密码)" : " (使用密码)"));
+           (options.password.empty()
+                ? (keyPassphrase.empty() ? " (无密码)" : " (使用私钥口令)")
+                : " (使用密码)"));
     setStatus(L"正在连接 " + toWide(session.host) + L" …");
+    layoutMain(g_app.main);
     updateButtons();
 
     const int cols = g_app.termData.cols();
     const int rows = g_app.termData.rows();
-    std::thread([mainWindow, options, cols, rows]() {
+    std::thread([mainWindow, connectionId, options, cols, rows]() {
         try {
             g_app.shell.start(options, "xterm-256color", cols, rows);
             guiLog("连接成功，已打开 shell 通道");
-            PostMessageW(mainWindow, WM_CONNECT_OK, 0, 0);
+            PostMessageW(mainWindow, WM_CONNECT_OK, connectionId, 0);
         } catch (const std::exception& ex) {
             guiLog(std::string("连接失败：") + ex.what());
             auto* message = new std::string(ex.what());
-            if (!PostMessageW(mainWindow, WM_CONNECT_FAIL, 0, reinterpret_cast<LPARAM>(message))) {
+            if (!PostMessageW(mainWindow, WM_CONNECT_FAIL, connectionId, reinterpret_cast<LPARAM>(message))) {
                 delete message;
             }
         }
@@ -2159,9 +2312,9 @@ void connectToSession(const Session& session, const std::wstring& password) {
 // 与主窗口同一套配色，不用系统 MessageBox 的浅色外壳。
 namespace dlg {
 
-constexpr std::uint32_t bgCard = 0x161B22;   // 卡片底色
-constexpr std::uint32_t bgInput = 0x0D1117;  // 输入框底色
-constexpr std::uint32_t bgBtn = 0x21262D;    // 次级按钮
+constexpr std::uint32_t bgCard = ui::bgPanel;  // 卡片底色
+constexpr std::uint32_t bgInput = 0x10141D;    // 输入框底色
+constexpr std::uint32_t bgBtn = ui::bgCard;   // 次级按钮
 
 HBRUSH editBrush() {
     static HBRUSH brush = nullptr;
@@ -3230,6 +3383,9 @@ void runModalLoop(HWND dlg) {
 // savedBefore 表示这条会话之前存过密码（用来解释为什么又弹了框）。
 bool promptPassword(const std::wstring& title, std::wstring& password, bool* remember = nullptr,
                     bool savedBefore = false);
+// 私钥带口令时用同一个对话框，只换标题/字段名/勾选框文字。
+bool promptKeyPassphrase(const std::wstring& title, std::wstring& passphrase,
+                         bool* remember = nullptr, bool savedBefore = false);
 
 struct SessionMgrState {
     HWND dlg = nullptr;
@@ -3318,7 +3474,7 @@ MgrLayout mgrLayout() {
     l.note = RECT{fieldX, y, fieldRight, y + fieldH};
 
     // 密码状态行：左边两行说明，右边「清除密码」只在真的存过密码时可用
-    l.pwdClear = RECT{fieldRight - dp(88), l.note.bottom + dp(52), fieldRight,
+    l.pwdClear = RECT{fieldRight - dp(112), l.note.bottom + dp(52), fieldRight,
                       l.note.bottom + dp(80)};
     l.pwdState = RECT{l.left, l.note.bottom + dp(52), l.pwdClear.left - dp(12),
                       l.note.bottom + dp(84)};
@@ -3387,7 +3543,12 @@ void mgrLoadSession(const Session& s) {
     if (g_mgr.user) SetWindowTextW(g_mgr.user, toWide(s.user).c_str());
     if (g_mgr.key) SetWindowTextW(g_mgr.key, toWide(s.keyPath).c_str());
     if (g_mgr.note) SetWindowTextW(g_mgr.note, toWide(s.note).c_str());
-    if (g_mgr.pwdClear) EnableWindow(g_mgr.pwdClear, s.savePassword ? TRUE : FALSE);
+    if (g_mgr.pwdClear) {
+        SetWindowTextW(g_mgr.pwdClear,
+                       s.keyPath.empty() ? L"清除密码" : L"清除私钥口令");
+        const bool saved = s.keyPath.empty() ? s.savePassword : s.saveKeyPassphrase;
+        EnableWindow(g_mgr.pwdClear, saved ? TRUE : FALSE);
+    }
 }
 
 Session mgrFormSession() {
@@ -3446,6 +3607,9 @@ void paintSessionMgr(HDC dc, HWND hwnd) {
         fillRoundRect(dc, rc, dp(8),
                       selected ? ui::bgActive : (hovered ? ui::bgHover : ui::bgPanel),
                       selected ? ui::mix(ui::accent, ui::bgCard, 0.5) : 0);
+        if (selected)
+            fillRoundRect(dc, RECT{rc.left + dp(2), rc.top + dp(12), rc.left + dp(5), rc.bottom - dp(12)},
+                          dp(2), ui::accent);
 
         RECT nameRc{rc.left + dp(12), rc.top + dp(7), rc.right - dp(34), rc.top + dp(29)};
         drawText(dc, ellipsize(dc, toWide(s.name), g_app.uiFontBold, nameRc.right - nameRc.left),
@@ -3493,10 +3657,11 @@ void paintSessionMgr(HDC dc, HWND hwnd) {
     paintEditFrame(dc, hwnd, g_mgr.note);
 
     RECT hint{l.left, l.note.bottom + dp(8), mgrWidth() - mgrPad(), l.note.bottom + dp(42)};
-    drawText(dc, L"私钥可留空：会尝试 ~/.ssh 下的默认密钥，连接时也可以临时输入密码。", hint,
+    drawText(dc, L"私钥可留空：会尝试 ~/.ssh 下的默认密钥；私钥带口令时连接前会弹框，"
+                 L"也可以勾选记住并存进密码保险库。", hint,
              ui::textFaint, g_app.tinyFont, DT_LEFT | DT_TOP | DT_WORDBREAK);
 
-    // 密码本体在凭据管理器或密码保险库里，sessions.ini 只有 savepassword 标记
+    // 口令本体在密码保险库里，sessions.ini 只有 savepassword/savekeypassphrase 标记
     const Session* selectedSession =
         g_mgr.selected >= 0 && g_mgr.selected < static_cast<int>(g_app.store.sessions().size())
             ? &g_app.store.sessions()[static_cast<std::size_t>(g_mgr.selected)]
@@ -3504,8 +3669,11 @@ void paintSessionMgr(HDC dc, HWND hwnd) {
     bool passwordSaved = selectedSession && selectedSession->savePassword;
     std::wstring passwordText;
     if (selectedSession && !selectedSession->keyPath.empty()) {
-        passwordText = L"密码：这条会话用私钥登录，不需要密码";
-        passwordSaved = false;
+        passwordSaved = selectedSession->saveKeyPassphrase;
+        passwordText = passwordSaved
+                           ? L"私钥口令：已保存到 " + savedPasswordLocation() +
+                                 L"，连接时自动使用"
+                           : L"私钥口令：未保存（连接时输入口令，可勾选记住）";
     } else if (passwordSaved) {
         passwordText = L"密码：已保存到 " + savedPasswordLocation() + L"，连接时自动使用";
     } else {
@@ -3534,7 +3702,7 @@ void mgrSelect(HWND hwnd, int index) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
-// 会话被编辑时同步凭据管理器里的条目：
+// 会话被编辑时同步密码保险库里的条目：
 //   - 只改了名字：把密码搬到新条目名下
 //   - 改了主机/端口/用户/私钥：旧口令不再适用，直接删掉
 //   - 其它情况：保留原来的标记
@@ -3557,7 +3725,7 @@ bool syncSavedPasswordOnEdit(const Session& old, Session& updated) {
         std::string password;
         std::string error;
         if (loadCredential(from, password, &error) &&
-            saveCredential(to, sessionCredentialLabel(updated), password, &error)) {
+            saveCredential(to, password, &error)) {
             deleteCredential(from);
             updated.savePassword = true;
             wipeString(password);
@@ -3598,7 +3766,45 @@ bool mgrSave(HWND hwnd) {
     bool passwordDropped = false;
     if (g_mgr.selected >= 0 && g_mgr.selected < static_cast<int>(sessions.size())) {
         const Session old = sessions[static_cast<std::size_t>(g_mgr.selected)];
+        // 改名要把口令搬到新条目名下；保险库锁着时先请用户解锁，
+        // 否则读不到旧口令，只能把保存标记清掉，等于丢密码。
+        if ((old.savePassword || old.saveKeyPassphrase) && old.name != s.name &&
+            !g_app.vault.unlocked() && vaultFilePresent() && !ensureVaultUnlocked()) {
+            messageWarn(L"需要解锁密码保险库",
+                        L"改名后要把已保存的口令迁到新条目名下，请先解锁密码保险库；"
+                        L"取消解锁则本次修改不会保存。");
+            return false;
+        }
         passwordDropped = syncSavedPasswordOnEdit(old, s);
+
+        // 私钥口令与密码分开存：主机/端口/用户/私钥任一变化都视为换了一把钥匙
+        if (old.saveKeyPassphrase) {
+            const bool keyChanged = old.host != s.host || old.port != s.port ||
+                                    old.user != s.user || old.keyPath != s.keyPath;
+            if (keyChanged) {
+                deleteCredential(keyPassphraseTarget(old.name));
+                s.saveKeyPassphrase = false;
+                passwordDropped = true;
+            } else if (old.name != s.name) {
+                std::string passphrase;
+                std::string error;
+                const std::string from = keyPassphraseTarget(old.name);
+                const std::string to = keyPassphraseTarget(s.name);
+                if (loadCredential(from, passphrase, &error) &&
+                    saveCredential(to, passphrase, &error)) {
+                    deleteCredential(from);
+                    wipeString(passphrase);
+                } else {
+                    guiLog("迁移已保存的私钥口令失败：" + error);
+                    deleteCredential(from);
+                    s.saveKeyPassphrase = false;
+                    wipeString(passphrase);
+                    passwordDropped = true;
+                }
+            } else {
+                s.saveKeyPassphrase = true;
+            }
+        }
         if (old.name != s.name) g_app.store.remove(old.name);
     }
     g_app.store.upsert(s);
@@ -3616,7 +3822,7 @@ bool mgrSave(HWND hwnd) {
     mgrLoadSession(s);
     mgrEnsureVisible(g_mgr.selected);
     setStatus(L"已保存会话 " + toWide(s.name) +
-              (passwordDropped ? L"（旧密码已从 " + activePasswordBackend() + L" 删除）" : L""));
+              (passwordDropped ? L"（旧口令已从 " + activePasswordBackend() + L" 删除）" : L""));
     InvalidateRect(hwnd, nullptr, FALSE);
     updateButtons();
     return true;
@@ -3627,14 +3833,23 @@ void mgrDelete(HWND hwnd) {
     if (g_mgr.selected < 0 || g_mgr.selected >= static_cast<int>(sessions.size())) return;
     const Session removed = sessions[static_cast<std::size_t>(g_mgr.selected)];
     const std::string name = removed.name;
+    const bool savedSecret = removed.savePassword || removed.saveKeyPassphrase;
+    const std::wstring secretName = removed.keyPath.empty() ? L"密码" : L"私钥口令";
+    const std::wstring passwordNote =
+        savedSecret
+            ? (g_app.vault.unlocked()
+                   ? L"\n\n" + activePasswordBackend() + L" 里保存的" + secretName + L"也会一起删除。"
+                   : L"\n\n这条会话的" + secretName + L"保存在密码保险库里；保险库锁定期间无法立即删除，"
+                     L"下次解锁时会自动清理。")
+            : std::wstring();
     if (!messageConfirm(L"删除会话",
                         L"确定删除会话 “" + toWide(name) + L"” 吗？（不会影响远端主机）" +
-                            (removed.savePassword ? L"\n\n" + activePasswordBackend() +
-                                                        L" 里保存的密码也会一起删除。" : L""),
+                            passwordNote,
                         L"删除", L"取消"))
         return;
-    // 会话没了，密码也没有归属了：一并清掉，别在凭据管理器/保险库里留孤儿
+    // 会话没了，口令也没有归属了：一并清掉，别在保险库里留孤儿
     if (removed.savePassword) deleteCredential(credentialTarget(name));
+    if (removed.saveKeyPassphrase) deleteCredential(keyPassphraseTarget(name));
     g_app.store.remove(name);
     g_app.store.save();
     if (g_app.currentSession == name) g_app.currentSession.clear();
@@ -3656,26 +3871,38 @@ void mgrClearPassword(HWND hwnd) {
     if (g_mgr.selected < 0 || g_mgr.selected >= static_cast<int>(sessions.size())) return;
     if (!mgrConfirmDiscard()) return;
     Session session = sessions[static_cast<std::size_t>(g_mgr.selected)];
-    if (!session.savePassword) {
-        messageInfo(L"没有保存密码", L"这个会话没有保存过密码。");
+    const bool keyMode = !session.keyPath.empty();
+    const bool saved = keyMode ? session.saveKeyPassphrase : session.savePassword;
+    const std::wstring what = keyMode ? L"私钥口令" : L"密码";
+    if (!saved) {
+        messageInfo(L"没有保存" + what, L"这个会话没有保存过" + what + L"。");
         return;
     }
-    if (!messageConfirm(L"清除密码",
+    if (!messageConfirm(L"清除" + what,
                         L"从 " + activePasswordBackend() + L" 里删除会话 “" + toWide(session.name) +
-                            L"” 的密码？\n\n下次连接需要重新输入。",
+                            L"” 的" + what + L"？\n\n下次连接需要重新输入。",
                         L"清除", L"取消"))
         return;
 
+    // 条目只在保险库里：锁着就先解锁；没有 vault.dat 时没有可删的条目，
+    // 直接复位标记即可。
+    if (!g_app.vault.unlocked() && vaultFilePresent() && !ensureVaultUnlocked()) return;
+
     std::string error;
-    if (!deleteCredential(credentialTarget(session.name), &error)) {
+    const std::string target =
+        keyMode ? keyPassphraseTarget(session.name) : credentialTarget(session.name);
+    if (g_app.vault.unlocked() && !deleteCredential(target, &error)) {
         messageWarn(L"清除失败", toWide(error));
         return;
     }
-    session.savePassword = false;
+    if (keyMode)
+        session.saveKeyPassphrase = false;
+    else
+        session.savePassword = false;
     g_app.store.upsert(session);
     g_app.store.save();
     mgrLoadSession(session);
-    setStatus(L"已清除 “" + toWide(session.name) + L"” 的保存密码");
+    setStatus(L"已清除 “" + toWide(session.name) + L"” 的保存" + what);
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
@@ -3932,6 +4159,11 @@ void openSessionManager(bool startBlank) {
     const std::string name = g_mgr.connectName;
     g_mgr.connectAfterClose = false;
     g_mgr.connectName.clear();
+    connectStoredSession(name);
+}
+
+void connectStoredSession(const std::string& name) {
+    if (g_app.connecting) return;
     const Session* session = g_app.store.find(name);
     if (!session) return;
     Session target = *session;
@@ -3941,7 +4173,7 @@ void openSessionManager(bool startBlank) {
     if (target.keyPath.empty()) {
         bool reused = false;
         if (target.savePassword) {
-            // 口令可能在凭据管理器，也可能在保险库里（解锁之后新存/迁移过去的）
+            // 口令只可能保存在密码保险库里
             std::string saved;
             std::string error;
             if (loadCredential(credentialTarget(target.name), saved, &error)) {
@@ -3950,9 +4182,9 @@ void openSessionManager(bool startBlank) {
                 reused = true;
                 guiLog("使用已保存的密码连接 " + target.name);
             } else if (!g_app.vault.unlocked() && vaultFilePresent()) {
-                // 凭据管理器里没有，保险库又锁着：多半就在保险库里。就地请求
-                // 解锁（取消也没关系，下面会退回到手输密码），解锁成功后重试一次。
-                guiLog("已保存的密码不在凭据管理器里（" + target.name + "）：" + error);
+                // 保险库锁着：就地请求解锁（取消也没关系，下面会退回到手输密码），
+                // 解锁成功后重试一次。
+                guiLog("已保存的密码在锁着的保险库里（" + target.name + "）：" + error);
                 setStatus(L"已保存的密码在密码保险库里，请先解锁");
                 SendMessageW(g_app.main, WM_COMMAND, MAKEWPARAM(IDM_VAULT, 0), 0);
                 if (g_app.vault.unlocked() &&
@@ -3975,9 +4207,20 @@ void openSessionManager(bool startBlank) {
                                 target.savePassword))
                 return;
             if (remember) {
-                // 等连接成功再写：口令刚被服务器拒绝的话不该被保存
-                g_pendingCredentialTarget = credentialTarget(target.name);
-                g_pendingCredentialSession = target.name;
+                // 「记住密码」只写密码保险库：还没解锁就就地新建/解锁。
+                // 用户在保险库对话框里取消时，本次连接照常进行，只是不落盘。
+                if (!g_app.vault.unlocked()) {
+                    vaultCommand();
+                    if (!g_app.vault.unlocked()) {
+                        remember = false;
+                        setStatus(L"密码保险库未解锁，本次不会保存密码");
+                    }
+                }
+                if (remember) {
+                    // 等连接成功再写：口令刚被服务器拒绝的话不该被保存
+                    g_pendingCredentialTarget = credentialTarget(target.name);
+                    g_pendingCredentialSession = target.name;
+                }
             } else if (target.savePassword) {
                 // 用户这次取消了勾选：把旧的条目一起删掉
                 deleteCredential(credentialTarget(target.name));
@@ -3987,15 +4230,75 @@ void openSessionManager(bool startBlank) {
             }
         }
     }
-    connectToSession(target, password);
+    std::wstring keyPassphrase;
+    bool rememberKey = target.saveKeyPassphrase;
+    if (!target.keyPath.empty() && privateKeyNeedsPassphrase(target.keyPath)) {
+        bool reused = false;
+        if (target.saveKeyPassphrase) {
+            std::string saved;
+            std::string error;
+            if (loadCredential(keyPassphraseTarget(target.name), saved, &error)) {
+                keyPassphrase = toWide(saved);
+                wipeString(saved);
+                reused = true;
+                guiLog("使用已保存的私钥口令连接 " + target.name);
+            } else if (!g_app.vault.unlocked() && vaultFilePresent()) {
+                guiLog("已保存的私钥口令在锁着的保险库里（" + target.name + "）：" + error);
+                setStatus(L"已保存的私钥口令在密码保险库里，请先解锁");
+                SendMessageW(g_app.main, WM_COMMAND, MAKEWPARAM(IDM_VAULT, 0), 0);
+                if (g_app.vault.unlocked() &&
+                    loadCredential(keyPassphraseTarget(target.name), saved, &error)) {
+                    keyPassphrase = toWide(saved);
+                    wipeString(saved);
+                    reused = true;
+                    guiLog("使用密码保险库里的私钥口令连接 " + target.name);
+                } else {
+                    guiLog("读取已保存的私钥口令失败（" + target.name + "）：" + error);
+                    setStatus(L"已保存的私钥口令不可用，请重新输入");
+                }
+            } else {
+                guiLog("读取已保存的私钥口令失败（" + target.name + "）：" + error);
+                setStatus(L"已保存的私钥口令不可用，请重新输入");
+            }
+        }
+        if (!reused) {
+            if (!promptKeyPassphrase(L"私钥口令 - " + toWide(target.host), keyPassphrase,
+                                     &rememberKey, target.saveKeyPassphrase)) {
+                wipeWide(password);
+                wipeWide(keyPassphrase);
+                return;
+            }
+            if (rememberKey) {
+                if (!g_app.vault.unlocked()) {
+                    vaultCommand();
+                    if (!g_app.vault.unlocked()) {
+                        rememberKey = false;
+                        setStatus(L"密码保险库未解锁，本次不会保存私钥口令");
+                    }
+                }
+                if (rememberKey) {
+                    g_pendingKeyCredentialTarget = keyPassphraseTarget(target.name);
+                    g_pendingKeyCredentialSession = target.name;
+                }
+            } else if (target.saveKeyPassphrase) {
+                deleteCredential(keyPassphraseTarget(target.name));
+                target.saveKeyPassphrase = false;
+                g_app.store.upsert(target);
+                g_app.store.save();
+            }
+        }
+    }
+
+    connectToSession(target, password, keyPassphrase);
     wipeWide(password);
+    wipeWide(keyPassphrase);
 }
 
 // ---------------------------------------------------------------- 密码对话框
 //
 // 连接不带私钥的会话时问一次密码：只在内存里留到连接完成。
-// 勾上「记住密码」的话，口令交给当前后端（解锁后的密码保险库，没解锁就是
-// Windows 凭据管理器），sessions.ini 只写一个 savepassword=1 的标记。
+// 勾上「记住密码」的话，口令交给密码保险库（未解锁会先弹出新建/解锁对话框），
+// sessions.ini 只写一个 savepassword=1 的标记。
 
 struct PasswordDialogState {
     HWND dlg = nullptr;
@@ -4010,6 +4313,7 @@ struct PasswordDialogState {
 PasswordDialogState g_passwordDialog;
 std::wstring g_passwordValue;
 std::wstring g_passwordTitle = L"登录";
+std::wstring g_passwordLabel = L"密码";
 bool g_passwordSavedBefore = false;
 
 constexpr int ID_PWD_REMEMBER = 202;
@@ -4033,7 +4337,7 @@ LRESULT CALLBACK passwordDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             g_passwordDialog.edit =
-                addEdit(hwnd, 201, L"", dp(72), dp(84), dp(316), dp(30), ES_PASSWORD);
+                addEdit(hwnd, 201, L"", dp(104), dp(84), dp(292), dp(30), ES_PASSWORD);
             if (g_passwordDialog.showRemember) {
                 g_passwordDialog.remember = addCheckbox(
                     hwnd, ID_PWD_REMEMBER, g_passwordDialog.rememberLabel.c_str(), dp(72),
@@ -4049,14 +4353,15 @@ LRESULT CALLBACK passwordDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_PAINT: {
             std::wstring subtitle;
             if (g_passwordSavedBefore) {
-                subtitle = L"上次保存的密码已失效，请重新输入";
+                subtitle = L"上次保存的" + g_passwordLabel + L"已失效，请重新输入";
             } else if (g_passwordDialog.showRemember) {
-                subtitle = L"勾选后存到 " + activePasswordBackend() + L"，下次自动登录";
+                subtitle = L"勾选后存到 " + activePasswordBackend() + L"，下次自动使用";
             } else {
-                subtitle = L"密码只用于本次连接，不会写入配置文件";
+                subtitle = g_passwordLabel + L"只用于本次连接，不会写入配置文件";
             }
             paintDialog(hwnd, g_passwordTitle, subtitle, [&](HDC dc) {
-                drawText(dc, L"密码", RECT{dp(24), dp(84), dp(66), dp(114)}, ui::textDim,
+                drawText(dc, g_passwordLabel.c_str(),
+                         RECT{dp(24), dp(84), dp(100), dp(114)}, ui::textDim,
                          g_app.uiFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 paintEditFrame(dc, hwnd, g_passwordDialog.edit);
             });
@@ -4138,8 +4443,9 @@ LRESULT CALLBACK passwordDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-bool promptPassword(const std::wstring& title, std::wstring& password, bool* remember,
-                    bool savedBefore) {
+bool promptSecret(const std::wstring& title, const std::wstring& label,
+                  const std::wstring& rememberLabel, std::wstring& value,
+                  bool* remember, bool savedBefore) {
     static bool registered = false;
     if (!registered) {
         WNDCLASSEXW wc{};
@@ -4156,7 +4462,8 @@ bool promptPassword(const std::wstring& title, std::wstring& password, bool* rem
     g_passwordDialog = PasswordDialogState();
     g_passwordDialog.showRemember = remember != nullptr;
     g_passwordDialog.rememberChecked = remember != nullptr && *remember;
-    g_passwordDialog.rememberLabel = rememberPasswordCheckboxText();
+    g_passwordDialog.rememberLabel = rememberLabel;
+    g_passwordLabel = label;
     g_passwordSavedBefore = savedBefore;
     g_passwordValue.clear();
     g_passwordTitle = title;
@@ -4169,12 +4476,24 @@ bool promptPassword(const std::wstring& title, std::wstring& password, bool* rem
 
     const bool ok = g_passwordDialog.ok;
     if (ok) {
-        password = g_passwordValue;
+        value = g_passwordValue;
         if (remember) *remember = g_passwordDialog.rememberChecked;
     }
     // 对话框自己的那份副本用完就抹掉（调用方拿走的那份由它自己管）
     wipeWideString(g_passwordValue);
     return ok;
+}
+
+bool promptPassword(const std::wstring& title, std::wstring& password, bool* remember,
+                    bool savedBefore) {
+    return promptSecret(title, L"密码", rememberPasswordCheckboxText(), password,
+                        remember, savedBefore);
+}
+
+bool promptKeyPassphrase(const std::wstring& title, std::wstring& passphrase,
+                         bool* remember, bool savedBefore) {
+    return promptSecret(title, L"私钥口令", rememberKeyPassphraseCheckboxText(),
+                        passphrase, remember, savedBefore);
 }
 
 // ---------------------------------------------------------------- 密码保险库
@@ -4183,7 +4502,9 @@ bool promptPassword(const std::wstring& title, std::wstring& password, bool* rem
 //   - 口令校验就地做：错了只在框里给出原因并选中原来的输入，不关窗口；
 //   - 口令只活到 Vault::create()/open() 返回：控件销毁前清空，Vault 自己
 //     用 DPAPI 密文 + VirtualLock 保管 DEK；
-//   - 解锁模式在「文件里有 TPM slot 且本机 TPM 可用」时多一个「用 TPM 解锁」；
+//   - 解锁模式在「文件里有 TPM slot 且本机 TPM 可用」时默认先自动试 TPM：
+//     TPM 在后台线程里解锁，期间点「取消」就改用主密码；失败也直接落回主密码输入；
+//     输入框旁边保留一个「用 TPM 解锁」按钮，失败后可以重试；
 //   - 新建时可以顺带启用 TPM：enableTpm 要在 TPM 里生成 RSA 密钥（首次约 3 秒），
 //     所以先把界面刷成「正在…」，否则用户会以为点了没反应。
 
@@ -4209,6 +4530,19 @@ struct VaultPromptState {
 };
 
 VaultPromptState g_vaultPrompt;
+
+// TPM 解锁是同步的 BCrypt/NCrypt 调用（实测 0.4~0.8 秒），放到工作线程里跑，
+// 这样进度框还能响应「改用主密码」。取消后结果直接丢弃（Vault 析构时清密钥）。
+struct TpmAttempt {
+    std::atomic<bool> cancelled{false};
+    std::atomic<bool> ready{false};  // 结果字段写入完成后置位（release/acquire）
+    bool ok = false;
+    std::string error;
+    Vault vault;
+};
+std::shared_ptr<TpmAttempt> g_tpmAttempt;
+
+constexpr UINT WM_VAULT_TPM_START = WM_APP + 20;  // 对话框内部：WM_CREATE 之后开始尝试
 
 constexpr int ID_VAULT_TPM = 301;
 constexpr int ID_VAULT_TPM_UNLOCK = 302;
@@ -4241,9 +4575,55 @@ void vaultPromptSetBusy(HWND hwnd, bool busy, const std::wstring& note) {
     }
 }
 
+// 取消正在跑的 TPM 尝试：结果之后才回来也没关系，工作线程会看到 cancelled
+// 并把 Vault 直接丢弃（析构时清 DEK / 条目）。
+void vaultPromptCancelPendingTpm() {
+    if (!g_tpmAttempt) return;
+    g_tpmAttempt->cancelled.store(true);
+    g_tpmAttempt.reset();
+}
+
+// 默认入口：有 TPM slot 且本机 TPM 可用时自动尝试。放到工作线程里跑，
+// 对话框在这 0.4~0.8 秒内仍能响应「取消（改用主密码）」。
+void vaultPromptStartTpm(HWND hwnd) {
+    if (g_vaultPrompt.busy || g_tpmAttempt) return;
+    if (!g_vaultPrompt.hasTpmSlot || !g_vaultPrompt.tpmAvailable) return;
+
+    auto attempt = std::make_shared<TpmAttempt>();
+    g_tpmAttempt = attempt;
+    vaultPromptSetBusy(hwnd, true, L"正在用 TPM 解锁…（点「取消」改用主密码）");
+
+    const std::wstring path = Vault::defaultPath();
+    std::thread([attempt, path]() {
+        Vault opened;
+        std::string error;
+        const bool ok = Vault::openWithTpm(path, opened, &error);
+        attempt->ok = ok;
+        attempt->error = error;
+        attempt->vault = std::move(opened);
+        attempt->ready.store(true, std::memory_order_release);
+        auto* payload = new std::shared_ptr<TpmAttempt>(attempt);
+        if (!PostMessageW(g_app.main, WM_VAULT_TPM_DONE, 0, reinterpret_cast<LPARAM>(payload))) {
+            delete payload;
+        }
+    }).detach();
+}
+
+// TPM 试过但用户不想等（或失败了）之后回到主密码输入。
+void vaultPromptSwitchToPassword(HWND hwnd) {
+    vaultPromptCancelPendingTpm();
+    vaultPromptSetBusy(hwnd, false, L"");
+    vaultPromptSetNote(hwnd, L"请输入主密码解锁", false);
+    if (g_vaultPrompt.password) {
+        SetFocus(g_vaultPrompt.password);
+        SendMessageW(g_vaultPrompt.password, EM_SETSEL, 0, -1);
+    }
+}
+
 // 关窗之前先把控件里的明文清掉（EDIT 内部缓冲由系统管理，清不彻底，
 // 但至少不再能被 WM_GETTEXT / UI Automation 取到）
 void vaultPromptClose(HWND hwnd) {
+    vaultPromptCancelPendingTpm();
     if (g_vaultPrompt.password) SetWindowTextW(g_vaultPrompt.password, L"");
     if (g_vaultPrompt.confirm) SetWindowTextW(g_vaultPrompt.confirm, L"");
     DestroyWindow(hwnd);
@@ -4319,23 +4699,6 @@ void vaultPromptSubmit(HWND hwnd) {
     vaultPromptClose(hwnd);
 }
 
-void vaultPromptUnlockWithTpm(HWND hwnd) {
-    if (g_vaultPrompt.busy) return;
-    vaultPromptSetBusy(hwnd, true, L"正在向 TPM 请求解锁…");
-    std::string error;
-    Vault opened;
-    const bool success = Vault::openWithTpm(Vault::defaultPath(), opened, &error);
-    if (!success) {
-        vaultPromptSetBusy(hwnd, false, L"");
-        vaultPromptSetNote(hwnd, toWide(error.empty() ? "TPM 解锁失败" : error), true);
-        return;
-    }
-    g_app.vault = std::move(opened);
-    g_vaultPrompt.ok = true;
-    g_vaultPrompt.viaTpm = true;
-    vaultPromptClose(hwnd);
-}
-
 LRESULT CALLBACK vaultDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     LRESULT colorResult = 0;
     if (dlg::handleDialogColor(msg, reinterpret_cast<HDC>(wp), reinterpret_cast<HWND>(lp),
@@ -4365,6 +4728,8 @@ LRESULT CALLBACK vaultDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_vaultPrompt.hasTpmSlot && g_vaultPrompt.tpmAvailable) {
                     g_vaultPrompt.tpmButton = addButton(hwnd, ID_VAULT_TPM_UNLOCK, L"用 TPM 解锁",
                                                         dp(24), dp(192), dp(132), dp(32));
+                    // 默认先试 TPM；对话框画出来之后立刻开始，不阻塞创建流程
+                    PostMessageW(hwnd, WM_VAULT_TPM_START, 0, 0);
                 }
             }
             SetFocus(g_vaultPrompt.password);
@@ -4400,6 +4765,9 @@ LRESULT CALLBACK vaultDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             });
             return 0;
         }
+        case WM_VAULT_TPM_START:
+            vaultPromptStartTpm(hwnd);
+            return 0;
         case WM_DRAWITEM: {
             const DRAWITEMSTRUCT& dis = *reinterpret_cast<DRAWITEMSTRUCT*>(lp);
             if (g_vaultPrompt.tpm && dis.hwndItem == g_vaultPrompt.tpm) {
@@ -4426,7 +4794,7 @@ LRESULT CALLBACK vaultDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (id == ID_VAULT_TPM_UNLOCK) {
-                vaultPromptUnlockWithTpm(hwnd);
+                vaultPromptStartTpm(hwnd);
                 return 0;
             }
             if (id == IDOK) {
@@ -4434,7 +4802,12 @@ LRESULT CALLBACK vaultDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (id == IDCANCEL) {
-                vaultPromptClose(hwnd);
+                // TPM 正在后台尝试时，「取消」不是关闭窗口，而是改用主密码
+                if (g_tpmAttempt) {
+                    vaultPromptSwitchToPassword(hwnd);
+                } else {
+                    vaultPromptClose(hwnd);
+                }
                 return 0;
             }
             return 0;
@@ -4485,11 +4858,16 @@ VaultPromptResult promptVault(VaultPromptMode mode) {
     }
 
     const std::wstring path = Vault::defaultPath();
+    vaultPromptCancelPendingTpm();  // 上一次尝试如果还没结束，结果作废
     g_vaultPrompt = VaultPromptState();
     g_vaultPrompt.mode = mode;
     // 两个探测都只读文件头 / 查一次 provider，几十微秒，不会拖慢弹窗
     g_vaultPrompt.tpmAvailable = Vault::tpmAvailable();
     g_vaultPrompt.hasTpmSlot = mode == VaultPromptMode::Unlock && Vault::tpmSlotPresent(path);
+    if (g_vaultPrompt.hasTpmSlot && !g_vaultPrompt.tpmAvailable) {
+        // 换了机器 / TPM 被清掉：直接说明为什么没走默认的 TPM 路径
+        g_vaultPrompt.note = L"本机 TPM 不可用，请输入主密码";
+    }
 
     const std::wstring title =
         mode == VaultPromptMode::Create ? L"新建密码保险库" : L"解锁密码保险库";
@@ -4522,7 +4900,90 @@ void onConnectCommand() {
         return;
     }
     if (g_app.connecting) return;
-    openSessionManager();
+    if (g_app.store.find(g_app.currentSession)) connectStoredSession(g_app.currentSession);
+    else openSessionManager();
+}
+
+void revealTerminalMatch() {
+    if (g_app.searchIndex < 0 || g_app.searchIndex >= static_cast<int>(g_app.searchMatches.size())) return;
+    const auto& match = g_app.searchMatches[static_cast<std::size_t>(g_app.searchIndex)];
+    const int top = std::max(0, static_cast<int>(match.line) - g_app.termData.rows() / 2);
+    const int offset = std::clamp(static_cast<int>(g_app.termData.scrollbackCount()) - top,
+                                  0, static_cast<int>(g_app.termData.scrollbackCount()));
+    g_app.termData.scrollView(offset - g_app.termData.scrollOffset());
+}
+
+void refreshTerminalSearch(bool reveal) {
+    if (!g_app.searchOpen) return;
+    std::u32string query;
+    const std::wstring text = textOf(g_app.searchEdit);
+    for (std::size_t i = 0; i < text.size(); ++i) {
+        char32_t ch = text[i];
+        if (ch >= 0xD800 && ch <= 0xDBFF && i + 1 < text.size() &&
+            text[i + 1] >= 0xDC00 && text[i + 1] <= 0xDFFF)
+            ch = 0x10000 + ((ch - 0xD800) << 10) + (text[++i] - 0xDC00);
+        query.push_back(ch);
+    }
+    g_app.searchMatches = g_app.termData.findAll(query);
+    if (g_app.searchMatches.empty()) g_app.searchIndex = -1;
+    else if (reveal || g_app.searchIndex < 0) g_app.searchIndex = 0;
+    else g_app.searchIndex = std::min(g_app.searchIndex, static_cast<int>(g_app.searchMatches.size()) - 1);
+    g_app.searchDirty = false;
+    if (reveal) revealTerminalMatch();
+    InvalidateRect(g_app.main, nullptr, FALSE);
+    InvalidateRect(g_app.term, nullptr, FALSE);
+}
+
+void stepTerminalSearch(int direction) {
+    if (g_app.searchDirty) refreshTerminalSearch(false);
+    const int count = static_cast<int>(g_app.searchMatches.size());
+    if (count == 0) return;
+    g_app.searchIndex = (g_app.searchIndex + direction + count) % count;
+    revealTerminalMatch();
+    InvalidateRect(g_app.main, nullptr, FALSE);
+    InvalidateRect(g_app.term, nullptr, FALSE);
+}
+
+WNDPROC g_searchEditProc = nullptr;
+LRESULT CALLBACK searchEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_KEYDOWN) {
+        if (wp == VK_RETURN || wp == VK_F3) {
+            stepTerminalSearch((GetKeyState(VK_SHIFT) & 0x8000) ? -1 : 1);
+            return 0;
+        }
+        if (wp == VK_ESCAPE) { showTerminalSearch(false); return 0; }
+        if (wp == VK_TAB) { SetFocus(g_app.term); return 0; }
+        if ((wp == 'A' || wp == 'F') && (GetKeyState(VK_CONTROL) & 0x8000)) {
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
+    }
+    if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE || wp == VK_TAB || wp == 1 || wp == 6))
+        return 0;
+    return CallWindowProcW(g_searchEditProc, hwnd, msg, wp, lp);
+}
+
+void showTerminalSearch(bool show) {
+    if (show && !g_app.searchEdit) {
+        g_app.searchEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
+                                          0, 0, 0, 0, g_app.main,
+                                          reinterpret_cast<HMENU>(ID_SEARCH_EDIT), g_app.inst, nullptr);
+        if (!g_app.searchEdit) return;
+        g_searchEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            g_app.searchEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(searchEditProc)));
+        SendMessageW(g_app.searchEdit, EM_SETCUEBANNER, FALSE,
+                     reinterpret_cast<LPARAM>(L"搜索输出（区分大小写）"));
+    }
+    g_app.searchOpen = show;
+    if (g_app.searchEdit) ShowWindow(g_app.searchEdit, show ? SW_SHOW : SW_HIDE);
+    layoutMain(g_app.main);
+    if (show) {
+        SetFocus(g_app.searchEdit);
+        SendMessageW(g_app.searchEdit, EM_SETSEL, 0, -1);
+        refreshTerminalSearch();
+    } else SetFocus(g_app.term);
+    InvalidateRect(g_app.main, nullptr, FALSE);
+    InvalidateRect(g_app.term, nullptr, FALSE);
 }
 
 // ---------------------------------------------------------------- SFTP 文件面板
@@ -4530,7 +4991,7 @@ void onConnectCommand() {
 // 连上之后左侧从会话列表切换成远端文件树。所有远端操作都在 RemoteFs 的
 // 独立线程里跑，UI 只负责画和派发，不会因为列大目录而卡住终端。
 
-int fileItemH() { return dp(30); }
+int fileItemH() { return dp(32); }
 int filePad() { return dp(4); }
 
 int fileMaxScroll() {
@@ -4614,20 +5075,61 @@ std::string resolveFsInput(const std::string& raw) {
     return remoteJoin(g_app.fsPath, text);
 }
 
-void promptFsPath() {
+WNDPROC g_pathEditProc = nullptr;
+
+LRESULT CALLBACK pathEditProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_KEYDOWN:
+            if ((wp == 'A' || wp == 'L') && (GetKeyState(VK_CONTROL) & 0x8000)) {
+                SendMessageW(hwnd, EM_SETSEL, 0, -1);
+                return 0;
+            }
+            if (wp == VK_RETURN || wp == VK_ESCAPE || wp == VK_TAB) {
+                std::wstring value(static_cast<std::size_t>(GetWindowTextLengthW(hwnd)) + 1, L'\0');
+                GetWindowTextW(hwnd, value.data(), static_cast<int>(value.size()));
+                value.resize(std::wcslen(value.c_str()));
+                // 先退出编辑，再提交，避免异步刷新或错误弹窗覆盖输入状态。
+                SetFocus(g_app.list);
+                ShowWindow(hwnd, SW_HIDE);
+                if (wp == VK_RETURN && g_app.fsReady) {
+                    const std::string target = resolveFsInput(toUtf8(value));
+                    if (!target.empty() && target != g_app.fsPath) fsNavigate(target);
+                }
+                return 0;
+            }
+            break;
+        case WM_CHAR:
+            if (wp == VK_RETURN || wp == VK_ESCAPE || wp == VK_TAB || wp == 1 || wp == 12)
+                return 0;
+            break;
+        case WM_KILLFOCUS:
+            ShowWindow(hwnd, SW_HIDE);
+            InvalidateRect(g_app.main, &g_app.fsPathRect, FALSE);
+            break;
+        default:
+            break;
+    }
+    return CallWindowProcW(g_pathEditProc, hwnd, msg, wp, lp);
+}
+
+void focusFsPath() {
     if (!g_app.fsReady) {
         messageWarn(L"SFTP 未就绪", L"文件通道还没连上，请稍后再试。");
         return;
     }
-    std::wstring value = toWide(g_app.fsPath);
-    if (!promptTextDialog(L"跳转到目录",
-                          L"远端路径：/ 开头为绝对路径，~ 为 home，其余相对当前目录",
-                          value)) {
-        return;
+    if (!g_app.fsPathEdit) {
+        g_app.fsPathEdit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
+                                          0, 0, 0, 0, g_app.main, nullptr, g_app.inst, nullptr);
+        if (!g_app.fsPathEdit) return;
+        g_pathEditProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            g_app.fsPathEdit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(pathEditProc)));
     }
-    const std::string target = resolveFsInput(toUtf8(value));
-    if (target.empty() || target == g_app.fsPath) return;
-    fsNavigate(target);
+    layoutMain(g_app.main);
+    SetWindowTextW(g_app.fsPathEdit, toWide(g_app.fsPath).c_str());
+    ShowWindow(g_app.fsPathEdit, SW_SHOW);
+    SetFocus(g_app.fsPathEdit);
+    SendMessageW(g_app.fsPathEdit, EM_SETSEL, 0, -1);
+    InvalidateRect(g_app.main, &g_app.fsPathRect, FALSE);
 }
 
 void fsGoUp() {
@@ -5122,7 +5624,7 @@ void paintFileIcon(HDC dc, const RECT& box, FileKind kind) {
 // 图标总览（开发用）：rshell-gui.exe --icons <out.bmp>
 // 把所有类型按 16/24/32/48 各画一遍，一眼就能看出哪一档比例/线条不对。
 bool renderIconSheet(const std::wstring& outPath) {
-    if (g_app.dpi <= 0) g_app.dpi = GetDpiForSystem();
+    if (g_app.dpi <= 0) g_app.dpi = wincompat::systemDpi();
     createFonts();
 
     struct Entry {
@@ -5398,19 +5900,23 @@ void paintFileList(HWND hwnd) {
     fillRect(mem, rc, ui::bgPanel);
 
     if (!g_app.fsReady) {
+        const int top = std::max(dp(10), std::min(dp(72), static_cast<int>(rc.bottom) / 5));
+        const int center = rc.right / 2;
+        paintFileIcon(mem, RECT{center - dp(16), top, center + dp(16), top + dp(32)},
+                      FileKind::Folder);
         const std::wstring text = g_app.fsFailed ? L"文件通道连接失败"
                                    : g_app.connecting ? L"正在连接…"
-                                                      : L"未连接";
-        drawText(mem, text, RECT{dp(12), dp(10), rc.right - dp(12), dp(30)},
-                 g_app.fsFailed ? ui::danger : ui::textDim, g_app.uiFont,
-                 DT_LEFT | DT_TOP | DT_SINGLELINE);
+                                                      : L"浏览远端文件";
+        drawText(mem, text, RECT{dp(12), top + dp(46), rc.right - dp(12), top + dp(70)},
+                 g_app.fsFailed ? ui::danger : ui::textDim, g_app.uiFontBold,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if (!g_app.fsError.empty()) {
-            drawText(mem, toWide(g_app.fsError), RECT{dp(12), dp(32), rc.right - dp(12), dp(96)},
+            drawText(mem, toWide(g_app.fsError), RECT{dp(12), top + dp(78), rc.right - dp(12), rc.bottom},
                      ui::textFaint, g_app.tinyFont, DT_LEFT | DT_TOP | DT_WORDBREAK);
         } else if (!g_app.connecting) {
-            drawText(mem, L"点下方「打开会话列表…」连接主机，\n连上后这里会显示远端文件。",
-                     RECT{dp(12), dp(34), rc.right - dp(12), dp(92)}, ui::textFaint,
-                     g_app.tinyFont, DT_LEFT | DT_TOP | DT_WORDBREAK);
+            drawText(mem, L"连接主机后，在这里浏览文件\n支持上传、下载与拖放传输",
+                     RECT{dp(12), top + dp(78), rc.right - dp(12), rc.bottom}, ui::textFaint,
+                     g_app.tinyFont, DT_CENTER | DT_TOP | DT_WORDBREAK);
         }
     } else if (!g_app.fsError.empty()) {
         drawText(mem, L"无法读取目录", RECT{dp(12), dp(10), rc.right - dp(12), dp(30)}, ui::danger,
@@ -5431,6 +5937,9 @@ void paintFileList(HWND hwnd) {
         const bool hovered = i == g_app.fsHover;
         if (selected || hovered) {
             fillRoundRect(mem, item, dp(5), selected ? ui::bgActive : ui::bgHover);
+            if (selected)
+                fillRoundRect(mem, RECT{item.left, top + dp(8), item.left + dp(3),
+                                       top + fileItemH() - dp(8)}, dp(2), ui::accent);
         }
 
         const RemoteEntry& entry = g_app.fsEntries[static_cast<std::size_t>(i)];
@@ -5474,7 +5983,8 @@ void paintFileList(HWND hwnd) {
 
 // ---- 文件通道（独立 SSH 连接）的生命周期 ----
 
-ConnectionOptions makeRemoteOptions(const Session& session, const std::wstring& password) {
+ConnectionOptions makeRemoteOptions(const Session& session, const std::wstring& password,
+                                    const std::wstring& keyPassphrase) {
     ConnectionOptions options;
     options.host = session.host;
     options.port = session.port > 0 ? session.port : 22;
@@ -5483,6 +5993,9 @@ ConnectionOptions makeRemoteOptions(const Session& session, const std::wstring& 
     std::string utf8Password = toUtf8(password);
     options.password = utf8Password;
     wipeString(utf8Password);
+    std::string utf8KeyPassphrase = toUtf8(keyPassphrase);
+    options.keyPassphrase = utf8KeyPassphrase;
+    wipeString(utf8KeyPassphrase);
     options.timeoutSec = 15;
     options.allowDefaultKeys = true;
     if (options.user.empty()) {
@@ -5495,7 +6008,8 @@ ConnectionOptions makeRemoteOptions(const Session& session, const std::wstring& 
     return options;
 }
 
-void startRemoteFs(const Session& session, const std::wstring& password) {
+void startRemoteFs(const Session& session, const std::wstring& password,
+                   const std::wstring& keyPassphrase) {
     g_app.fsReady = false;
     g_app.fsFailed = false;
     g_app.fsError.clear();
@@ -5507,19 +6021,20 @@ void startRemoteFs(const Session& session, const std::wstring& password) {
     g_app.fsPendingUploads = 0;
     g_app.stats = RemoteStats();
 
+    const UINT_PTR connectionId = g_app.connectionId;
     g_app.fs.setCallbacks(RemoteFsCallbacks{
-        [](const FsEvent& event) {
+        [connectionId](const FsEvent& event) {
             auto* copy = new FsEvent(event);
-            if (!PostMessageW(g_app.main, WM_FS_EVENT, 0, reinterpret_cast<LPARAM>(copy)))
+            if (!PostMessageW(g_app.main, WM_FS_EVENT, connectionId, reinterpret_cast<LPARAM>(copy)))
                 delete copy;
         },
-        [](const RemoteStats& stats) {
+        [connectionId](const RemoteStats& stats) {
             auto* copy = new RemoteStats(stats);
-            if (!PostMessageW(g_app.main, WM_FS_STATS, 0, reinterpret_cast<LPARAM>(copy)))
+            if (!PostMessageW(g_app.main, WM_FS_STATS, connectionId, reinterpret_cast<LPARAM>(copy)))
                 delete copy;
         }});
     g_app.fs.setSampleInterval(5);
-    g_app.fs.start(makeRemoteOptions(session, password));
+    g_app.fs.start(makeRemoteOptions(session, password, keyPassphrase));
 
     layoutMain(g_app.main);
     updateButtons();
@@ -5566,7 +6081,8 @@ int downloadVisibleRows() {
 
 // 展开状态下状态栏上方的面板高度（0 表示不需要面板）
 int downloadsPanelHeight() {
-    if (!g_app.downloadsOpen || g_app.downloads.empty()) return 0;
+    if (!g_app.downloadsOpen) return 0;
+    if (g_app.downloads.empty()) return dp(76);
     const int headerH = dp(30);
     const int rowH = dp(34);
     const int moreH = static_cast<int>(g_app.downloads.size()) > kMaxVisibleDownloads
@@ -5692,7 +6208,7 @@ void handleFsEvent(const FsEvent& event) {
             g_app.fsReady = false;
             g_app.fsFailed = true;
             g_app.fsError = event.message;
-            setStatus(L"文件通道连接失败");
+            setStatus(L"文件通道连接失败", true);
             break;
         case FsEventKind::Listing: {
             const std::string previous =
@@ -5734,11 +6250,11 @@ void handleFsEvent(const FsEvent& event) {
             if (g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
             if (App::DownloadTask* task = findDownloadTask(event.path, event.upload)) {
                 task->state = App::DownloadState::Failed;
-                setStatus(toWide(event.message));
+                setStatus(toWide(event.message), true);
                 syncDownloadLayout();
                 break;
             }
-            setStatus(toWide(event.message));
+            setStatus(toWide(event.message), true);
             // 终端跟随 / 路径框跳转失败（没有权限、目录已删除）只在面板里提示，
             // 不弹模态框：用户可能只是 cd 进了一个进不去的目录，提示够用
             if (!g_app.fsQuietPath.empty() && event.path == g_app.fsQuietPath) {
@@ -5757,12 +6273,13 @@ void handleFsEvent(const FsEvent& event) {
 
 
 void layoutMain(HWND hwnd) {
+    hideStatusHint();
     RECT rc;
     GetClientRect(hwnd, &rc);
-    const int pad = dp(10);
-    const int titleH = dp(44);
-    const int statusH = dp(28);
-    const int btnH = dp(32);
+    const int pad = dp(14);
+    const int titleH = dp(48);
+    const int statusH = dp(34);
+    const int btnH = dp(36);
     const int sidebarW = std::clamp<int>(rc.right / 4, dp(230), dp(340));
 
     g_app.titleH = titleH;
@@ -5777,7 +6294,7 @@ void layoutMain(HWND hwnd) {
     if (contentBottom - contentTop < dp(110)) return;
 
     // 侧栏：分组标题 + 文件列表 + 底部一个动作按钮（打开会话 / 断开）
-    const int headerH = dp(24);
+    const int headerH = dp(76);
     const int listTop = contentTop + headerH;
     const int buttonY = contentBottom - btnH;
     const int listH = std::max(dp(48), buttonY - dp(8) - listTop);
@@ -5787,8 +6304,15 @@ void layoutMain(HWND hwnd) {
     g_app.contentTop = contentTop;
     g_app.contentBottom = contentBottom;
     // 路径条：标题行左侧（右边留给「上级目录」小按钮），点一下能输入路径
-    g_app.fsPathRect = RECT{pad, contentTop + dp(1), pad + sidebarW - dp(28),
-                            contentTop + dp(1) + dp(21)};
+    g_app.fsPathRect = RECT{pad, contentTop + dp(36), pad + sidebarW - dp(36),
+                            contentTop + dp(66)};
+    if (g_app.fsPathEdit) {
+        const RECT& box = g_app.fsPathRect;
+        const int editH = std::min<int>(box.bottom - box.top - dp(4), g_app.uiTextH + dp(2));
+        MoveWindow(g_app.fsPathEdit, box.left + dp(7), box.top + (box.bottom - box.top - editH) / 2,
+                   box.right - box.left - dp(14), editH, TRUE);
+        SendMessageW(g_app.fsPathEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.tinyFont), TRUE);
+    }
 
     if (g_app.list) MoveWindow(g_app.list, pad, listTop, sidebarW, listH, TRUE);
 
@@ -5797,18 +6321,33 @@ void layoutMain(HWND hwnd) {
     g_app.buttons.push_back(App::UiButton{
         ID_BTN_ACTION, RECT{pad, buttonY, pad + sidebarW, buttonY + btnH}, true, false});
     // 分组标题右侧的「上级目录」小按钮
-    const int upSize = dp(20);
+    const int upSize = dp(30);
     g_app.buttons.push_back(
         App::UiButton{ID_BTN_FS_UP,
-                      RECT{pad + sidebarW - upSize, listTop - upSize - dp(3), pad + sidebarW,
-                           listTop - dp(3)},
+                      RECT{pad + sidebarW - upSize, contentTop + dp(36), pad + sidebarW,
+                           contentTop + dp(66)},
                       false, true});
 
     if (g_app.term) {
         const int termX = pad * 2 + sidebarW;
         const int termW = std::max(dp(120), static_cast<int>(rc.right) - termX - pad);
-        MoveWindow(g_app.term, termX, contentTop, termW,
-                   std::max(dp(80), contentBottom - contentTop), TRUE);
+        g_app.searchBox = RECT{termX + dp(4), contentTop, rc.right - pad - dp(170), contentTop + dp(28)};
+        g_app.searchPrev = RECT{rc.right - pad - dp(88), contentTop, rc.right - pad - dp(60), contentTop + dp(28)};
+        g_app.searchNext = RECT{rc.right - pad - dp(58), contentTop, rc.right - pad - dp(30), contentTop + dp(28)};
+        g_app.searchClose = RECT{rc.right - pad - dp(28), contentTop, rc.right - pad, contentTop + dp(28)};
+        if (g_app.searchEdit) {
+            const RECT& box = g_app.searchBox;
+            const int editH = std::min<int>(box.bottom - box.top - dp(4), g_app.uiTextH);
+            MoveWindow(g_app.searchEdit, box.left + dp(7), box.top + (box.bottom - box.top - editH) / 2,
+                       std::max(dp(20), static_cast<int>(box.right - box.left) - dp(14)), editH, TRUE);
+            SendMessageW(g_app.searchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+        }
+        if (!g_app.searchOpen && !g_app.shell.running() && !g_app.connecting && selectedSession())
+            g_app.buttons.push_back(App::UiButton{IDM_RECONNECT,
+                RECT{rc.right - pad - dp(108), contentTop, rc.right - pad, contentTop + dp(28)}, false, true});
+        const int termTop = contentTop + dp(38);
+        MoveWindow(g_app.term, termX, termTop, termW,
+                   std::max(dp(80), contentBottom - termTop), TRUE);
     }
     // 按钮/标题栏都是自绘的，布局变了要重画
     InvalidateRect(hwnd, nullptr, TRUE);
@@ -5947,7 +6486,7 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             // Ctrl+L：跳到目录（资源管理器 / 浏览器的通用习惯；终端里的 Ctrl+L 不受影响）
             if (wp == 'L' && (GetKeyState(VK_CONTROL) & 0x8000)) {
-                promptFsPath();
+                focusFsPath();
                 return 0;
             }
             return 0;
@@ -6004,6 +6543,8 @@ bool buttonEnabled(int id) {
     switch (id) {
         case ID_BTN_ACTION:
             return connected || !busy;
+        case IDM_RECONNECT:
+            return !connected && !busy && selectedSession();
         case ID_BTN_FS_UP:
             return g_app.fsReady && !g_app.fsPath.empty() && g_app.fsPath != "/";
         default:
@@ -6128,7 +6669,7 @@ void paintTitleBar(HDC dc, const RECT& rc) {
         fillCircle(dc, x + dp(1), h / 2, dp(2), ui::textFaint);
         x += dp(8);
         const std::wstring subtitle =
-            g_app.currentSession.empty() ? L"选择左侧会话开始" : toWide(g_app.currentSession);
+            g_app.currentSession.empty() ? L"SSH 工作空间" : toWide(g_app.currentSession);
         RECT subRc{x, 0, x + subMaxW, h};
         drawText(dc, ellipsize(dc, subtitle, g_app.uiFont, subMaxW), subRc, ui::textDim, g_app.uiFont);
     }
@@ -6186,7 +6727,10 @@ void paintButtons(HDC dc) {
         std::wstring label;
         switch (b.id) {
             case ID_BTN_ACTION:
-                label = connected ? L"断开连接" : L"打开会话列表…";
+                label = connected ? L"断开连接" : (selectedSession() ? L"重新连接" : L"打开会话列表…");
+                break;
+            case IDM_RECONNECT:
+                label = L"重新连接";
                 break;
             case ID_BTN_FS_UP:
                 label = L"↑";
@@ -6241,8 +6785,12 @@ std::wstring statsLine() {
     return out;
 }
 
-// 状态栏右侧的传输胶囊：没有任务时为空矩形。
-// 收起/展开、总进度都靠它一眼看清，点一下展开逐项列表。
+std::size_t failedDownloadCount() {
+    return static_cast<std::size_t>(std::count_if(g_app.downloads.begin(), g_app.downloads.end(),
+        [](const App::DownloadTask& task) { return task.state == App::DownloadState::Failed; }));
+}
+
+// 右侧常驻传输入口：空闲、进行中、失败都使用同一位置。
 std::wstring downloadChipText() {
     std::size_t active = 0;
     std::uint64_t done = 0;
@@ -6261,16 +6809,26 @@ std::wstring downloadChipText() {
         }
     }
     std::wstring text;
+    const std::size_t failed = failedDownloadCount();
     if (active > 0) {
         // 方向一眼可见：只有上传/只有下载用单箭头，两者混合用 ⇅
         text = (anyUp && anyDown) ? L"⇅ " : (anyUp ? L"↑ " : L"↓ ");
         text += std::to_wstring(active) + L" 项";
-        if (total > 0) {
+        if (failed > 0) {
+            text += L" · ! " + std::to_wstring(failed);
+        } else if (total > 0) {
             text += L" · " + formatPercent(static_cast<double>(done) * 100.0 /
                                            static_cast<double>(total));
         } else {
             text += L" · 传输中";
         }
+    } else if (failed > 0) {
+        text = L"⇅ " + std::to_wstring(failed) + L" 项失败";
+    } else if (g_app.downloads.empty()) {
+        text = L"⇅ 传输 · 空闲";
+    } else if (std::any_of(g_app.downloads.begin(), g_app.downloads.end(),
+                         [](const App::DownloadTask& task) { return task.state == App::DownloadState::Cancelled; })) {
+        text = L"⇅ 无进行中任务";
     } else {
         text = L"⇅ 已完成";
     }
@@ -6278,7 +6836,7 @@ std::wstring downloadChipText() {
     return text;
 }
 
-// 状态栏右端那组终端信息（尺寸 / 回滚 / 字号）。胶囊要贴在它左边，所以宽度得先量出来。
+// 终端参数只用于悬停说明和调整后的短暂提示。
 std::wstring terminalInfoText() {
     return std::to_wstring(g_app.termData.cols()) + L" × " +
            std::to_wstring(g_app.termData.rows()) + L"   ·   回滚 " +
@@ -6286,24 +6844,62 @@ std::wstring terminalInfoText() {
            std::to_wstring(g_app.fontSize);
 }
 
-RECT statusDownloadChip(HWND hwnd) {
-    RECT empty{};
-    if (!hwnd || g_app.downloads.empty() || g_app.statusH <= 0) return empty;
-    RECT client{};
-    GetClientRect(hwnd, &client);
-    HDC dc = GetDC(hwnd);
-    if (!dc) return empty;
-    const std::wstring text = downloadChipText();
-    const int textW = textWidth(dc, text, g_app.tinyFont);
-    const int infoW = textWidth(dc, terminalInfoText(), g_app.tinyFont);
-    ReleaseDC(hwnd, dc);
+struct StatusLayout {
+    RECT connection{}, content{}, transfer{}, vault{}, reconnect{}, dismiss{};
+};
 
-    const int chipH = dp(20);
-    const int chipW = textW + dp(20);
-    const int y = client.bottom - g_app.statusH + (g_app.statusH - chipH) / 2;
-    // 右端先让出终端信息，再往左一个间距放胶囊
-    const int right = client.right - dp(14) - infoW - dp(12);
-    return RECT{right - chipW, y, right, y + chipH};
+StatusLayout statusGeometry(const RECT& client) {
+    StatusLayout layout;
+    const int y = client.bottom - g_app.statusH;
+    const int top = y + dp(4), bottom = client.bottom - dp(4);
+    layout.connection = RECT{dp(24), y, std::clamp<int>(client.right / 4, dp(160), dp(240)), client.bottom};
+    layout.transfer = RECT{client.right - dp(182), top, client.right - dp(14), bottom};
+    int right = layout.transfer.left - dp(12);
+    if (g_app.vault.unlocked()) {
+        layout.vault = RECT{right - dp(108), top, right, bottom};
+        right = layout.vault.left - dp(12);
+    }
+    if (!g_app.connecting && !g_app.shell.running() && selectedSession()) {
+        layout.reconnect = RECT{right - dp(76), top, right, bottom};
+        right = layout.reconnect.left - dp(12);
+    }
+    const int left = layout.connection.right + dp(16);
+    if (g_app.statusError && !g_app.statusText.empty() && right - left >= dp(56)) {
+        layout.dismiss = RECT{right - dp(22), top, right, bottom};
+        right = layout.dismiss.left - dp(4);
+    }
+    layout.content = RECT{left, y, std::max(left, right), client.bottom};
+    return layout;
+}
+
+std::wstring compactStatsText(HDC dc, int width) {
+    const RemoteStats& stats = g_app.stats;
+    if (!stats.valid || width <= 0) return L"";
+    std::vector<std::wstring> parts;
+    if (stats.cpuPercent >= 0) parts.push_back(L"CPU " + formatPercent(stats.cpuPercent));
+    if (stats.memTotalKb > 0) {
+        const auto used = stats.memTotalKb - std::min(stats.memTotalKb, stats.memAvailKb);
+        parts.push_back(L"内存 " + formatPercent(100.0 * used / stats.memTotalKb));
+    }
+    const std::wstring disk = stats.diskTotalKb > 0 ?
+        L"磁盘 " + formatPercent(100.0 * stats.diskUsedKb / stats.diskTotalKb) : L"";
+    if (!disk.empty()) parts.push_back(disk);
+    if (stats.latencyMs >= 0) parts.push_back(L"采样 " + std::to_wstring(stats.latencyMs) + L"ms");
+    for (;;) {
+        std::wstring text;
+        for (const auto& part : parts) { if (!text.empty()) text += L"   "; text += part; }
+        if (textWidth(dc, text, g_app.uiFont) <= width || parts.empty()) return text;
+        const auto diskPart = std::find(parts.begin(), parts.end(), disk);
+        if (!disk.empty() && diskPart != parts.end()) parts.erase(diskPart);
+        else parts.pop_back();
+    }
+}
+
+RECT statusDownloadChip(HWND hwnd) {
+    RECT client{};
+    if (!hwnd || g_app.statusH <= 0) return client;
+    GetClientRect(hwnd, &client);
+    return statusGeometry(client).transfer;
 }
 
 // 展开的下载列表：贴状态栏上沿整宽停靠，几何在绘制和命中测试之间共用
@@ -6323,7 +6919,7 @@ struct DownloadsPanelLayout {
 
 DownloadsPanelLayout downloadsPanelGeometry(HWND hwnd) {
     DownloadsPanelLayout layout;
-    if (!hwnd || g_app.downloads.empty() || !g_app.downloadsOpen) return layout;
+    if (!hwnd || !g_app.downloadsOpen) return layout;
     const int panelH = downloadsPanelHeight();
     if (panelH <= 0) return layout;
 
@@ -6431,6 +7027,12 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
     drawText(dc, L"✕", layout.closeButton, ui::textDim, g_app.uiFont,
              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
+    if (g_app.downloads.empty()) {
+        drawText(dc, L"暂无传输任务", RECT{layout.band.left + dp(12), layout.band.top + headerH,
+                 layout.band.right - dp(12), layout.band.bottom - dp(6)}, ui::textDim, g_app.uiFont,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
     for (std::size_t i = 0; i < layout.rows.size(); ++i) {
         const App::DownloadTask& task = g_app.downloads[i];
         const DownloadRowLayout& row = layout.rows[i];
@@ -6536,62 +7138,125 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
 
 }
 
+std::wstring statusConnectionText() {
+    std::wstring text = g_app.connecting ? L"连接中" :
+        (g_app.shell.running() ? L"已连接" : (g_app.connectionId ? L"已断开" : L"未连接"));
+    if (!g_app.currentSession.empty()) text += L" · " + toWide(g_app.currentSession);
+    return text;
+}
+
 void paintStatusBar(HDC dc, const RECT& rc) {
     const int h = g_app.statusH;
     if (h <= 0) return;
     const int y = rc.bottom - h;
+    const StatusLayout layout = statusGeometry(rc);
     fillRect(dc, RECT{0, y, rc.right, rc.bottom}, ui::bgPanel);
     drawHLine(dc, 0, rc.right, y, ui::border);
-
-    const bool connected = g_app.shell.running();
-    const std::uint32_t dot =
-        g_app.connecting ? ui::warn : (connected ? ui::success : ui::textFaint);
+    const std::uint32_t dot = g_app.connecting ? ui::warn :
+        (g_app.shell.running() ? ui::success : (g_app.statusError ? ui::danger : ui::textFaint));
     fillCircle(dc, dp(14), y + h / 2, dp(3), dot);
+    drawText(dc, statusConnectionText(), layout.connection, ui::text, g_app.uiFont,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    fillRect(dc, RECT{layout.content.left - dp(8), y + dp(10), layout.content.left - dp(8) + 1,
+                      rc.bottom - dp(10)}, ui::borderSoft);
 
-    RECT infoRc{rc.right - dp(320), y, rc.right - dp(14), rc.bottom};
-    const std::wstring info = terminalInfoText();
-    drawText(dc, info, infoRc, ui::textFaint, g_app.tinyFont,
-             DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-
-    // 下载胶囊：贴在终端信息左边，左边的内容跟着让位
-    int rightLimit = infoRc.left - dp(12);
-    const RECT chip = statusDownloadChip(g_app.main);
-    if (chip.right > chip.left) {
-        if (g_app.hoverDownloadChip) fillRoundRect(dc, chip, dp(5), ui::bgHover);
-        drawText(dc, downloadChipText(), chip,
-                 activeDownloadCount() > 0 ? ui::accent : ui::textDim, g_app.tinyFont,
+    const ULONGLONG now = GetTickCount64();
+    const bool notice = statusNoticeActive(now);
+    const std::wstring content = notice ? g_app.statusText :
+        (now < g_app.terminalInfoUntil ? terminalInfoText() :
+         compactStatsText(dc, layout.content.right - layout.content.left));
+    drawText(dc, content, layout.content, notice && g_app.statusError ? ui::danger : ui::textDim,
+             g_app.uiFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (layout.dismiss.right > layout.dismiss.left)
+        dlg::paintButton(dc, layout.dismiss, L"×", false, g_app.hoverStatusAction == 2, false, false, true);
+    if (layout.reconnect.right > layout.reconnect.left)
+        dlg::paintButton(dc, layout.reconnect, L"重新连接", false, g_app.hoverStatusAction == 1, false, false, true);
+    if (layout.vault.right > layout.vault.left) {
+        fillRoundRect(dc, layout.vault, dp(5), ui::mix(ui::accent, ui::bgPanel, 0.85));
+        drawText(dc, L"保险库 已解锁", layout.vault, ui::textDim, g_app.uiFont,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        rightLimit = std::min(rightLimit, static_cast<int>(chip.left) - dp(12));
     }
+    fillRoundRect(dc, layout.transfer, dp(5), g_app.hoverDownloadChip ? ui::bgHover : ui::bgCard);
+    drawText(dc, downloadChipText(), layout.transfer,
+             failedDownloadCount() ? ui::danger : (activeDownloadCount() ? ui::accent : ui::textDim),
+             g_app.uiFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
 
-    // 保险库状态：解锁时给个常驻标记，提醒用户这份口令还在内存里
-    if (g_app.vault.unlocked()) {
-        const std::wstring label = L"保险库 已解锁";
-        const int chipW = textWidth(dc, label, g_app.tinyFont) + dp(16);
-        const RECT vaultChip{rightLimit - chipW, y + dp(4), rightLimit, rc.bottom - dp(4)};
-        fillRoundRect(dc, vaultChip, dp(5), ui::mix(ui::accent, ui::bgPanel, 0.85));
-        drawText(dc, label, vaultChip, ui::accent, g_app.tinyFont,
-                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        rightLimit = vaultChip.left - dp(12);
-    }
+void hideStatusHint() {
+    if (g_app.statusHint) ShowWindow(g_app.statusHint, SW_HIDE);
+}
 
-    // 远端状态：只在连上并有采样数据时显示
-    const std::wstring metrics = statsLine();
-    int textRight = rightLimit;
-    if (!metrics.empty()) {
-        RECT metricsRc{dp(24) + dp(250), y, rightLimit, rc.bottom};
-        if (metricsRc.right > metricsRc.left) {
-            drawText(dc, metrics, metricsRc, ui::textFaint, g_app.tinyFont,
-                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            textRight = metricsRc.left - dp(12);
-        }
+std::wstring statusDetailsText() {
+    std::wstring text = statusConnectionText();
+    if (statusNoticeActive(GetTickCount64())) text += L"\n" + g_app.statusText.substr(0, 400);
+    const RemoteStats& stats = g_app.stats;
+    if (stats.valid) {
+        text += L"\n" + toWide(stats.host) + L" · " + toWide(stats.os) +
+                L" · " + std::to_wstring(stats.cores) + L" 核\n" + statsLine();
+        text += L"\n采样耗时包含远端命令执行，不等同于纯网络 RTT。";
     }
+    text += L"\n终端 " + terminalInfoText();
+    text += g_app.vault.unlocked() ? L"\n保险库已解锁：密钥仍在内存中" :
+        (vaultFilePresent() ? L"\n保险库已锁定" : L"\n保险库未创建");
+    if (failedDownloadCount()) text += L"\n存在失败传输，点击右侧传输入口查看。";
+    return text;
+}
 
-    RECT textRc{dp(24), y, textRight, rc.bottom};
-    if (textRc.right > textRc.left) {
-        drawText(dc, g_app.statusText, textRc, ui::textDim, g_app.tinyFont,
-                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+LRESULT CALLBACK statusHintProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCDESTROY && g_app.statusHint == hwnd) g_app.statusHint = nullptr;
+    if (msg == WM_NCHITTEST) return HTTRANSPARENT;
+    if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
+    if (msg == WM_ERASEBKGND) return 1;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        RECT rc;
+        GetClientRect(hwnd, &rc);
+        fillRoundRect(dc, rc, dp(8), ui::bgCard, ui::border);
+        InflateRect(&rc, -dp(12), -dp(10));
+        drawText(dc, g_app.statusHintText, rc, ui::text, g_app.uiFont,
+                 DT_LEFT | DT_TOP | DT_WORDBREAK);
+        EndPaint(hwnd, &ps);
+        return 0;
     }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void showStatusHint(HWND owner, POINT point) {
+    RECT client;
+    GetClientRect(owner, &client);
+    if (point.y < client.bottom - g_app.statusH) return;
+    static bool registered = false;
+    constexpr wchar_t name[] = L"RshellStatusHint";
+    if (!registered) {
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = statusHintProc;
+        wc.hInstance = g_app.inst;
+        wc.lpszClassName = name;
+        registered = RegisterClassW(&wc) != 0;
+        if (!registered) return;
+    }
+    if (!g_app.statusHint)
+        g_app.statusHint = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            name, L"", WS_POPUP, 0, 0, 0, 0, owner, nullptr, g_app.inst, nullptr);
+    if (!g_app.statusHint) return;
+    g_app.statusHintText = statusDetailsText();
+    POINT anchor{point.x, client.bottom - g_app.statusH - dp(6)};
+    ClientToScreen(owner, &anchor);
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    if (!GetMonitorInfoW(MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST), &monitor)) return;
+    const int width = std::min<int>(dp(400), monitor.rcWork.right - monitor.rcWork.left - dp(20));
+    RECT textRc{0, 0, width - dp(24), 0};
+    HDC dc = GetDC(owner);
+    HGDIOBJ old = SelectObject(dc, g_app.uiFont);
+    DrawTextW(dc, g_app.statusHintText.c_str(), -1, &textRc, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    SelectObject(dc, old);
+    ReleaseDC(owner, dc);
+    const int height = std::min<int>(textRc.bottom + dp(20), monitor.rcWork.bottom - monitor.rcWork.top - dp(20));
+    const int x = std::clamp<int>(anchor.x, monitor.rcWork.left + dp(10), monitor.rcWork.right - width - dp(10));
+    const int y = std::max<int>(monitor.rcWork.top + dp(10), anchor.y - height);
+    SetWindowPos(g_app.statusHint, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    InvalidateRect(g_app.statusHint, nullptr, FALSE);
 }
 
 void paintMain(HWND hwnd) {
@@ -6611,14 +7276,53 @@ void paintMain(HWND hwnd) {
     fillRect(mem, rc, ui::bgApp);
     paintTitleBar(mem, rc);
 
+    const int pad = dp(14);
+    const int termX = pad * 2 + g_app.sidebarW;
+    if (g_app.contentTop > 0) {
+        fillRoundRect(mem, RECT{pad - dp(6), g_app.contentTop - dp(4),
+                               pad + g_app.sidebarW + dp(6), g_app.contentBottom + dp(6)},
+                      dp(10), ui::bgPanel, ui::borderSoft);
+        drawText(mem, L"远端文件", RECT{pad + dp(4), g_app.contentTop, pad + g_app.sidebarW - dp(58),
+                                      g_app.contentTop + dp(28)}, ui::text, g_app.uiFontBold);
+        const RECT protocol{pad + g_app.sidebarW - dp(48), g_app.contentTop + dp(4),
+                            pad + g_app.sidebarW - dp(2), g_app.contentTop + dp(24)};
+        fillRoundRect(mem, protocol, dp(5), ui::bgCard);
+        drawText(mem, L"SFTP", protocol, ui::textDim, g_app.tinyFont,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+        if (!g_app.searchOpen) {
+            drawText(mem, L">_", RECT{termX + dp(8), g_app.contentTop, termX + dp(32), g_app.contentTop + dp(28)},
+                     ui::accent, g_app.uiFontBold);
+            const std::wstring label = g_app.currentSession.empty() ? L"终端" : toWide(g_app.currentSession);
+            drawText(mem, label, RECT{termX + dp(40), g_app.contentTop, rc.right - pad - dp(116),
+                                     g_app.contentTop + dp(28)}, ui::text, g_app.uiFontBold,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            drawText(mem, L"SSH / 终端", RECT{rc.right - pad - dp(108), g_app.contentTop,
+                                            rc.right - pad - dp(8), g_app.contentTop + dp(28)},
+                     ui::textFaint, g_app.tinyFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            fillRoundRect(mem, g_app.searchBox, dp(6), dlg::bgInput, ui::accent);
+            const std::wstring count = g_app.searchMatches.empty() ? L"0 / 0" :
+                std::to_wstring(g_app.searchIndex + 1) + L" / " + std::to_wstring(g_app.searchMatches.size());
+            drawText(mem, count, RECT{g_app.searchBox.right + dp(4), g_app.contentTop,
+                                     g_app.searchPrev.left - dp(4), g_app.contentTop + dp(28)},
+                     g_app.searchMatches.empty() ? ui::textFaint : ui::warn, g_app.tinyFont,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+            dlg::paintButton(mem, g_app.searchPrev, L"↑", false, false, false, false, !g_app.searchMatches.empty());
+            dlg::paintButton(mem, g_app.searchNext, L"↓", false, false, false, false, !g_app.searchMatches.empty());
+            dlg::paintButton(mem, g_app.searchClose, L"×", false, false, false, false, true);
+        }
+    }
+
     // 分栏标题：路径条（显示当前远端目录，点一下可以输入新路径）
     if (g_app.contentTop > 0 && g_app.fsPathRect.right > g_app.fsPathRect.left) {
         const RECT box = g_app.fsPathRect;
         const bool canEdit = g_app.fsReady;
         // 凹槽样式：比侧栏底色深半档，hover 时描边转为主色，暗示「可以点」
         fillRoundRect(mem, box, dp(5),
-                      canEdit ? ui::mix(ui::bgApp, ui::bgPanel, 0.45) : ui::bgPanel,
-                      canEdit ? (g_app.hoverPathRect ? ui::accent : ui::border) : ui::borderSoft);
+                      canEdit ? dlg::bgInput : ui::bgPanel,
+                      canEdit ? (g_app.hoverPathRect || GetFocus() == g_app.fsPathEdit
+                                     ? ui::accent : ui::border) : ui::borderSoft);
         std::wstring path = toWide(g_app.fsPath);
         if (path.empty()) path = g_app.fsReady ? L"/" : L"未连接";
         int textRight = box.right - dp(7);
@@ -6669,65 +7373,54 @@ void activateTitleButton(HWND hwnd, int index) {
 
 // ---------------------------------------------------------------- 保险库入口
 //
+// 口令只存密码保险库（vault.dat），不再回退到 Windows 凭据管理器。
 // 一个菜单项按状态变三种行为：没有文件 -> 新建，有文件且锁定 -> 解锁，
 // 已解锁 -> 立刻锁定（DEK 从内存里抹掉，下次用还得重新输入主密码）。
 //
-// 解锁成功之后把 credential_store 的后端换成保险库（setCredentialVault），
-// 并把凭据管理器里的会话口令一次性搬进来：同一口令只留保险库这一份，
-// 之后新存的密码也直接进保险库。锁定/退出时断开后端，一切退回凭据管理器。
+// 解锁成功之后把 credential_store 的后端换成保险库（setCredentialVault）；
+// 锁定/退出时断开。解锁时顺手清理孤儿条目（会话已删/取消记住密码的）。
 
-// 把凭据管理器里的会话口令搬进保险库，返回新搬进来的条数。
-//
-// 只搬 sessions.ini 里标了 savepassword 的会话：没有会话的口令是孤儿，搬进来
-// 也永远不会被用到。全部写盘成功之后才删凭据管理器里的旧副本，中途失败只是
-// 少搬几条，下次解锁会再试。
-int migrateCredentialsToVault() {
-    std::vector<std::string> moved;  // 已经进保险库的条目名（成功后清掉旧副本）
-    int added = 0;
-    // 顺手清掉保险库里的孤儿：锁定期间删掉的会话、或取消了「记住密码」的会话，
-    // 其条目只能等解锁后才有机会删（锁定时拿不到条目表）。
-    bool pruned = false;
+// 清理保险库里没有归属的条目：锁定期间删掉的会话、或取消了「记住密码」的会话，
+// 其条目只能等解锁后才有机会删（锁定时拿不到条目表）。返回删除条数。
+int pruneVaultOrphans() {
+    int removed = 0;
     const std::string prefix = "rshell/";
+    const std::string keySuffix = "/key-passphrase";
     for (const std::string& entry : g_app.vault.names()) {
         if (entry.rfind(prefix, 0) != 0) continue;
-        const Session* owner = g_app.store.find(entry.substr(prefix.size()));
-        if (owner && owner->savePassword) continue;
+        std::string name = entry.substr(prefix.size());
+        const bool keyEntry =
+            name.size() > keySuffix.size() &&
+            name.compare(name.size() - keySuffix.size(), keySuffix.size(),
+                         keySuffix) == 0;
+        if (keyEntry) name.resize(name.size() - keySuffix.size());
+        const Session* owner = g_app.store.find(name);
+        if (owner && (keyEntry ? owner->saveKeyPassphrase : owner->savePassword))
+            continue;
         g_app.vault.remove(entry);
-        pruned = true;
+        ++removed;
     }
-
-    for (const Session& session : g_app.store.sessions()) {
-        if (!session.savePassword) continue;
-        const std::string target = credentialTarget(session.name);
-        if (g_app.vault.has(target)) {
-            moved.push_back(target);  // 保险库里已经有：只清掉凭据管理器那份
-            continue;
-        }
-        std::string secret;
-        std::string error;
-        // 保险库里没有 -> 路由会回退到凭据管理器，正好用来读旧口令
-        if (!loadCredential(target, secret, &error)) {
-            if (!error.empty() && error.find("没有这条密码") == std::string::npos)
-                guiLog("迁移 “" + session.name + "” 的口令失败：" + error);
-            continue;
-        }
-        g_app.vault.set(target, secret);
-        wipeString(secret);
-        moved.push_back(target);
-        ++added;
-    }
-    if (moved.empty() && !pruned) return 0;
-
+    if (removed == 0) return 0;
     std::string error;
     if (!g_app.vault.save(&error)) {
-        // 没落盘就别删旧副本，下次解锁再试一遍
-        guiLog("把口令写进密码保险库失败：" + error);
-        for (const std::string& target : moved) g_app.vault.remove(target);
+        guiLog("清理密码保险库里的孤儿条目失败：" + error);
         return 0;
     }
-    for (const std::string& target : moved) deleteManagedCredential(target);
-    if (added > 0) guiLog("已把 " + std::to_string(added) + " 条口令从凭据管理器迁移到密码保险库");
-    return added;
+    guiLog("已清理 " + std::to_string(removed) + " 条密码保险库孤儿条目");
+    return removed;
+}
+
+// 已解锁 -> true；有 vault.dat -> 弹解锁框；没有文件 -> false。
+bool ensureVaultUnlocked() {
+    if (g_app.vault.unlocked()) return true;
+    if (!vaultFilePresent()) return false;
+    const VaultPromptResult result = promptVault(VaultPromptMode::Unlock);
+    if (!result.ok) return false;
+    setCredentialVault(&g_app.vault);
+    pruneVaultOrphans();
+    guiLog(result.viaTpm ? "密码保险库已用 TPM 解锁" : "密码保险库已解锁");
+    InvalidateRect(g_app.main, nullptr, FALSE);
+    return true;
 }
 
 std::wstring vaultMenuLabel() {
@@ -6741,7 +7434,7 @@ void vaultCommand() {
         setCredentialVault(nullptr);
         g_app.vault.lock();
         guiLog("密码保险库已锁定");
-        setStatus(L"密码保险库已锁定，之后保存的口令回到 Windows 凭据管理器");
+        setStatus(L"密码保险库已锁定，解锁后才能使用已保存的密码");
         InvalidateRect(g_app.main, nullptr, FALSE);  // 状态栏的解锁标记要撤掉
         return;
     }
@@ -6753,11 +7446,11 @@ void vaultCommand() {
 
     // 从这里开始，保存/读取口令都由保险库承担
     setCredentialVault(&g_app.vault);
-    const int migrated = migrateCredentialsToVault();
+    const int pruned = pruneVaultOrphans();
 
     const std::wstring count = std::to_wstring(g_app.vault.names().size());
-    const std::wstring migration =
-        migrated > 0 ? L"，已从凭据管理器迁入 " + std::to_wstring(migrated) + L" 条" : L"";
+    const std::wstring cleanup =
+        pruned > 0 ? L"，已清理 " + std::to_wstring(pruned) + L" 条孤儿条目" : L"";
     if (result.created) {
         guiLog("已创建密码保险库");
         setStatus(L"已创建密码保险库（" + count + L" 条）" +
@@ -6765,7 +7458,7 @@ void vaultCommand() {
     } else {
         guiLog(result.viaTpm ? "密码保险库已用 TPM 解锁" : "密码保险库已解锁");
         setStatus(L"密码保险库已解锁（" + count + L" 条）" + (result.viaTpm ? L" · TPM" : L"") +
-                  migration);
+                  cleanup);
     }
     InvalidateRect(g_app.main, nullptr, FALSE);
 }
@@ -6792,6 +7485,7 @@ void openMainMenu(HWND hwnd) {
     };
 
     add(IDM_OPEN, L"会话管理…", L"Ctrl+O");
+    add(IDM_RECONNECT, L"重新连接", L"Ctrl+Shift+R", !connected && !busy && selectedSession());
     add(IDM_CONNECT, connected ? L"断开连接" : L"连接…",
         connected ? L"" : L"Enter", connected || !busy, connected);
     add(IDM_NEW, L"新建会话…", L"Ctrl+N", !busy);
@@ -6803,6 +7497,7 @@ void openMainMenu(HWND hwnd) {
     add(IDM_COPY, L"复制", L"Ctrl+Shift+C");
     add(IDM_PASTE, L"粘贴", L"Ctrl+V");
     add(IDM_SELECT_ALL, L"全选", L"Ctrl+Shift+A");
+    add(IDM_SEARCH, L"搜索终端历史…", L"Ctrl+Shift+F");
     sep();
     add(IDM_ZOOM_IN, L"放大字体", L"Ctrl++");
     add(IDM_ZOOM_OUT, L"缩小字体", L"Ctrl+-");
@@ -6848,11 +7543,34 @@ void applyFontSize(int size) {
     InvalidateRect(g_app.term, nullptr, FALSE);
 }
 
+void openTerminalMenu(HWND hwnd, POINT screenPt) {
+    std::vector<popup::Item> items;
+    auto add = [&](int id, const wchar_t* label, const wchar_t* shortcut, bool enabled = true) {
+        popup::Item item;
+        item.id = id;
+        item.text = label;
+        item.shortcut = shortcut;
+        item.enabled = enabled;
+        items.push_back(std::move(item));
+    };
+    add(IDM_COPY, L"复制", L"Ctrl+Shift+C", g_app.hasSelection);
+    add(IDM_PASTE, L"粘贴", L"Ctrl+V", g_app.shell.running() && IsClipboardFormatAvailable(CF_UNICODETEXT));
+    add(IDM_SELECT_ALL, L"全选", L"Ctrl+Shift+A");
+    popup::Item separator;
+    separator.separator = true;
+    items.push_back(separator);
+    add(IDM_SEARCH, L"搜索终端历史…", L"Ctrl+Shift+F");
+    add(IDM_RECONNECT, L"重新连接", L"Ctrl+Shift+R",
+        !g_app.connecting && !g_app.shell.running() && selectedSession());
+    const int command = popup::run(hwnd, screenPt, items);
+    if (command) PostMessageW(g_app.main, WM_COMMAND, command, 0);
+}
+
 LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             g_app.main = hwnd;
-            g_app.dpi = GetDpiForWindow(hwnd);
+            g_app.dpi = wincompat::windowDpi(hwnd);
 
             g_app.list = CreateWindowExW(
                 0, kListClass, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10, hwnd,
@@ -6877,10 +7595,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 auto* params = reinterpret_cast<NCCALCSIZE_PARAMS*>(lp);
                 if (IsZoomed(hwnd)) {
                     const UINT dpi = static_cast<UINT>(g_app.dpi > 0 ? g_app.dpi : 96);
-                    const int frameX = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
-                                       GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-                    const int frameY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
-                                       GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                    const int frameX = wincompat::systemMetric(SM_CXSIZEFRAME, dpi) +
+                                       wincompat::systemMetric(SM_CXPADDEDBORDER, dpi);
+                    const int frameY = wincompat::systemMetric(SM_CYSIZEFRAME, dpi) +
+                                       wincompat::systemMetric(SM_CXPADDEDBORDER, dpi);
                     params->rgrc[0].left += frameX;
                     params->rgrc[0].right -= frameX;
                     params->rgrc[0].top += frameY;
@@ -6925,6 +7643,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_MOUSEMOVE: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            hideStatusHint();
+            RECT client;
+            GetClientRect(hwnd, &client);
+            const StatusLayout status = statusGeometry(client);
+            const int statusAction = PtInRect(&status.reconnect, pt) ? 1 :
+                                    (PtInRect(&status.dismiss, pt) ? 2 : 0);
             const int button = hitButton(pt);
             const int titleButton = hitTitleButton(pt);
             // 下载胶囊 / 列表里的悬停状态
@@ -6934,7 +7658,9 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const bool pathHover = g_app.fsReady && PtInRect(&g_app.fsPathRect, pt) != FALSE;
             if (button != g_app.hoverButton || titleButton != g_app.hoverTitleBtn ||
                 chipHover != g_app.hoverDownloadChip ||
-                cancelHover != g_app.hoverDownloadCancel || pathHover != g_app.hoverPathRect) {
+                cancelHover != g_app.hoverDownloadCancel || pathHover != g_app.hoverPathRect ||
+                statusAction != g_app.hoverStatusAction) {
+                g_app.hoverStatusAction = statusAction;
                 g_app.hoverButton = button;
                 g_app.hoverTitleBtn = titleButton;
                 g_app.hoverDownloadChip = chipHover;
@@ -6944,12 +7670,24 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             TRACKMOUSEEVENT track{};
             track.cbSize = sizeof(track);
-            track.dwFlags = TME_LEAVE;
+            track.dwFlags = TME_LEAVE | (pt.y >= client.bottom - g_app.statusH ? TME_HOVER : 0);
             track.hwndTrack = hwnd;
+            track.dwHoverTime = 450;
             TrackMouseEvent(&track);
             return 0;
         }
+        case WM_MOUSEHOVER:
+            showStatusHint(hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            return 0;
+        case WM_ACTIVATE:
+            if (LOWORD(wp) == WA_INACTIVE) hideStatusHint();
+            break;
         case WM_MOUSELEAVE:
+            hideStatusHint();
+            if (g_app.hoverStatusAction) {
+                g_app.hoverStatusAction = 0;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             if (g_app.hoverButton != -1 || g_app.hoverTitleBtn != -1 ||
                 g_app.hoverDownloadChip || g_app.hoverDownloadCancel != -1 ||
                 g_app.hoverPathRect) {
@@ -6963,6 +7701,22 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_LBUTTONDOWN: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            hideStatusHint();
+            RECT client;
+            GetClientRect(hwnd, &client);
+            const StatusLayout status = statusGeometry(client);
+            if (PtInRect(&status.dismiss, pt)) { setStatus(L""); return 0; }
+            if (PtInRect(&status.reconnect, pt)) {
+                PostMessageW(hwnd, WM_COMMAND, IDM_RECONNECT, 0);
+                return 0;
+            }
+            if (g_app.searchOpen) {
+                if (PtInRect(&g_app.searchPrev, pt)) { stepTerminalSearch(-1); return 0; }
+                if (PtInRect(&g_app.searchNext, pt)) { stepTerminalSearch(1); return 0; }
+                if (PtInRect(&g_app.searchClose, pt)) { showTerminalSearch(false); return 0; }
+            }
+            if (g_app.fsPathEdit && GetFocus() == g_app.fsPathEdit &&
+                !PtInRect(&g_app.fsPathRect, pt)) SetFocus(hwnd);
             // 下载胶囊：展开/收起列表；列表里的取消、清除、关闭
             const DownloadHit downloadHit = hitDownloadUi(hwnd, pt);
             if (downloadHit.chip) {
@@ -6993,7 +7747,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // 路径条：点一下输入新路径（SFTP 没连上时不可编辑）
             if (g_app.fsReady && PtInRect(&g_app.fsPathRect, pt)) {
-                promptFsPath();
+                focusFsPath();
                 return 0;
             }
 
@@ -7043,8 +7797,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
                 const DownloadHit downloadHit = hitDownloadUi(hwnd, pt);
+                RECT client;
+                GetClientRect(hwnd, &client);
+                const StatusLayout status = statusGeometry(client);
                 if (hitButton(pt) >= 0 || hitTitleButton(pt) >= 0 || downloadHit.chip ||
                     downloadHit.close || downloadHit.clear || downloadHit.cancelIndex >= 0 ||
+                    PtInRect(&status.reconnect, pt) || PtInRect(&status.dismiss, pt) ||
                     (g_app.fsReady && PtInRect(&g_app.fsPathRect, pt))) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
@@ -7057,6 +7815,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // terminalProc 里处理，主窗口把它交给了 DefWindowProc，结果光标
             // 一直亮着不闪。这里统一由主窗口驱动。
             if (wp == 1) {
+                expireStatusNotices(GetTickCount64());
+                if (g_app.searchDirty) refreshTerminalSearch(false);
                 g_app.cursorOn = !g_app.cursorOn;
                 if (g_app.term) InvalidateRect(g_app.term, nullptr, FALSE);
             } else if (wp == kCwdHookTimer1) {
@@ -7154,10 +7914,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             mi.cbSize = sizeof(mi);
             if (GetMonitorInfoW(monitor, &mi)) {
                 const UINT dpi = static_cast<UINT>(g_app.dpi > 0 ? g_app.dpi : 96);
-                const int frameX = GetSystemMetricsForDpi(SM_CXSIZEFRAME, dpi) +
-                                   GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
-                const int frameY = GetSystemMetricsForDpi(SM_CYSIZEFRAME, dpi) +
-                                   GetSystemMetricsForDpi(SM_CXPADDEDBORDER, dpi);
+                const int frameX = wincompat::systemMetric(SM_CXSIZEFRAME, dpi) +
+                                   wincompat::systemMetric(SM_CXPADDEDBORDER, dpi);
+                const int frameY = wincompat::systemMetric(SM_CYSIZEFRAME, dpi) +
+                                   wincompat::systemMetric(SM_CXPADDEDBORDER, dpi);
                 info->ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left - frameX;
                 info->ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top - frameY;
                 info->ptMaxSize.x = (mi.rcWork.right - mi.rcWork.left) + frameX * 2;
@@ -7165,9 +7925,31 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_CTLCOLOREDIT:
+            if (reinterpret_cast<HWND>(lp) == g_app.fsPathEdit ||
+                reinterpret_cast<HWND>(lp) == g_app.searchEdit) {
+                HDC dc = reinterpret_cast<HDC>(wp);
+                SetTextColor(dc, toColorRef(ui::text));
+                SetBkColor(dc, toColorRef(dlg::bgInput));
+                return reinterpret_cast<LRESULT>(dlg::editBrush());
+            }
+            break;
         case WM_COMMAND: {
             const int id = LOWORD(wp);
+            if (id == ID_SEARCH_EDIT && HIWORD(wp) == EN_CHANGE) {
+                refreshTerminalSearch();
+                return 0;
+            }
             switch (id) {
+                case IDM_SEARCH:
+                    showTerminalSearch(true);
+                    return 0;
+                case IDM_RECONNECT:
+                    if (!g_app.connecting && !g_app.shell.running()) {
+                        if (selectedSession()) connectStoredSession(g_app.currentSession);
+                        else openSessionManager();
+                    }
+                    return 0;
                 case IDM_NEW:
                     newSessionCommand();
                     return 0;
@@ -7206,7 +7988,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     fsDeleteSelected();
                     return 0;
                 case IDM_FS_GOTO:
-                    promptFsPath();
+                    focusFsPath();
                     return 0;
                 case IDM_FS_REFRESH:
                     fsRefresh();
@@ -7218,7 +8000,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     if (copyTextToClipboard(text)) {
                         setStatus(L"已复制路径 " + text);
                     } else {
-                        setStatus(L"复制失败：剪贴板正被其它程序占用");
+                        setStatus(L"复制失败：剪贴板正被其它程序占用", true);
                     }
                     return 0;
                 }
@@ -7244,9 +8026,9 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     messageInfo(L"关于 rshell",
                                 L"rshell GUI\n\n基于 libssh2 的 SSH 终端与 SFTP 文件管理器。\n"
                                 L"会话保存在 ~/.rshell/sessions.ini；勾选「记住密码」的会话，"
-                                L"口令存在 Windows 凭据管理器（rshell/<会话名>）或密码保险库里。\n"
+                                L"口令存在密码保险库里（%LOCALAPPDATA%\\rshell\\vault.dat）。\n"
                                 L"主菜单的「密码保险库」用主密码加密保存口令（本机支持时可用 TPM 解锁）；"
-                                L"解锁之后口令一律存进保险库，并会把凭据管理器里的旧条目迁移过来。\n\n"
+                                L"不勾「记住密码」时口令只留在内存里，断开即失效。\n\n"
                                 L"快捷键：Ctrl+Shift+C 复制，Ctrl+V 粘贴，"
                                 L"Ctrl++ / Ctrl+- 缩放字体。");
                     return 0;
@@ -7260,6 +8042,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_SHELL_DATA: {
             std::unique_ptr<std::string> payload(reinterpret_cast<std::string*>(lp));
+            if (wp != g_app.connectionId) return 0;
             if (payload) {
                 if (std::ofstream* dump = terminalDump()) {
                     dump->write(payload->data(), static_cast<std::streamsize>(payload->size()));
@@ -7268,6 +8051,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.shellGotOutput = true;
                 g_app.lastShellOutputTick = GetTickCount();
                 g_app.termData.feed(*payload);
+                g_app.searchDirty = g_app.searchOpen;
                 flushTerminalResponse();
                 // shell 的 OSC 7 钩子会在每次画提示符时把 $PWD 报回来，
                 // 目录变了就带着文件面板一起走（单向：面板不反向影响终端）
@@ -7283,7 +8067,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_CONNECT_OK: {
+            if (wp != g_app.connectionId) return 0;
             g_app.connecting = false;
+            if (!g_app.shell.running()) { layoutMain(hwnd); updateButtons(); return 0; }
+            layoutMain(hwnd);
             layoutTerminal(g_app.term);
             std::wstring status = L"已连接 " + toWide(g_app.currentSession);
             if (!g_app.shell.fingerprint().empty()) {
@@ -7294,17 +8081,14 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 文件通道共用，本分支结束前抹掉
             std::wstring plainPassword = g_currentPassword.reveal();
 
-            // 勾了「记住密码」：连接成功之后才把口令交给当前后端（解锁的保险库
-            // 或凭据管理器），这样被服务器拒绝的口令不会被存下来
+            // 勾了「记住密码」：连接成功之后才把口令交给密码保险库，
+            // 这样被服务器拒绝的口令不会被存下来
             if (!g_pendingCredentialTarget.empty()) {
                 const Session* pending = g_app.store.find(g_pendingCredentialSession);
-                const std::string label =
-                    pending ? sessionCredentialLabel(*pending) : std::string();
                 std::string error;
                 // 临时 UTF-8 副本用完就抹掉，别在堆里留明文
                 std::string plain = toUtf8(plainPassword);
-                const bool stored =
-                    saveCredential(g_pendingCredentialTarget, label, plain, &error);
+                const bool stored = saveCredential(g_pendingCredentialTarget, plain, &error);
                 wipeString(plain);
                 if (stored) {
                     if (pending) {
@@ -7313,8 +8097,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         g_app.store.upsert(copy);
                         g_app.store.save();
                     }
-                    status += credentialVaultActive() ? L"  ·  密码已存入密码保险库"
-                                                      : L"  ·  密码已保存";
+                    status += L"  ·  密码已存入密码保险库";
                 } else {
                     guiLog("保存密码失败：" + error);
                     messageWarn(L"密码没有保存",
@@ -7325,6 +8108,32 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_pendingCredentialSession.clear();
             }
 
+            std::wstring plainKeyPassphrase = g_currentKeyPassphrase.reveal();
+            if (!g_pendingKeyCredentialTarget.empty()) {
+                const Session* pending = g_app.store.find(g_pendingKeyCredentialSession);
+                std::string error;
+                std::string plain = toUtf8(plainKeyPassphrase);
+                const bool stored =
+                    saveCredential(g_pendingKeyCredentialTarget, plain, &error);
+                wipeString(plain);
+                if (stored) {
+                    if (pending) {
+                        Session copy = *pending;
+                        copy.saveKeyPassphrase = true;
+                        g_app.store.upsert(copy);
+                        g_app.store.save();
+                    }
+                    status += L"  ·  私钥口令已存入密码保险库";
+                } else {
+                    guiLog("保存私钥口令失败：" + error);
+                    messageWarn(L"私钥口令没有保存",
+                                L"连接已经建立，但口令没能写进 " + activePasswordBackend() +
+                                    L"。\n\n" + toWide(error));
+                }
+                g_pendingKeyCredentialTarget.clear();
+                g_pendingKeyCredentialSession.clear();
+            }
+
             setStatus(status);
             SetWindowTextW(hwnd, (L"rshell - " + toWide(g_app.currentSession)).c_str());
             SetFocus(g_app.term);
@@ -7333,7 +8142,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             // 左侧切到远端文件树，并开始采集机器状态
             if (const Session* session = g_app.store.find(g_app.currentSession)) {
-                startRemoteFs(*session, plainPassword);
+                startRemoteFs(*session, plainPassword, plainKeyPassphrase);
             }
 
             // 等 rc / motd 输出得差不多了，再往 shell 里注入 OSC 7 钩子，
@@ -7344,43 +8153,95 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 SetTimer(hwnd, kCwdHookTimer1, 900, nullptr);
             }
             wipeWideString(plainPassword);
+            wipeWideString(plainKeyPassphrase);
             return 0;
         }
         case WM_CONNECT_FAIL: {
             std::unique_ptr<std::string> payload(reinterpret_cast<std::string*>(lp));
+            if (wp != g_app.connectionId) return 0;
             stopCwdHook();
             g_app.connecting = false;
-            // 连接都没成功，别把这次输入的口令存进凭据库
+            layoutMain(hwnd);
+            // 连接都没成功，别把这次输入的口令存进密码保险库
             g_pendingCredentialTarget.clear();
             g_pendingCredentialSession.clear();
+            g_pendingKeyCredentialTarget.clear();
+            g_pendingKeyCredentialSession.clear();
+            g_currentKeyPassphrase.clear();
             stopRemoteFs();
             updateButtons();
             const std::wstring detail = payload ? toWide(*payload) : L"未知错误";
-            setStatus(L"连接失败");
+            // 状态栏只放第一行，完整说明（例如握手失败的算法提示）留在对话框和日志里。
+            std::wstring statusText = detail;
+            if (const size_t lineEnd = statusText.find(L'\n'); lineEnd != std::wstring::npos) {
+                statusText.resize(lineEnd);
+            }
+            setStatus(L"连接失败：" + statusText, true);
             messageError(L"连接失败", L"无法建立 SSH 连接，请检查地址、端口和认证信息。", detail);
             return 0;
         }
         case WM_SHELL_CLOSED: {
+            std::unique_ptr<std::string> reason(reinterpret_cast<std::string*>(lp));
+            if (wp != g_app.connectionId) return 0;
             // 会话结束：注入钩子的定时器可能还在排队，先撤掉
             stopCwdHook();
-            if (!g_app.connecting) {
-                g_app.termData.feed("\r\n[连接已断开]\r\n");
+            g_app.connecting = false;
+            {
+                const std::string detail = reason && !reason->empty() ? *reason : "连接已断开";
+                g_app.termData.feed("\r\n[" + detail + "]\r\n");
+                g_app.searchDirty = g_app.searchOpen;
                 InvalidateRect(g_app.term, nullptr, FALSE);
-                setStatus(L"连接已断开");
+                setStatus(toWide(detail), detail.rfind("远端会话已结束", 0) != 0);
+                guiLog("会话结束：" + detail);
                 SetWindowTextW(hwnd, L"rshell");
                 stopRemoteFs();
                 g_currentPassword.clear();
+                g_currentKeyPassphrase.clear();
             }
+            layoutMain(hwnd);
             updateButtons();
+            return 0;
+        }
+        case WM_VAULT_TPM_DONE: {
+            std::unique_ptr<std::shared_ptr<TpmAttempt>> payload(
+                reinterpret_cast<std::shared_ptr<TpmAttempt>*>(lp));
+            if (!payload || !*payload) return 0;
+            const std::shared_ptr<TpmAttempt> attempt = *payload;
+            // 用户已经点了「改用主密码」：这次结果直接丢掉（Vault 析构会清密钥）
+            if (attempt->cancelled.load(std::memory_order_acquire)) return 0;
+            // 与工作线程的 ready.store(release) 配对：之后读 ok/error/vault 才安全
+            (void)attempt->ready.load(std::memory_order_acquire);
+
+            if (attempt->ok) {
+                g_app.vault = std::move(attempt->vault);
+                g_vaultPrompt.ok = true;
+                g_vaultPrompt.viaTpm = true;
+                g_vaultPrompt.busy = false;
+                if (g_vaultPrompt.dlg) vaultPromptClose(g_vaultPrompt.dlg);
+            } else if (g_vaultPrompt.dlg) {
+                // TPM 不可用/密钥失效：留在同一个对话框里，直接输入主密码
+                vaultPromptSetBusy(g_vaultPrompt.dlg, false, L"");
+                std::wstring note =
+                    toWide(attempt->error.empty() ? "TPM 解锁失败" : attempt->error);
+                note += L"；请输入主密码";
+                vaultPromptSetNote(g_vaultPrompt.dlg, note, true);
+                if (g_vaultPrompt.password) {
+                    SetFocus(g_vaultPrompt.password);
+                    SendMessageW(g_vaultPrompt.password, EM_SETSEL, 0, -1);
+                }
+            }
+            if (g_tpmAttempt == attempt) g_tpmAttempt.reset();
             return 0;
         }
         case WM_FS_EVENT: {
             std::unique_ptr<FsEvent> event(reinterpret_cast<FsEvent*>(lp));
+            if (wp != 0 && wp != g_app.connectionId) return 0;
             if (event) handleFsEvent(*event);
             return 0;
         }
         case WM_FS_STATS: {
             std::unique_ptr<RemoteStats> stats(reinterpret_cast<RemoteStats*>(lp));
+            if (wp != 0 && wp != g_app.connectionId) return 0;
             if (stats) {
                 g_app.stats = *stats;
                 InvalidateRect(hwnd, nullptr, FALSE);
@@ -7445,10 +8306,12 @@ void applyDarkFrame(HWND hwnd) {
 // 全部是尽力而为：策略在当前系统上不支持时 SetProcessMitigationPolicy 会失败，
 // 这里忽略返回值，不影响启动。
 void hardenProcess() {
+    const auto setPolicy = wincompat::api().setMitigation;
+    if (!setPolicy) return;  // Win7 不提供这些策略；不影响主密码保险库加密。
     // 1) 禁用 AppInit_DLLs 等传统扩展点注入
     PROCESS_MITIGATION_EXTENSION_POINT_DISABLE_POLICY extension{};
     extension.DisableExtensionPoints = 1;
-    SetProcessMitigationPolicy(ProcessExtensionPointDisablePolicy, &extension, sizeof(extension));
+    setPolicy(ProcessExtensionPointDisablePolicy, &extension, sizeof(extension));
 
     // 2) 禁止本进程生成/切换可执行内存：shellcode 注入后没法直接跑起来。
     //    该策略生效后不可撤销。rshell 不依赖 JIT，实测启动和渲染正常。
@@ -7456,13 +8319,13 @@ void hardenProcess() {
     dynamicCode.ProhibitDynamicCode = 1;   // 不允许 VirtualAlloc(PAGE_EXECUTE_*) / 改可执行属性
     dynamicCode.AllowThreadOptOut = 0;     // 不允许单线程退出该策略
     dynamicCode.AllowRemoteDowngrade = 0;  // 不允许调试器远程降级
-    SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dynamicCode, sizeof(dynamicCode));
+    setPolicy(ProcessDynamicCodePolicy, &dynamicCode, sizeof(dynamicCode));
 
     // 3) 不从不信任的位置加载 DLL：网络路径、低完整性级别目录
     PROCESS_MITIGATION_IMAGE_LOAD_POLICY imageLoad{};
     imageLoad.NoRemoteImages = 1;
     imageLoad.NoLowMandatoryLabelImages = 1;
-    SetProcessMitigationPolicy(ProcessImageLoadPolicy, &imageLoad, sizeof(imageLoad));
+    setPolicy(ProcessImageLoadPolicy, &imageLoad, sizeof(imageLoad));
 
     // 4) 只允许微软签名的二进制：默认关闭。
     //    GUI 会经 COM 加载第三方 shell 扩展（文件对话框、缩略图、杀软 hook），
@@ -7472,7 +8335,7 @@ void hardenProcess() {
         if (enforce[0] == '1') {
             PROCESS_MITIGATION_BINARY_SIGNATURE_POLICY signature{};
             signature.MicrosoftSignedOnly = 1;
-            SetProcessMitigationPolicy(ProcessSignaturePolicy, &signature, sizeof(signature));
+            setPolicy(ProcessSignaturePolicy, &signature, sizeof(signature));
         }
     }
 }
@@ -7482,8 +8345,8 @@ int runGui(HINSTANCE inst, int showCommand) {
     // 在加载任何第三方组件（GDI+、OLE）之前先加固
     hardenProcess();
     // 高 DPI：按监视器 DPI 渲染，避免系统位图缩放导致文字发虚
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    g_app.dpi = GetDpiForSystem();
+    wincompat::initializeDpi();
+    g_app.dpi = wincompat::systemDpi();
     startGdiplus();
     // 拖出下载要用 OLE 拖放（DoDragDrop）
     const bool oleReady = SUCCEEDED(OleInitialize(nullptr));
@@ -7513,14 +8376,14 @@ int runGui(HINSTANCE inst, int showCommand) {
             LocalFree(argv);
         }
     }
-    // 终端配色换成与界面同一套（GitHub Dark），
+    // 终端配色与界面的深蓝灰底色保持一致，
     // 默认的 xterm 纯色在深色 UI 里显得刺眼。
     {
         TerminalTheme theme;
-        theme.fg = 0xC9D1D9;
-        theme.bg = 0x0D1117;
-        theme.cursor = 0x58A6FF;
-        theme.selection = 0x264F78;
+        theme.fg = 0xD8E0EF;
+        theme.bg = 0x10141D;
+        theme.cursor = 0x98A5FF;
+        theme.selection = ui::bgActive;
         const std::uint32_t palette[16] = {
             0x161B22, 0xFF7B72, 0x7EE787, 0xD29922, 0x79C0FF, 0xD2A8FF, 0x56D4DD, 0xC9D1D9,
             0x6E7681, 0xFFA198, 0xA5E3A5, 0xE3B341, 0xA5D6FF, 0xE2C5FF, 0x9FE8EF, 0xF0F6FC,
@@ -7715,3 +8578,9 @@ int runGui(HINSTANCE inst, int showCommand) {
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int showCommand) {
     return runGui(inst, showCommand);
 }
+
+
+
+
+
+

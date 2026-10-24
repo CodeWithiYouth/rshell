@@ -71,7 +71,16 @@
 #define LIBSSH2_RSA_SHA1 1
 #define LIBSSH2_RSA_SHA2 1
 #define LIBSSH2_DSA 1
+
+/*
+ * Ed25519/X25519 由内嵌的 Monocypher 提供（rshell 的 Windows 构建会定义
+ * LIBSSH2_ED25519_MONOCYPHER）。没有这个宏时保持关闭，避免单独构建 libssh2 时缺符号。
+ */
+#ifdef LIBSSH2_ED25519_MONOCYPHER
+#define LIBSSH2_ED25519 1
+#else
 #define LIBSSH2_ED25519 0
+#endif
 
 /*
  * Conditionally enable ECDSA support.
@@ -328,6 +337,38 @@ typedef struct __libssh2_wincng_ecdsa_ctx {
 void
 _libssh2_wincng_ecdsa_free(libssh2_ecdsa_ctx* ctx);
 
+#if LIBSSH2_ECDSA
+int
+_libssh2_wincng_parse_ecdsa_privatekey(libssh2_ecdsa_ctx **key,
+                                       unsigned char *privatekey,
+                                       size_t privatekey_len);
+int
+_libssh2_wincng_ecdsa_new_private_sec1(libssh2_ecdsa_ctx **key,
+                                       LIBSSH2_SESSION *session,
+                                       const char *filename,
+                                       const unsigned char *passphrase);
+int
+_libssh2_wincng_ecdsa_new_from_raw(libssh2_ecdsa_ctx **key,
+                                   LIBSSH2_SESSION *session,
+                                   const char *keytype, const char *curve,
+                                   const unsigned char *point,
+                                   size_t point_len,
+                                   const unsigned char *d, size_t d_len);
+int
+_libssh2_wincng_ecdsa_new_private_from_ppk(libssh2_ecdsa_ctx **key,
+                                           LIBSSH2_SESSION *session,
+                                           const char *filename,
+                                           const char *passphrase);
+int
+_libssh2_wincng_ecdsa_sec1_pubkey(LIBSSH2_SESSION *session,
+                                  unsigned char **method,
+                                  size_t *method_len,
+                                  unsigned char **pubkeydata,
+                                  size_t *pubkeydata_len,
+                                  const char *filename,
+                                  const char *passphrase);
+#endif
+
 #define _libssh2_ecdsa_create_key(session, privkey, pubkey_octal, \
                                   pubkey_octal_len, curve) \
     _libssh2_wincng_ecdh_create_key(session, privkey, pubkey_octal, \
@@ -526,6 +567,46 @@ _libssh2_wincng_hash(const unsigned char *data, ULONG datalen,
 void
 _libssh2_wincng_rsa_free(libssh2_rsa_ctx *rsa);
 
+#if LIBSSH2_RSA
+int
+_libssh2_wincng_rsa_new(libssh2_rsa_ctx **rsa,
+                        const unsigned char *edata, unsigned long elen,
+                        const unsigned char *ndata, unsigned long nlen,
+                        const unsigned char *ddata, unsigned long dlen,
+                        const unsigned char *pdata, unsigned long plen,
+                        const unsigned char *qdata, unsigned long qlen,
+                        const unsigned char *e1data, unsigned long e1len,
+                        const unsigned char *e2data, unsigned long e2len,
+                        const unsigned char *coeffdata, unsigned long coefflen);
+int
+_libssh2_wincng_rsa_new_from_openssh(libssh2_rsa_ctx **rsa,
+                                     LIBSSH2_SESSION *session,
+                                     const char *filename,
+                                     const unsigned char *passphrase);
+int
+_libssh2_wincng_rsa_new_from_parts(libssh2_rsa_ctx **rsa,
+                                   const unsigned char *e, size_t e_len,
+                                   const unsigned char *n, size_t n_len,
+                                   const unsigned char *d, size_t d_len,
+                                   const unsigned char *p, size_t p_len,
+                                   const unsigned char *q, size_t q_len,
+                                   const unsigned char *iqmp,
+                                   size_t iqmp_len);
+int
+_libssh2_wincng_rsa_new_from_ppk(libssh2_rsa_ctx **rsa,
+                                 LIBSSH2_SESSION *session,
+                                 const char *filename,
+                                 const char *passphrase);
+int
+_libssh2_wincng_openssh_rsa_pubkey(LIBSSH2_SESSION *session,
+                                   unsigned char **method,
+                                   size_t *method_len,
+                                   unsigned char **pubkeydata,
+                                   size_t *pubkeydata_len,
+                                   const char *filename,
+                                   const char *passphrase);
+#endif /* LIBSSH2_RSA */
+
 #if LIBSSH2_DSA
 void
 _libssh2_wincng_dsa_free(libssh2_dsa_ctx *dsa);
@@ -557,5 +638,57 @@ _libssh2_dh_secret(_libssh2_dh_ctx *dhctx, _libssh2_bn *secret,
                    _libssh2_bn *f, _libssh2_bn *p);
 extern void
 _libssh2_dh_dtor(_libssh2_dh_ctx *dhctx);
+
+#if LIBSSH2_ED25519
+/*
+ * Ed25519/X25519：由第三方 Monocypher 实现（src/wincng_ed25519.c）。
+ * secret 为 OpenSSH 私钥里的 64 字节（seed || public）。
+ */
+typedef struct _libssh2_wincng_ed25519_ctx {
+    LIBSSH2_SESSION *session;
+    unsigned char secret[64];
+    unsigned char public_key[32];
+    int has_private;
+} libssh2_ed25519_ctx;
+
+void _libssh2_wincng_ed25519_free(libssh2_ed25519_ctx *ctx);
+#define _libssh2_ed25519_free(ctx) _libssh2_wincng_ed25519_free(ctx)
+
+int
+_libssh2_wincng_ed25519_new_private_raw(libssh2_ed25519_ctx **ed_ctx,
+                                        LIBSSH2_SESSION *session,
+                                        const unsigned char secret[64]);
+int
+_libssh2_wincng_ed25519_new_private_from_ppk(libssh2_ed25519_ctx **ed_ctx,
+                                             LIBSSH2_SESSION *session,
+                                             const char *filename,
+                                             const char *passphrase);
+
+int
+_libssh2_wincng_ed25519_pubkey_from_file(LIBSSH2_SESSION *session,
+                                         unsigned char **method,
+                                         size_t *method_len,
+                                         unsigned char **pubkeydata,
+                                         size_t *pubkeydata_len,
+                                         const char *filename,
+                                         const char *passphrase);
+int
+_libssh2_wincng_ed25519_pubkey_from_memory(LIBSSH2_SESSION *session,
+                                           unsigned char **method,
+                                           size_t *method_len,
+                                           unsigned char **pubkeydata,
+                                           size_t *pubkeydata_len,
+                                           const char *filedata,
+                                           size_t filedata_len,
+                                           const char *passphrase);
+#endif /* LIBSSH2_ED25519 */
+
+int
+_libssh2_wincng_ppk_is_file(const char *filename);
+int
+_libssh2_wincng_ppk_pubkey(LIBSSH2_SESSION *session,
+                           unsigned char **method, size_t *method_len,
+                           unsigned char **pubkeydata, size_t *pubkeydata_len,
+                           const char *filename, const char *passphrase);
 
 #endif /* LIBSSH2_WINCNG_H */

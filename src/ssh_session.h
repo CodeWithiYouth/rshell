@@ -40,10 +40,12 @@ struct ConnectionOptions {
     void wipeSecrets();
 };
 
+// 私钥是否带口令（GUI 连接前用它决定是否弹出口令框）
+bool privateKeyNeedsPassphrase(const std::string& keyPath);
+
 // 管理一条 SSH 连接的生命周期。所有阻塞 API 都带超时，避免卡死。
 class SshSession {
-public:
-    explicit SshSession(ConnectionOptions options);
+public:    explicit SshSession(ConnectionOptions options);
     ~SshSession();
 
     SshSession(const SshSession&) = delete;

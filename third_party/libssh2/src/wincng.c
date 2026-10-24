@@ -323,7 +323,7 @@ _libssh2_wincng_ecdsa_curve_type_from_name(IN const char *name,
                                            OUT libssh2_curve_type *out_curve);
 
 /* Parse an OpenSSL-formatted ECDSA private key */
-static int
+int
 _libssh2_wincng_parse_ecdsa_privatekey(OUT _libssh2_wincng_ecdsa_key **key,
                                        IN unsigned char *privatekey,
                                        IN size_t privatekey_len);
@@ -1382,7 +1382,19 @@ _libssh2_wincng_rsa_new_private(libssh2_rsa_ctx **rsa,
     unsigned char *pbEncoded;
     size_t cbEncoded;
     int ret;
+#endif
 
+#if LIBSSH2_RSA
+    /* OpenSSH 新格式 RSA 私钥走自己的解析（CryptoAPI 只认 PEM）。 */
+    if(_libssh2_wincng_rsa_new_from_openssh(rsa, session, filename,
+                                            passphrase) == 0)
+        return 0;
+    if(_libssh2_wincng_ppk_is_file(filename) &&
+       _libssh2_wincng_rsa_new_from_ppk(rsa, session, filename,
+                                        (const char *)passphrase) == 0)
+        return 0;
+#endif
+#ifdef HAVE_LIBCRYPT32
     (void)session;
 
     ret = _libssh2_wincng_load_private(session, filename, passphrase,
@@ -2068,11 +2080,16 @@ _libssh2_wincng_privatekey_from_point(IN _libssh2_wincng_ecc_keytype keytype,
         return LIBSSH2_ERROR_INVAL;
     }
 
+    /* CNG 要求私钥标量长度与坐标长度一致，短标量左侧补零。 */
+    if(d_len > q->x_len) {
+        return LIBSSH2_ERROR_INVAL;
+    }
+
     *key = NULL;
 
     /* Initialize a blob to import */
     ecc_blob_len =
-        sizeof(BCRYPT_ECCPRIVATE_BLOB) + q->x_len + q->y_len + d_len;
+        sizeof(BCRYPT_ECCPRIVATE_BLOB) + q->x_len + q->y_len + q->x_len;
     ecc_blob = malloc(ecc_blob_len);
     if(!ecc_blob) {
         return LIBSSH2_ERROR_ALLOC;
@@ -2091,8 +2108,13 @@ _libssh2_wincng_privatekey_from_point(IN _libssh2_wincng_ecc_keytype keytype,
         (PUCHAR)ecc_blob + sizeof(BCRYPT_ECCKEY_BLOB) + q->x_len,
         q->y,
         q->y_len);
-    memcpy(
+    memset(
         (PUCHAR)ecc_blob + sizeof(BCRYPT_ECCKEY_BLOB) + q->x_len + q->y_len,
+        0,
+        q->x_len - d_len);
+    memcpy(
+        (PUCHAR)ecc_blob + sizeof(BCRYPT_ECCKEY_BLOB) + q->x_len + q->y_len +
+            (q->x_len - d_len),
         d,
         d_len);
 
@@ -2673,6 +2695,33 @@ _libssh2_wincng_ecdsa_new_private(OUT _libssh2_wincng_ecdsa_key **key,
 
     *key = NULL;
 
+    /* SEC1（BEGIN EC PRIVATE KEY）由 wincng_keys.c 解析。 */
+    if(_libssh2_wincng_ecdsa_new_private_sec1(key, session, filename,
+                                              passphrase) == 0)
+        return LIBSSH2_ERROR_NONE;
+    if(_libssh2_wincng_ppk_is_file(filename) &&
+       _libssh2_wincng_ecdsa_new_private_from_ppk(
+           key, session, filename, (const char *)passphrase) == 0)
+        return LIBSSH2_ERROR_NONE;
+
+    /* OpenSSH 新格式（含 bcrypt 口令）由通用解析器解密后交给 ECDSA 后端。 */
+    {
+        FILE *fp = fopen(filename, "rb");
+        if(fp) {
+            struct string_buf *decrypted = NULL;
+            int rc = _libssh2_openssh_pem_parse(session, passphrase, fp,
+                                                &decrypted);
+            fclose(fp);
+            if(rc == 0 && decrypted) {
+                rc = _libssh2_wincng_parse_ecdsa_privatekey(
+                    key, decrypted->data, decrypted->len);
+                _libssh2_string_buf_free(session, decrypted);
+                if(rc == 0)
+                    return LIBSSH2_ERROR_NONE;
+            }
+        }
+    }
+
     if(passphrase && strlen((const char *)passphrase) > 0) {
         return _libssh2_error(
             session,
@@ -3234,7 +3283,33 @@ _libssh2_wincng_pub_priv_keyfile(LIBSSH2_SESSION *session,
     unsigned char *pbEncoded;
     size_t cbEncoded;
     int ret;
+#endif
 
+#if LIBSSH2_ED25519
+    /* OpenSSH 格式的 ed25519 私钥不经过 CryptoAPI，由 Monocypher 后端解析。 */
+    if(_libssh2_wincng_ed25519_pubkey_from_file(session, method, method_len,
+                                                pubkeydata, pubkeydata_len,
+                                                privatekey, passphrase) == 0)
+        return 0;
+#endif
+    if(_libssh2_wincng_ppk_is_file(privatekey) &&
+       _libssh2_wincng_ppk_pubkey(session, method, method_len,
+                                  pubkeydata, pubkeydata_len,
+                                  privatekey, passphrase) == 0)
+        return 0;
+#if LIBSSH2_RSA
+    if(_libssh2_wincng_openssh_rsa_pubkey(session, method, method_len,
+                                          pubkeydata, pubkeydata_len,
+                                          privatekey, passphrase) == 0)
+        return 0;
+#endif
+#if LIBSSH2_ECDSA
+    if(_libssh2_wincng_ecdsa_sec1_pubkey(session, method, method_len,
+                                         pubkeydata, pubkeydata_len,
+                                         privatekey, passphrase) == 0)
+        return 0;
+#endif
+#ifdef HAVE_LIBCRYPT32
     ret = _libssh2_wincng_load_private(session, privatekey,
                                        (const unsigned char *)passphrase,
                                        &pbEncoded, &cbEncoded, 1, 1);
@@ -3273,7 +3348,17 @@ _libssh2_wincng_pub_priv_keyfilememory(LIBSSH2_SESSION *session,
     unsigned char *pbEncoded;
     size_t cbEncoded;
     int ret;
+#endif
 
+#if LIBSSH2_ED25519
+    if(_libssh2_wincng_ed25519_pubkey_from_memory(session, method, method_len,
+                                                  pubkeydata, pubkeydata_len,
+                                                  privatekeydata,
+                                                  privatekeydata_len,
+                                                  passphrase) == 0)
+        return 0;
+#endif
+#ifdef HAVE_LIBCRYPT32
     ret = _libssh2_wincng_load_private_memory(session, privatekeydata,
                                               privatekeydata_len,
                                               (const unsigned char *)
@@ -4183,3 +4268,5 @@ _libssh2_supported_key_sign_algorithms(LIBSSH2_SESSION *session,
 }
 
 #endif /* LIBSSH2_CRYPTO_C */
+
+

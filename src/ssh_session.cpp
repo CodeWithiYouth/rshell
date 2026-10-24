@@ -297,7 +297,19 @@ void SshSession::connect() {
     libssh2_session_set_timeout(session_, options_.timeoutSec * 1000);
 
     int rc = libssh2_session_handshake(session_, sock_);
-    if (rc != 0) fail("SSH 握手失败");
+    if (rc != 0) {
+        std::string message = "SSH 握手失败：" + sshErrorText(rc);
+        if (rc == LIBSSH2_ERROR_KEX_FAILURE) {
+            // 算法没有交集时 libssh2 只给一句 "Unable to exchange encryption keys"，
+            // 不知道的人会误以为是私钥或密码问题。
+            message +=
+                "\n服务器与客户端没有共同的密钥交换/加密/主机密钥算法。WinCNG 的 Win7 兼容构建只支持 "
+                "diffie-hellman-*，如果服务器只开放 curve25519/ECDH（新版 OpenSSH 加固配置常见），需要：\n"
+                "  - Windows 10/11：用 -DRSHELL_WINDOWS7_COMPAT=OFF 重新构建（默认启用 CNG ECDH）；\n"
+                "  - 或让服务器在 sshd_config 的 KexAlgorithms 中放开 diffie-hellman-group-exchange-sha256。";
+        }
+        throw Error(message);
+    }
 
     if (const char* banner = libssh2_session_banner_get(session_)) banner_ = trim(banner);
     if (const char* kex = libssh2_session_methods(session_, LIBSSH2_METHOD_KEX)) kex_ = kex;
@@ -458,17 +470,95 @@ std::string keyAlgorithmHint(const std::string& keyPath) {
         algorithm = "ssh-ed25519";
     }
     if (toLower(algorithm).find("ed25519") != std::string::npos) {
-        return "该私钥为 Ed25519 算法，当前 libssh2 加密后端可能不支持；"
-               "可改用 RSA/ECDSA 私钥，或用 -DRSHELL_CRYPTO_BACKEND=OpenSSL 重新构建";
+        return "私钥为 Ed25519 算法：当前 Windows 构建已支持。若认证失败，请确认私钥与服务器 "
+               "authorized_keys 匹配；带口令时连接前会提示输入。";
+    }
+    std::ifstream keyFile(utf8ToPath(keyPath), std::ios::binary);
+    std::string firstLine;
+    if (keyFile) std::getline(keyFile, firstLine);
+    if (firstLine.find("BEGIN EC PRIVATE KEY") != std::string::npos) {
+        return "ECDSA 私钥为 SEC1 PEM 格式：modern（Windows 10+）构建支持；"
+               "Win7 兼容构建不支持 ECDSA。";
     }
     if (isOpenSshNewFormat(keyPath)) {
-        return "私钥为 OpenSSH 新格式，当前 libssh2 加密后端可能无法解析；"
-               "可用 ssh-keygen -p -m PEM -f <私钥> 转换为 PEM 格式";
+        return "私钥为 OpenSSH 新格式：当前构建支持 RSA/ECDSA/Ed25519。若认证失败，"
+               "请检查是否带口令（GUI 无口令输入框），以及 ECDSA 是否在 Win7 兼容构建上使用。";
     }
     return std::string();
 }
 
+// 加密私钥在没有口令时，libssh2 返回的是 PUBLICKEY_UNVERIFIED
+//（"Callback returned error"）而不是 DECRYPT，所以要先从文件头判断，
+// 交互式连接才能在正确的位置提示输入口令。
+// OpenSSH 新格式的加密标记在 base64 内的 ciphername 里，需要解出来看。
+int base64CharValue(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+std::vector<unsigned char> decodeBase64Text(const std::string& text) {
+    std::vector<unsigned char> out;
+    int buffer = 0;
+    int bits = 0;
+    for (const char c : text) {
+        if (c == '=' || c == '\r' || c == '\n' || c == ' ' || c == '\t') continue;
+        const int value = base64CharValue(c);
+        if (value < 0) return {};
+        buffer = (buffer << 6) | value;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back(static_cast<unsigned char>((buffer >> bits) & 0xFF));
+        }
+    }
+    return out;
+}
+
+bool isEncryptedPrivateKey(const std::string& keyPath) {
+    std::ifstream in(utf8ToPath(keyPath), std::ios::binary);
+    if (!in) return false;
+    const std::string text((std::istreambuf_iterator<char>(in)),
+                           std::istreambuf_iterator<char>());
+    if (text.find("Proc-Type: 4,ENCRYPTED") != std::string::npos) return true;
+    if (text.find("BEGIN ENCRYPTED PRIVATE KEY") != std::string::npos) return true;
+    if (text.find("PuTTY-User-Key-File-") != std::string::npos &&
+        text.find("Encryption: aes256-cbc") != std::string::npos)
+        return true;
+
+    const std::string begin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+    const std::string end = "-----END OPENSSH PRIVATE KEY-----";
+    const size_t start = text.find(begin);
+    if (start == std::string::npos) return false;
+    const size_t bodyStart = start + begin.size();
+    const size_t bodyEnd = text.find(end, bodyStart);
+    if (bodyEnd == std::string::npos) return false;
+    const std::vector<unsigned char> blob =
+        decodeBase64Text(text.substr(bodyStart, bodyEnd - bodyStart));
+
+    static const char kMagic[] = "openssh-key-v1";
+    const size_t magicLen = sizeof(kMagic) - 1;
+    if (blob.size() < magicLen + 1 + 4) return false;
+    if (std::memcmp(blob.data(), kMagic, magicLen) != 0) return false;
+    size_t offset = magicLen + 1;  // 跳过结尾的 '\0'
+    const size_t cipherLen = (static_cast<size_t>(blob[offset]) << 24) |
+                             (static_cast<size_t>(blob[offset + 1]) << 16) |
+                             (static_cast<size_t>(blob[offset + 2]) << 8) |
+                             static_cast<size_t>(blob[offset + 3]);
+    offset += 4;
+    if (cipherLen == 0 || offset + cipherLen > blob.size()) return false;
+    return !(cipherLen == 4 && std::memcmp(blob.data() + offset, "none", 4) == 0);
+}
+
 }  // namespace
+
+bool privateKeyNeedsPassphrase(const std::string& keyPath) {
+    if (keyPath.empty()) return false;
+    return isEncryptedPrivateKey(expandPath(keyPath));
+}
 
 void SshSession::authenticate() {
     const std::string& user = options_.user;
@@ -486,6 +576,9 @@ void SshSession::authenticate() {
         return false;
     };
 
+    // 私钥格式/算法提示：认证全失败时一并抛给界面，GUI 里也能看到原因。
+    std::string keyHint;
+
     auto tryKey = [&](const std::string& keyPath, const std::string& passphrase) -> int {
         if (keyPath.empty()) return LIBSSH2_ERROR_BAD_USE;
         std::error_code ec;
@@ -501,7 +594,16 @@ void SshSession::authenticate() {
         if (rc != 0) {
             log().debug("私钥认证失败 (" + keyPath + ")：" + sshErrorText(rc));
             std::string hint = keyAlgorithmHint(keyPath);
-            if (!hint.empty()) log().warn(hint);
+            if (isEncryptedPrivateKey(keyPath)) {
+                const std::string passphraseHint =
+                    "私钥带口令（passphrase）：请确认连接时输入的口令正确；"
+                    "也可以在 GUI 会话里勾选“记住私钥口令”保存到密码保险库。";
+                hint = hint.empty() ? passphraseHint : passphraseHint + "\n" + hint;
+            }
+            if (!hint.empty()) {
+                log().debug(hint);
+                if (keyHint.empty()) keyHint = hint;
+            }
         }
         return rc;
     };
@@ -509,11 +611,10 @@ void SshSession::authenticate() {
     // 1) 指定私钥
     if (!options_.keyPath.empty()) {
         std::string path = expandPath(options_.keyPath);
-        int rc = tryKey(path, options_.keyPassphrase);
-        if (rc == 0) {
-            authenticated_ = true;
-        } else if (rc == LIBSSH2_ERROR_DECRYPT && stdinIsTty()) {
-            // 私钥被口令加密（或口令错误），交互式重试
+        const bool encrypted = isEncryptedPrivateKey(path);
+        const bool canPrompt = stdinIsTty() && options_.password.empty();
+        if (encrypted && canPrompt && options_.keyPassphrase.empty()) {
+            // 最多试 3 次口令；直接回车表示放弃私钥，继续走密码认证。
             for (int i = 0; i < 3 && !authenticated_; ++i) {
                 std::string entered = readPassword("私钥口令 (" + path + "): ");
                 if (entered.empty()) break;
@@ -526,7 +627,11 @@ void SshSession::authenticate() {
             }
             if (!authenticated_) log().warn("使用指定私钥认证失败：" + path);
         } else {
-            log().warn("使用指定私钥认证失败：" + path);
+            if (tryKey(path, options_.keyPassphrase) == 0) {
+                authenticated_ = true;
+            } else {
+                log().warn("使用指定私钥认证失败：" + path);
+            }
         }
     }
 
@@ -564,11 +669,15 @@ void SshSession::authenticate() {
         char* methods = libssh2_userauth_list(session_, user.c_str(),
                                               static_cast<unsigned int>(user.size()));
         std::string hint = methods ? std::string("服务器允许的方式：") + methods : std::string();
-        throw Error("SSH 认证失败（用户 " + user + "）" + (hint.empty() ? "" : "，" + hint));
+        std::string message = "SSH 认证失败（用户 " + user + "）" +
+                              (hint.empty() ? "" : "，" + hint);
+        if (!keyHint.empty()) message += "\n" + keyHint;
+        throw Error(message);
     }
     log().debug("SSH 认证成功");
     // 凭据已经交给 libssh2 会话，SshSession 自己不再需要明文口令
     wipeString(options_.password);
+    wipeString(options_.keyPassphrase);
 }
 
 // ---------------------------------------------------------------- 执行命令

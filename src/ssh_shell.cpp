@@ -2,19 +2,13 @@
 #include "ssh_shell.h"
 
 #include <chrono>
+#include <algorithm>
 #include <vector>
 
 #include "util.h"
+#include "credential_store.h"
 
 namespace rshell {
-
-namespace {
-
-void sleepMs(int ms) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
-}
-
-}  // namespace
 
 SshShell::SshShell() = default;
 
@@ -24,6 +18,10 @@ void SshShell::setCallbacks(ShellCallbacks callbacks) { callbacks_ = std::move(c
 
 void SshShell::start(const ConnectionOptions& options, const std::string& term, int cols, int rows) {
     close();
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        closedReason_.clear();
+    }
     session_ = std::make_unique<SshSession>(options);
     session_->connect();
     fingerprint_ = session_->fingerprint();
@@ -52,106 +50,137 @@ void SshShell::start(const ConnectionOptions& options, const std::string& term, 
 
 void SshShell::readerLoop() {
     std::vector<char> buf(64 * 1024);
-    int idle = 0;
+    std::string pending;
+    std::string reason;
+    std::size_t offset = 0;
+    std::size_t attemptSize = 0;
+    int cols = 0, rows = 0;
+    auto lastProgress = std::chrono::steady_clock::now();
     while (!stop_.load()) {
         bool active = false;
+        bool readPending = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!channel_) break;
-            auto n = libssh2_channel_read(channel_, buf.data(), buf.size());
-            while (n > 0) {
-                if (callbacks_.onData) callbacks_.onData(std::string(buf.data(), static_cast<std::size_t>(n)));
+            if (pending.empty() && cols == 0 && resizeCols_ > 0) {
+                cols = resizeCols_;
+                rows = resizeRows_;
+                resizeCols_ = 0;
+            }
+            if (cols == 0 && pending.empty() && !outgoing_.empty()) {
+                pending = std::move(outgoing_.front());
+                outgoing_.pop_front();
+                offset = 0;
+                lastProgress = std::chrono::steady_clock::now();
+            }
+        }
+        if (!pending.empty()) {
+            // EAGAIN 后必须用相同的地址和长度重试，期间继续读取远端输出。
+            if (attemptSize == 0) attemptSize = std::min<std::size_t>(16384, pending.size() - offset);
+            const auto n = libssh2_channel_write(channel_, pending.data() + offset, attemptSize);
+            if (n > 0) {
+                offset += static_cast<std::size_t>(n);
+                attemptSize = 0;
+                lastProgress = std::chrono::steady_clock::now();
                 active = true;
-                n = libssh2_channel_read(channel_, buf.data(), buf.size());
-            }
-            if (n < 0 && n != LIBSSH2_ERROR_EAGAIN) {
-                closedReason_ = "读取失败（" + std::to_string(n) + "）";
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    queuedBytes_ -= static_cast<std::size_t>(n);
+                }
+                if (offset == pending.size()) wipeString(pending);
+            } else if (n < 0 && n != LIBSSH2_ERROR_EAGAIN) {
+                reason = "发送失败（" + std::to_string(n) + "）";
                 break;
-            }
-            n = libssh2_channel_read_stderr(channel_, buf.data(), buf.size());
-            while (n > 0) {
-                if (callbacks_.onData) callbacks_.onData(std::string(buf.data(), static_cast<std::size_t>(n)));
-                active = true;
-                n = libssh2_channel_read_stderr(channel_, buf.data(), buf.size());
-            }
-            if (n < 0 && n != LIBSSH2_ERROR_EAGAIN) {
-                closedReason_ = "读取 stderr 失败";
-                break;
-            }
-            if (libssh2_channel_eof(channel_) == 1) {
-                closedReason_.clear();
+            } else if (std::chrono::steady_clock::now() - lastProgress > std::chrono::seconds(30)) {
+                reason = "发送超时：远端持续未接收数据";
                 break;
             }
         }
-        idle = active ? 0 : idle + 1;
-        sleepMs(active ? 0 : (idle > 50 ? 20 : 8));
+        if (cols > 0) {
+            const int rc = libssh2_channel_request_pty_size(channel_, cols, rows);
+            if (rc != LIBSSH2_ERROR_EAGAIN) cols = 0;
+        }
+        for (int stream = 0; stream < 2 && reason.empty(); ++stream) {
+            // 限制单轮读取量，连续输出时也给发送、resize 和退出留出机会。
+            for (int batch = 0; batch < 8 && !stop_.load(); ++batch) {
+                const auto n = libssh2_channel_read_ex(channel_, stream, buf.data(), buf.size());
+                if (n > 0) {
+                    if (callbacks_.onData)
+                        callbacks_.onData(std::string(buf.data(), static_cast<std::size_t>(n)));
+                    active = true;
+                    if (batch == 7) readPending = true;
+                } else {
+                    if (n < 0 && n != LIBSSH2_ERROR_EAGAIN)
+                        reason = "网络读取失败（" + std::to_string(n) + "）";
+                    break;
+                }
+            }
+        }
+        if (!reason.empty()) break;
+        if (!readPending && libssh2_channel_eof(channel_) == 1) {
+            const int status = libssh2_channel_get_exit_status(channel_);
+            reason = "远端会话已结束（退出码 " + std::to_string(status) + "）";
+            break;
+        }
+        if (!active) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            wake_.wait_for(lock, std::chrono::milliseconds(8), [&]() {
+                return stop_.load() || (pending.empty() && cols == 0 &&
+                       (!outgoing_.empty() || resizeCols_ > 0));
+            });
+        }
     }
-
+    wipeString(pending);
+    if (channel_) {
+        libssh2_channel_close(channel_);
+        libssh2_channel_free(channel_);
+        channel_ = nullptr;
+    }
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (channel_) {
-            libssh2_channel_close(channel_);
-            libssh2_channel_free(channel_);
-            channel_ = nullptr;
-        }
-        if (session_) {
-            libssh2_session_set_blocking(session_->raw(), 1);
-        }
+        for (std::string& data : outgoing_) wipeString(data);
+        outgoing_.clear();
+        queuedBytes_ = 0;
+        resizeCols_ = 0;
+        closedReason_ = reason;
+        running_ = false;
+        connected_ = false;
     }
-    running_ = false;
-    connected_ = false;
-    if (callbacks_.onClosed) callbacks_.onClosed();
+    if (!stop_.load() && callbacks_.onClosed) callbacks_.onClosed();
 }
 
-
-
-
-
-bool SshShell::writeRaw(const char* data, std::size_t len) {
+std::string SshShell::closedReason() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!channel_) return false;
-    std::size_t off = 0;
-    int spins = 0;
-    while (off < len) {
-        auto written = libssh2_channel_write(channel_, data + off, len - off);
-        if (written == LIBSSH2_ERROR_EAGAIN) {
-            if (++spins > 2000) return false;
-            sleepMs(1);
-            continue;
-        }
-        if (written < 0) return false;
-        off += static_cast<std::size_t>(written);
-        spins = 0;
-    }
+    return closedReason_;
+}
+
+bool SshShell::write(const std::string& data) {
+    if (data.empty()) return true;
+    std::lock_guard<std::mutex> lock(mutex_);
+    constexpr std::size_t maxQueuedBytes = 8 * 1024 * 1024;
+    if (!running_.load() || stop_.load() || data.size() > maxQueuedBytes - queuedBytes_)
+        return false;
+    outgoing_.push_back(data);
+    queuedBytes_ += data.size();
+    wake_.notify_one();
     return true;
 }
 
-void SshShell::write(const std::string& data) {
-    if (data.empty() || !running_.load()) return;
-    writeRaw(data.data(), data.size());
-}
-
 void SshShell::resize(int cols, int rows) {
-    if (!running_.load()) return;
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!channel_) return;
-    for (int i = 0; i < 100; ++i) {
-        int rc = libssh2_channel_request_pty_size(channel_, cols, rows);
-        if (rc != LIBSSH2_ERROR_EAGAIN) return;
-        sleepMs(2);
-    }
+    if (!running_.load() || stop_.load()) return;
+    resizeCols_ = std::max(1, cols);
+    resizeRows_ = std::max(1, rows);
+    wake_.notify_one();
 }
 
 void SshShell::close() {
     stop_ = true;
+    wake_.notify_one();
     if (reader_.joinable()) reader_.join();
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (channel_) {
-            libssh2_channel_close(channel_);
-            libssh2_channel_free(channel_);
-            channel_ = nullptr;
-        }
+    if (channel_) {
+        libssh2_channel_close(channel_);
+        libssh2_channel_free(channel_);
+        channel_ = nullptr;
     }
     if (session_) {
         session_->disconnect();

@@ -1692,7 +1692,7 @@ dh_gex_clean_exit:
     return ret;
 }
 
-#if LIBSSH2_ECDSA
+#if LIBSSH2_ECDSA || LIBSSH2_ED25519
 
 /* LIBSSH2_KEX_METHOD_EC_SHA_HASH_CREATE_VERIFY
  *
@@ -1807,6 +1807,10 @@ do {                                                                         \
         rc = -1;                                                             \
     }                                                                        \
 } while(0)
+
+#endif /* LIBSSH2_ECDSA || LIBSSH2_ED25519 */
+
+#if LIBSSH2_ECDSA
 
 /* kex_session_ecdh_curve_type
  * returns the EC curve type by name used in key exchange

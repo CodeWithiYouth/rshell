@@ -172,7 +172,8 @@ private:
     std::unique_ptr<SshSession> session_;
     std::unique_ptr<SftpClient> sftp_;
     ConnectionOptions options_;   // 非敏感字段（host/port/user/keyPath/timeout）
-    ProtectedSecret password_;    // 口令只以密文形式留在这里，建连时才 reveal
+    ProtectedSecret password_;    // 登录密码只以密文形式留在这里
+    ProtectedSecret keyPassphrase_;  // 私钥口令同理，建连时才 reveal
 
     std::atomic<bool> running_{false};
     std::atomic<bool> ready_{false};

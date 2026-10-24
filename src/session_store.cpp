@@ -71,6 +71,9 @@ SessionStore SessionStore::load(const std::string& path) {
         } else if (key == "savepassword" || key == "save-password") {
             current.savePassword = (value == "1" || iequals(value, "true") ||
                                     iequals(value, "yes") || iequals(value, "on"));
+        } else if (key == "savekeypassphrase" || key == "save-key-passphrase") {
+            current.saveKeyPassphrase = (value == "1" || iequals(value, "true") ||
+                                         iequals(value, "yes") || iequals(value, "on"));
         }
     }
     flush();
@@ -96,8 +99,9 @@ bool SessionStore::save() const {
         if (!s.user.empty()) out << "user=" << s.user << "\n";
         if (!s.keyPath.empty()) out << "key=" << s.keyPath << "\n";
         if (!s.note.empty()) out << "note=" << s.note << "\n";
-        // 只记标记：密码在凭据管理器或密码保险库里，条目名 rshell/<会话名>
+        // 只记标记：密码/私钥口令在密码保险库里，条目名 rshell/<会话名>
         if (s.savePassword) out << "savepassword=1\n";
+        if (s.saveKeyPassphrase) out << "savekeypassphrase=1\n";
     }
 
     std::ofstream file(p, std::ios::binary | std::ios::trunc);

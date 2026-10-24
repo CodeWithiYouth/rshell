@@ -2,6 +2,8 @@ name: Windows Release
 
 on:
   push:
+    branches:
+      - codex/windows-release-pr-build
     tags:
       - 'v*'
   pull_request:

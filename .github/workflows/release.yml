@@ -63,6 +63,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
       - name: Download build artifact
         uses: actions/download-artifact@v4
         with:

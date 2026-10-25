@@ -70,10 +70,9 @@ enum : UINT {
     WM_VAULT_TPM_DONE = WM_APP + 8,  // lParam = std::shared_ptr<TpmAttempt>*（UI 线程释放）
 };
 
-// 终端目录跟随钩子的注入分三步走（每次一个定时器，避免一次写完 shell 还没执行完）
+// 目录跟随分三步执行，每步由远端私有 OSC 确认；定时器只负责静默等待和超时。
 // 1) stty -echo  2) 写 OSC 7 钩子  3) stty echo
-// 第 4 个定时器不写东西：等最后一批输出落地后再解冻终端画面（注入期间不重绘，
-// 所以连"闪一下"都看不到）。
+// 初始化期间绘制原提示符快照，用户输入暂存到回显恢复后发送。
 constexpr UINT_PTR kCwdHookTimer1 = 2;
 constexpr UINT_PTR kCwdHookTimer2 = 3;
 constexpr UINT_PTR kCwdHookTimer3 = 4;
@@ -102,6 +101,10 @@ enum : int {
     IDM_RECONNECT,
     IDM_ABOUT,
     IDM_EXIT,
+    IDM_NEW_TAB,
+    IDM_CLOSE_TAB,
+    IDM_NEXT_TAB,
+    IDM_PREV_TAB,
     // 文件面板右键菜单（都在 popup::Item 里，走同一个 WM_COMMAND 分发）
     IDM_FS_UPLOAD = 2101,
     IDM_FS_MKDIR,
@@ -114,7 +117,78 @@ enum : int {
     IDM_VAULT = 2201,
 };
 
-struct App {
+struct SessionState {
+    UINT_PTR tabId = 0;
+    bool unread = false;
+    enum class DownloadState { Active, Done, Failed, Cancelled };
+    struct DownloadTask {
+        int id = 0;
+        std::string remote;  // 远端路径：进度事件靠它对应到任务
+        std::wstring name;   // 文件名
+        std::uint64_t done = 0;
+        std::uint64_t total = 0;
+        DownloadState state = DownloadState::Active;
+        bool drag = false;   // 拖到资源管理器：具体落到哪个目录由系统决定
+        bool upload = false;  // true = 上传（本地 -> 远端），false = 下载
+        std::shared_ptr<std::atomic<bool>> cancel;  // 取消开关，传输线程轮询
+    };
+    Terminal termData;
+    std::shared_ptr<SshShell> shell = std::make_shared<SshShell>();
+    std::string currentSession;
+    std::wstring statusText = L"就绪";
+    bool statusError = false;
+    ULONGLONG statusUntil = 0;
+    ULONGLONG terminalInfoUntil = 0;
+    int statusFontSize = 16;
+    bool connecting = false;
+    UINT_PTR connectionId = 0;
+    bool searchOpen = false;
+    bool searchDirty = false;
+    std::vector<TerminalMatch> searchMatches;
+    int searchIndex = -1;
+    // 每个连接独立维护 OSC 7 注入状态、静默等待和重绘冻结。
+    bool shellGotOutput = false;
+    DWORD lastShellOutputTick = 0;
+    DWORD lastKeyTick = 0;
+    int cwdHookTries = 0;
+    long long cwdHookStartLine = 0;
+    int cwdHookPhase = 0;  // 1=关回显，2=安装钩子，3=恢复回显；各阶段由远端确认。
+    bool cwdHookAcked = false;
+    ULONGLONG cwdHookStarted = 0;
+    ULONGLONG cwdHookDeadline = 0;
+    std::unique_ptr<Terminal> cwdHookSnapshot;
+    std::string cwdHookPendingInput;
+    bool holdTermPaint = false;
+    std::shared_ptr<RemoteFs> fs = std::make_shared<RemoteFs>();                 // 独立 SSH 连接：SFTP + 机器状态采样
+    bool fsReady = false;        // 独立连接已建立
+    bool fsFailed = false;       // 独立连接失败（左侧显示原因）
+    std::string fsPath;          // 当前远端目录
+    std::string fsHome;          // 登录后的 home
+    std::string fsError;         // 列目录失败原因
+    std::string fsQuietPath;     // 终端跟随触发的导航：列目录失败只在状态栏提示
+    std::vector<RemoteEntry> fsEntries;
+    int fsSel = -1;
+    int fsHover = -1;
+    int fsScroll = 0;
+    int fsPendingUploads = 0;    // 排队中的上传数：全部完成时只刷新一次目录
+    std::vector<DownloadTask> downloads;
+    int downloadSeq = 0;
+    bool downloadsOpen = false;    // 下载列表是否展开
+    RemoteStats stats;
+    bool hasSelection = false;
+    bool selecting = false;
+    std::size_t selStartLine = 0;
+    std::size_t selEndLine = 0;
+    int selStartCol = 0;
+    int selEndCol = 0;
+    std::wstring searchQuery;
+    ProtectedSecret currentPassword;
+    ProtectedSecret currentKeyPassphrase;
+    std::string pendingCredentialTarget, pendingCredentialSession;
+    std::string pendingKeyCredentialTarget, pendingKeyCredentialSession;
+};
+
+struct App : SessionState {
     HINSTANCE inst = nullptr;
     HWND main = nullptr;
     HWND list = nullptr;
@@ -126,19 +200,16 @@ struct App {
     HWND btnDel = nullptr;
     HWND btnConnect = nullptr;
 
-
     SessionStore store;
-    Terminal termData;
-    SshShell shell;
+    std::shared_ptr<Libssh2Runtime> runtime;
+    RECT tabsRect{};
+    int firstVisibleTab = 0;
+
     // 主密码保险库：解锁后一直留在内存里，退出/手动锁定/（后续）空闲超时再 lock()
     Vault vault;
-    std::string currentSession;
+
     std::wstring windowTitle = L"rshell";
-    std::wstring statusText = L"就绪";
-    bool statusError = false;
-    ULONGLONG statusUntil = 0;
-    ULONGLONG terminalInfoUntil = 0;
-    int statusFontSize = 16;
+
     HWND statusHint = nullptr;
     std::wstring statusHintText;
     int hoverStatusAction = 0;
@@ -192,8 +263,6 @@ struct App {
     int pressTitleBtn = -1;
     RECT titleButtons[4]{};  // 供 WM_NCHITTEST 排除
 
-    // ---- 自绘文件列表状态 ----
-
     // ---- 终端卡片 ----
     int termPadX = 0;
     int termPadY = 0;
@@ -203,30 +272,10 @@ struct App {
     int sbDragStartY = 0;
     int sbDragStartOffset = 0;
 
-    bool connecting = false;
-    UINT_PTR connectionId = 0;
     HWND searchEdit = nullptr;
-    bool searchOpen = false;
-    bool searchDirty = false;
-    std::vector<TerminalMatch> searchMatches;
-    int searchIndex = -1;
+
     RECT searchBox{}, searchPrev{}, searchNext{}, searchClose{};
     bool cursorOn = true;
-    // 终端目录跟随：连接后往远端 shell 注入一段 OSC 7 钩子（bash/zsh），
-    // 每次画提示符时把 $PWD 报回来。注入要等 shell 真的开始说话（rc 跑完），
-    // 并且要等用户手停下来——否则这行命令会插进用户正在输入的半行里。
-    bool shellGotOutput = false;
-    DWORD lastShellOutputTick = 0;
-    DWORD lastKeyTick = 0;
-    int cwdHookTries = 0;
-    // 注入起点（绝对行号 = 回滚行数 + 屏幕内行号）和第 1 步发出的时刻。
-    // 第 1 步的 `stty -echo` 必然被 tty 回显，远端可能因此多出 1~N 行，
-    // 第 2 步要靠这两个值数出到底多了几行，再一次性擦回注入起点。
-    long long cwdHookStartLine = 0;
-    DWORD cwdHookStep1Tick = 0;
-    DWORD cwdHookStep3Tick = 0;
-    // 注入期间冻结终端重绘：回显的 `stty -echo` 等第 2 步擦干净再一起画
-    bool holdTermPaint = false;
     // TranslateMessage 对 Ctrl+字母照样会生成 WM_CHAR（哪怕 WM_KEYDOWN 已经处理过），
     // 不拦的话 Ctrl+V 会粘两次、有选区时 Ctrl+C 会"复制 + 发 ^C"。
     // 存的是要吞掉的字符码，只有真正匹配才吞，避免误伤下一次正常输入。
@@ -240,58 +289,97 @@ struct App {
     int imeCursorPos = 0;
 
     // ---- 左侧文件面板：SFTP 文件浏览器（独立 SSH 连接） ----
-    RemoteFs fs;                 // 独立 SSH 连接：SFTP + 机器状态采样
-    bool fsReady = false;        // 独立连接已建立
-    bool fsFailed = false;       // 独立连接失败（左侧显示原因）
-    std::string fsPath;          // 当前远端目录
-    std::string fsHome;          // 登录后的 home
-    std::string fsError;         // 列目录失败原因
-    std::string fsQuietPath;     // 终端跟随触发的导航：列目录失败只在状态栏提示
-    std::vector<RemoteEntry> fsEntries;
-    int fsSel = -1;
-    int fsHover = -1;
-    int fsScroll = 0;
-    int fsPendingUploads = 0;    // 排队中的上传数：全部完成时只刷新一次目录
+
     bool fsDragArmed = false;    // 左键按下、还没越过拖动阈值
     POINT fsDragOrigin{};
     // 文件面板标题行的路径条：显示当前目录，点一下可以输入新路径
     RECT fsPathRect{};
     bool hoverPathRect = false;
 
-    // ---- 传输任务 ----
-    // 拖动下载、右键「下载到本地」和上传都进同一个列表：收起时是状态栏右侧的一枚
-    // 胶囊，展开后是状态栏上方的逐项列表，每一项都能单独取消。
-    enum class DownloadState { Active, Done, Failed, Cancelled };
-    struct DownloadTask {
-        int id = 0;
-        std::string remote;  // 远端路径：进度事件靠它对应到任务
-        std::wstring name;   // 文件名
-        std::uint64_t done = 0;
-        std::uint64_t total = 0;
-        DownloadState state = DownloadState::Active;
-        bool drag = false;   // 拖到资源管理器：具体落到哪个目录由系统决定
-        bool upload = false;  // true = 上传（本地 -> 远端），false = 下载
-        std::shared_ptr<std::atomic<bool>> cancel;  // 取消开关，传输线程轮询
-    };
-    std::vector<DownloadTask> downloads;
-    int downloadSeq = 0;
-    bool downloadsOpen = false;    // 下载列表是否展开
+    // 传输列表的公共交互状态
     int hoverDownloadCancel = -1;  // 悬停的「取消」按钮对应的任务下标
     bool hoverDownloadChip = false;
     int panelTop = 0;              // 展开时面板顶边（内容区给它让位）
 
-    // ---- 底部状态栏的远端指标 ----
-    RemoteStats stats;
 
-    bool hasSelection = false;
-    bool selecting = false;
-    std::size_t selStartLine = 0;
-    std::size_t selEndLine = 0;
-    int selStartCol = 0;
-    int selEndCol = 0;
 };
 
 App g_app;
+
+// 活动标签的状态放在 App 的基类中，以复用现有终端/SFTP 绘制代码；
+// 其余标签保存在各自的堆对象中。后端本体不随状态移动，工作线程始终持有原连接。
+std::vector<std::unique_ptr<SessionState>> g_tabs;
+std::size_t g_activeTab = 0;
+UINT_PTR g_selectedTabId = 0;
+UINT_PTR g_nextTabId = 1;
+UINT_PTR g_nextConnectionId = 1;
+std::atomic<bool> g_applicationClosing{false};
+
+bool foregroundSession() { return g_app.tabId == g_selectedTabId; }
+
+void initializeSessionTabs() {
+    if (!g_tabs.empty()) return;
+    g_app.tabId = g_nextTabId++;
+    g_app.connectionId = g_nextConnectionId++;
+    g_selectedTabId = g_app.tabId;
+    g_activeTab = 0;
+    g_tabs.emplace_back(nullptr);
+}
+
+SessionState* findSessionState(UINT_PTR id, bool connection) {
+    if ((connection ? g_app.connectionId : g_app.tabId) == id) return &g_app;
+    for (auto& state : g_tabs)
+        if (state && (connection ? state->connectionId : state->tabId) == id) return state.get();
+    return nullptr;
+}
+
+void renameSessionTabs(const std::string& from, const std::string& to) {
+    auto rename = [&](SessionState& state) {
+        if (state.currentSession == from) state.currentSession = to;
+        if (state.pendingCredentialSession == from) {
+            state.pendingCredentialSession = to;
+            state.pendingCredentialTarget = credentialTarget(to);
+        }
+        if (state.pendingKeyCredentialSession == from) {
+            state.pendingKeyCredentialSession = to;
+            state.pendingKeyCredentialTarget = keyPassphraseTarget(to);
+        }
+    };
+    rename(g_app);
+    for (auto& state : g_tabs) if (state) rename(*state);
+}
+
+// 只在 UI 线程中临时切换事件上下文，退出作用域时恢复当前可见标签。
+// 嵌套窗口消息也按自己的所属连接查找状态，不依赖当前标签的下标。
+class SessionStateScope {
+public:
+    explicit SessionStateScope(SessionState* state) : saved_(state == &g_app ? nullptr : state) {
+        if (saved_) std::swap(static_cast<SessionState&>(g_app), *saved_);
+    }
+    ~SessionStateScope() {
+        if (saved_) std::swap(static_cast<SessionState&>(g_app), *saved_);
+    }
+    SessionStateScope(const SessionStateScope&) = delete;
+    SessionStateScope& operator=(const SessionStateScope&) = delete;
+private:
+    SessionState* saved_;
+};
+
+void setCwdTimer(UINT_PTR timer, UINT delay) {
+    SetTimer(g_app.main, g_app.tabId * 8 + timer, delay, nullptr);
+}
+void killCwdTimer(UINT_PTR timer) {
+    KillTimer(g_app.main, g_app.tabId * 8 + timer);
+}
+
+void newSessionTab();
+void switchSessionTab(std::size_t index);
+void closeSessionTab(std::size_t index);
+void cycleSessionTab(int direction);
+void paintSessionTabs(HDC dc);
+int hitSessionTab(POINT pt, bool* close = nullptr);
+bool handleSessionTabClick(POINT pt);
+void ensureActiveTabVisible(int width);
 
 void connectToSession(const Session& session, const std::wstring& password,
                       const std::wstring& keyPassphrase);
@@ -300,15 +388,9 @@ void startRemoteFs(const Session& session, const std::wstring& password,
                    const std::wstring& keyPassphrase);
 
 // 密码/私钥口令只在内存里留到断开连接：文件通道要用同一个凭据再连一次
-ProtectedSecret g_currentPassword;       // 登录密码
-ProtectedSecret g_currentKeyPassphrase;  // 私钥口令
 
 // 用户在密码框里勾了「记住密码/记住私钥口令」时，先记下要写的条目，等连接成功再落库：
 // 口令刚被服务器拒绝的话不该被保存下来。
-std::string g_pendingCredentialTarget;
-std::string g_pendingCredentialSession;
-std::string g_pendingKeyCredentialTarget;
-std::string g_pendingKeyCredentialSession;
 void disconnectSession();
 void updateButtons();
 void doCopy();
@@ -324,7 +406,7 @@ void hideStatusHint();
 void openMainMenu(HWND hwnd);
 void layoutMain(HWND hwnd);
 bool askHostKey(const std::string& host, const std::string& keyType,
-                const std::string& fingerprint);
+                const std::string& fingerprint, UINT_PTR connectionId = 0);
 void openSessionManager(bool startBlank = false);
 void openFileContextMenu(HWND hwnd, POINT screenPt);
 // 传输任务（状态栏列表）：新增、取消、清理已完成、展开高度
@@ -410,11 +492,11 @@ bool ensureVaultUnlocked();
 void vaultCommand();
 
 void setStatus(const std::wstring& text, bool error = false) {
-    hideStatusHint();
+    if (foregroundSession()) hideStatusHint();
     g_app.statusText = text;
     g_app.statusError = error && !text.empty();
     g_app.statusUntil = !error && !text.empty() ? GetTickCount64() + 4000 : 0;
-    if (g_app.status) SetWindowTextW(g_app.status, text.c_str());
+    if (foregroundSession() && g_app.status) SetWindowTextW(g_app.status, text.c_str());
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
 }
 
@@ -1186,13 +1268,28 @@ void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome 
     }
 }
 
+class TerminalDisplayScope {
+public:
+    TerminalDisplayScope() {
+        if (g_app.holdTermPaint && g_app.cwdHookSnapshot) {
+            snapshot_ = g_app.cwdHookSnapshot.get();
+            snapshot_->resize(g_app.termData.cols(), g_app.termData.rows());
+            std::swap(g_app.termData, *snapshot_);
+        }
+    }
+    ~TerminalDisplayScope() { if (snapshot_) std::swap(g_app.termData, *snapshot_); }
+    TerminalDisplayScope(const TerminalDisplayScope&) = delete;
+    TerminalDisplayScope& operator=(const TerminalDisplayScope&) = delete;
+private:
+    Terminal* snapshot_ = nullptr;
+};
+
 void paintTerminal(HWND hwnd) {
-    if (g_app.holdTermPaint) {
-        // 注入 OSC 7 钩子期间冻结画面：远端回显的那几行等第 2 步擦干净再一起画，
-        // 否则屏幕上会看到 `stty -echo` 闪一下。
+    if (g_app.holdTermPaint && !g_app.cwdHookSnapshot) {
         ValidateRect(hwnd, nullptr);
         return;
     }
+    TerminalDisplayScope display;
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(hwnd, &ps);
     RECT client;
@@ -1206,7 +1303,7 @@ void paintTerminal(HWND hwnd) {
 
     drawTerminalGrid(g_app.memDC, width, height, GetFocus() == hwnd, true);
     // 仅在首次打开的空终端显示引导，保留断开后的全部输出。
-    if (g_app.currentSession.empty() && !g_app.connecting && !g_app.shell.running() &&
+    if (g_app.currentSession.empty() && !g_app.connecting && !g_app.shell->running() &&
         g_app.termData.scrollbackCount() == 0 && width >= dp(320) && height >= dp(220)) {
         bool blank = true;
         for (int row = 0; row < g_app.termData.rows() && blank; ++row)
@@ -1349,13 +1446,21 @@ bool renderDumpToBmp(const std::wstring& dumpPath, const std::wstring& outPath, 
 
 void flushTerminalResponse() {
     std::string resp = g_app.termData.takeResponse();
-    if (!resp.empty() && g_app.shell.running()) g_app.shell.write(resp);
+    if (!resp.empty() && g_app.shell->running()) g_app.shell->write(resp);
 }
 
 void sendInput(const std::string& text) {
     if (text.empty()) return;
-    if (g_app.shell.running()) {
-        if (!g_app.shell.write(text)) setStatus(L"发送队列已满或连接已断开，本次输入未发送", true);
+    if (g_app.cwdHookPhase) {
+        constexpr std::size_t limit = 8 * 1024 * 1024;
+        if (text.size() > limit - g_app.cwdHookPendingInput.size())
+            setStatus(L"初始化期间的待发送队列已满，本次输入未发送", true);
+        else g_app.cwdHookPendingInput += text;
+        return;
+    }
+    if (text != "\x1b[I" && text != "\x1b[O") g_app.lastKeyTick = GetTickCount();
+    if (g_app.shell->running()) {
+        if (!g_app.shell->write(text)) setStatus(L"发送队列已满或连接已断开，本次输入未发送", true);
     } else {
         setStatus(L"尚未连接：请先选择一个会话并连接");
     }
@@ -1423,7 +1528,14 @@ void layoutTerminal(HWND hwnd) {
         g_app.terminalInfoUntil = GetTickCount64() + 2000;
         if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
         g_app.termData.resize(cols, rows);
-        if (g_app.shell.running()) g_app.shell.resize(cols, rows);
+        if (g_app.shell->running()) g_app.shell->resize(cols, rows);
+        if (foregroundSession()) {
+            for (auto& state : g_tabs) if (state) {
+                state->termData.resize(cols, rows);
+                state->searchDirty = state->searchOpen;
+                if (state->shell->running()) state->shell->resize(cols, rows);
+            }
+        }
         InvalidateRect(hwnd, nullptr, FALSE);
     }
 }
@@ -1571,7 +1683,7 @@ int modifierCode(bool shift, bool alt, bool ctrl) {
 
 // 返回 true 表示按键已被处理（不再交给默认窗口过程）
 bool handleKeyDown(HWND hwnd, WPARAM key, bool alt) {
-    g_app.lastKeyTick = GetTickCount();  // 注入 OSC 7 钩子前要等用户停手
+    g_app.lastKeyTick = GetTickCount();  // 用户开始输入后，本次不再自动注入初始化命令。
     const bool ctrl = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
     const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
     const int mod = modifierCode(shift, alt, ctrl);
@@ -1801,6 +1913,7 @@ void updateImeWindow(HWND hwnd) {
 // ---------------------------------------------------------------- 终端窗口
 
 LRESULT CALLBACK terminalProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    SessionStateScope visible(findSessionState(g_selectedTabId, false));
     switch (msg) {
         case WM_PAINT:
             paintTerminal(hwnd);
@@ -2163,6 +2276,7 @@ const Session* selectedSession() { return g_app.store.find(g_app.currentSession)
 
 // 自绘按钮的可用状态由按钮自己算，这里只负责触发重绘
 void updateButtons() {
+    if (!foregroundSession()) return;
     if (!g_app.fsReady && g_app.fsPathEdit) ShowWindow(g_app.fsPathEdit, SW_HIDE);
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
     if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
@@ -2170,30 +2284,72 @@ void updateButtons() {
 
 void endCwdHookFreeze() {
     if (!g_app.holdTermPaint) return;
+    if (g_app.cwdHookSnapshot) {
+        g_app.termData.restoreDisplay(std::move(*g_app.cwdHookSnapshot));
+        g_app.cwdHookSnapshot.reset();
+    }
     g_app.holdTermPaint = false;
-    g_app.cwdHookStep3Tick = 0;
     if (g_app.term) InvalidateRect(g_app.term, nullptr, FALSE);
 }
 
 void stopCwdHook() {
     if (g_app.main) {
-        KillTimer(g_app.main, kCwdHookTimer1);
-        KillTimer(g_app.main, kCwdHookTimer2);
-        KillTimer(g_app.main, kCwdHookTimer3);
-        KillTimer(g_app.main, kCwdHookTimer4);
+        killCwdTimer(kCwdHookTimer1);
+        killCwdTimer(kCwdHookTimer2);
+        killCwdTimer(kCwdHookTimer3);
+        killCwdTimer(kCwdHookTimer4);
     }
-    g_app.shellGotOutput = false;
     g_app.cwdHookTries = 0;
     g_app.cwdHookStartLine = 0;
-    g_app.cwdHookStep1Tick = 0;
-    g_app.cwdHookStep3Tick = 0;
+    g_app.cwdHookPhase = 0;
+    g_app.cwdHookAcked = false;
+    g_app.cwdHookDeadline = 0;
+    g_app.cwdHookPendingInput.clear();
     endCwdHookFreeze();  // 断线 / 取消注入时画面不能一直冻着
 }
 
-// 往远端 shell 注入 OSC 7 钩子（分三步，见文件开头的定时器常量）。
-// 第 1 步必然被 tty 回显，屏幕上会多出几行；第 2 步在 ECHO 关掉之后把它们
-// 一次性擦回注入起点（擦几行由本地终端模型数出来），所以不会留痕。
-void sendCwdHookScript() {
+std::string cwdHookAckCommand(int phase) {
+    return "printf '\\033]777;rshell-cwd;" + std::to_string(g_app.connectionId) + ":" +
+        std::to_string(phase) + "\\007'";
+}
+
+void finishCwdHook(bool timedOut = false) {
+    std::string pending = std::move(g_app.cwdHookPendingInput);
+    const bool started = g_app.cwdHookStarted != 0;
+    const auto elapsed = GetTickCount64() - g_app.cwdHookStarted;
+    stopCwdHook();
+    if (!pending.empty()) sendInput(pending);
+    if (timedOut) {
+        guiLog("目录跟随初始化超时，已恢复终端输入");
+        setStatus(L"目录跟随初始化超时，已恢复终端输入", true);
+    } else if (started) guiLog("目录跟随初始化完成（" + std::to_string(elapsed) + " ms）");
+}
+
+void abortCwdHook() {
+    if (g_app.shell->running()) g_app.shell->write(" stty echo\r");
+    finishCwdHook(true);
+}
+
+void handleCwdHookAck(const std::string& ack) {
+    if (!g_app.cwdHookPhase || ack != std::to_string(g_app.connectionId) + ":" +
+        std::to_string(g_app.cwdHookPhase)) return;
+    if (g_app.cwdHookPhase == 1) {
+        g_app.cwdHookAcked = true;
+        setCwdTimer(kCwdHookTimer2, 40);
+    } else if (g_app.cwdHookPhase == 2) {
+        killCwdTimer(kCwdHookTimer3);
+        g_app.cwdHookPhase = 3;
+        g_app.cwdHookAcked = false;
+        g_app.shell->write(buildCwdHookRestoreEcho() + "; " + cwdHookAckCommand(3) + "\r");
+        setCwdTimer(kCwdHookTimer4, 40);
+    } else {
+        g_app.cwdHookAcked = true;
+        setCwdTimer(kCwdHookTimer4, 40);
+    }
+}
+
+// 远端确认关回显后再安装钩子，不再凭固定网络延时猜测命令完成时间。
+bool sendCwdHookScript() {
     // 数出"注入起点 → 当前光标"差了几行：第 1 步必然被 tty 回显，
     // 远端可能因此多出 1~N 行（多行提示符、PROMPT_COMMAND 打印、shell 报错都算），
     // 所以擦除不能写死"上移一行"。
@@ -2202,14 +2358,15 @@ void sendCwdHookScript() {
     const int erase = std::clamp(static_cast<int>(nowLine - g_app.cwdHookStartLine), 1,
                                  std::max(1, g_app.termData.cursorRow()));
     // 擦除序列和钩子本体都在 util.cpp 的 buildCwdHookScript 里，这里只补一个回车
-    g_app.shell.write(buildCwdHookScript(erase) + "\r");
+    return g_app.shell->write(buildCwdHookScript(erase) + "; " + cwdHookAckCommand(2) + "\r");
 }
 
 void disconnectSession() {
     stopCwdHook();
-    ++g_app.connectionId;
-    if (g_app.shell.running() || g_app.connecting) {
-        g_app.shell.close();
+    g_app.connectionId = g_nextConnectionId++;
+    if (g_app.shell->running() || g_app.connecting) {
+        if (g_app.connecting) g_app.shell = std::make_shared<SshShell>();
+        else g_app.shell->close();
         g_app.connecting = false;
         setStatus(L"已断开连接");
         g_app.termData.feed("\r\n[已主动断开连接]\r\n");
@@ -2217,8 +2374,12 @@ void disconnectSession() {
         InvalidateRect(g_app.term, nullptr, FALSE);
     }
     stopRemoteFs();
-    g_currentPassword.clear();
-    g_currentKeyPassphrase.clear();
+    g_app.currentPassword.clear();
+    g_app.currentKeyPassphrase.clear();
+    g_app.pendingCredentialTarget.clear();
+    g_app.pendingCredentialSession.clear();
+    g_app.pendingKeyCredentialTarget.clear();
+    g_app.pendingKeyCredentialSession.clear();
     layoutMain(g_app.main);
     updateButtons();
 }
@@ -2226,9 +2387,13 @@ void disconnectSession() {
 void connectToSession(const Session& session, const std::wstring& password,
                       const std::wstring& keyPassphrase) {
     if (g_app.connecting) return;
-    if (g_app.shell.running()) disconnectSession();
-    const UINT_PTR connectionId = ++g_app.connectionId;
-    g_app.shell.close();  // 等旧工作线程结束后才能替换回调。
+    if (g_app.shell->running()) disconnectSession();
+    stopCwdHook();
+    g_app.shellGotOutput = false;
+    g_app.lastShellOutputTick = g_app.lastKeyTick = 0;
+    g_app.connectionId = g_nextConnectionId++;
+    const UINT_PTR connectionId = g_app.connectionId;
+    g_app.shell->close();  // 等旧工作线程结束后才能替换回调。
 
     ConnectionOptions options;
     options.host = session.host;
@@ -2251,32 +2416,34 @@ void connectToSession(const Session& session, const std::wstring& password,
     }
 
     HWND mainWindow = g_app.main;
-    options.confirmHostKey = [mainWindow](const std::string& hostField,
+    options.confirmHostKey = [mainWindow, connectionId](const std::string& hostField,
                                           const std::string& fingerprint,
                                           const std::string& keyType) {
         guiLog("未知主机密钥 " + hostField + " " + keyType + " " + fingerprint);
         (void)mainWindow;
         // 连接发生在工作线程：SendMessage 会把询问同步到 UI 线程的自绘对话框
-        return askHostKey(hostField, keyType, fingerprint);
+        return askHostKey(hostField, keyType, fingerprint, connectionId);
     };
 
-    g_app.shell.setCallbacks(ShellCallbacks{
+    auto shell = g_app.shell;
+    const auto runtime = g_app.runtime;
+    shell->setCallbacks(ShellCallbacks{
         [mainWindow, connectionId](std::string data) {
             auto* payload = new std::string(std::move(data));
             if (!PostMessageW(mainWindow, WM_SHELL_DATA, connectionId, reinterpret_cast<LPARAM>(payload))) {
                 delete payload;
             }
         },
-        [mainWindow, connectionId]() {
-            auto* reason = new std::string(g_app.shell.closedReason());
+        [mainWindow, connectionId, source = shell.get()]() {
+            auto* reason = new std::string(source->closedReason());
             if (!PostMessageW(mainWindow, WM_SHELL_CLOSED, connectionId, reinterpret_cast<LPARAM>(reason)))
                 delete reason;
         }});
 
     g_app.connecting = true;
     g_app.currentSession = session.name;
-    g_currentPassword.assign(password);
-    g_currentKeyPassphrase.assign(keyPassphrase);
+    g_app.currentPassword.assign(password);
+    g_app.currentKeyPassphrase.assign(keyPassphrase);
     g_app.termData.reset();
     g_app.hasSelection = false;
     g_app.searchMatches.clear();
@@ -2293,9 +2460,9 @@ void connectToSession(const Session& session, const std::wstring& password,
 
     const int cols = g_app.termData.cols();
     const int rows = g_app.termData.rows();
-    std::thread([mainWindow, connectionId, options, cols, rows]() {
+    std::thread([mainWindow, connectionId, options, cols, rows, shell, runtime]() mutable {
         try {
-            g_app.shell.start(options, "xterm-256color", cols, rows);
+            shell->start(options, "xterm-256color", cols, rows);
             guiLog("连接成功，已打开 shell 通道");
             PostMessageW(mainWindow, WM_CONNECT_OK, connectionId, 0);
         } catch (const std::exception& ex) {
@@ -2305,6 +2472,7 @@ void connectToSession(const Session& session, const std::wstring& password,
                 delete message;
             }
         }
+        shell.reset();  // 在 runtime 的生命周期内释放可能已被关闭标签放弃的连接。
     }).detach();
 }
 
@@ -3197,6 +3365,7 @@ bool messageConfirm(const std::wstring& title, const std::wstring& text,
 // 这样弹出的是自绘对话框而不是系统 MessageBox。
 
 struct HostKeyRequest {
+    UINT_PTR connectionId = 0;
     std::string host;
     std::string keyType;
     std::string fingerprint;
@@ -3216,12 +3385,14 @@ bool runHostKeyDialog(const std::string& host, const std::string& keyType,
 }
 
 bool askHostKey(const std::string& host, const std::string& keyType,
-                const std::string& fingerprint) {
+                const std::string& fingerprint, UINT_PTR connectionId) {
+    if (g_applicationClosing.load()) return false;
     if (!g_app.main || !IsWindow(g_app.main)) return false;
     if (GetCurrentThreadId() == GetWindowThreadProcessId(g_app.main, nullptr)) {
         return runHostKeyDialog(host, keyType, fingerprint);
     }
     HostKeyRequest request;
+    request.connectionId = connectionId;
     request.host = host;
     request.keyType = keyType;
     request.fingerprint = fingerprint;
@@ -3768,6 +3939,7 @@ bool mgrSave(HWND hwnd) {
     }
     const auto& sessions = g_app.store.sessions();
     bool passwordDropped = false;
+    std::string renamedFrom;
     if (g_mgr.selected >= 0 && g_mgr.selected < static_cast<int>(sessions.size())) {
         const Session old = sessions[static_cast<std::size_t>(g_mgr.selected)];
         // 改名要把口令搬到新条目名下；保险库锁着时先请用户解锁，
@@ -3809,11 +3981,13 @@ bool mgrSave(HWND hwnd) {
                 s.saveKeyPassphrase = true;
             }
         }
-        if (old.name != s.name) g_app.store.remove(old.name);
+        if (old.name != s.name) { renamedFrom = old.name; g_app.store.remove(old.name); }
     }
     g_app.store.upsert(s);
     g_app.store.save();
-    g_app.currentSession = s.name;
+    if (!renamedFrom.empty()) renameSessionTabs(renamedFrom, s.name);
+    if (g_app.currentSession.empty() && !g_app.connecting && !g_app.shell->running())
+        g_app.currentSession = s.name;
 
     g_mgr.selected = -1;
     const auto& after = g_app.store.sessions();
@@ -3856,7 +4030,6 @@ void mgrDelete(HWND hwnd) {
     if (removed.saveKeyPassphrase) deleteCredential(keyPassphraseTarget(name));
     g_app.store.remove(name);
     g_app.store.save();
-    if (g_app.currentSession == name) g_app.currentSession.clear();
 
     const int count = static_cast<int>(g_app.store.sessions().size());
     g_mgr.selected = count > 0 ? std::min(g_mgr.selected, count - 1) : -1;
@@ -4167,10 +4340,11 @@ void openSessionManager(bool startBlank) {
 }
 
 void connectStoredSession(const std::string& name) {
-    if (g_app.connecting) return;
     const Session* session = g_app.store.find(name);
     if (!session) return;
     Session target = *session;
+    if (g_app.connecting || g_app.shell->running() ||
+        (!g_app.currentSession.empty() && g_app.currentSession != name)) newSessionTab();
     std::wstring password;
     bool remember = target.savePassword;
 
@@ -4222,8 +4396,8 @@ void connectStoredSession(const std::string& name) {
                 }
                 if (remember) {
                     // 等连接成功再写：口令刚被服务器拒绝的话不该被保存
-                    g_pendingCredentialTarget = credentialTarget(target.name);
-                    g_pendingCredentialSession = target.name;
+                    g_app.pendingCredentialTarget = credentialTarget(target.name);
+                    g_app.pendingCredentialSession = target.name;
                 }
             } else if (target.savePassword) {
                 // 用户这次取消了勾选：把旧的条目一起删掉
@@ -4281,8 +4455,8 @@ void connectStoredSession(const std::string& name) {
                     }
                 }
                 if (rememberKey) {
-                    g_pendingKeyCredentialTarget = keyPassphraseTarget(target.name);
-                    g_pendingKeyCredentialSession = target.name;
+                    g_app.pendingKeyCredentialTarget = keyPassphraseTarget(target.name);
+                    g_app.pendingKeyCredentialSession = target.name;
                 }
             } else if (target.saveKeyPassphrase) {
                 deleteCredential(keyPassphraseTarget(target.name));
@@ -4899,7 +5073,7 @@ VaultPromptResult promptVault(VaultPromptMode mode) {
 
 // 连接按钮 / 菜单里的「连接」：已连接时断开，否则打开会话管理窗口
 void onConnectCommand() {
-    if (g_app.shell.running()) {
+    if (g_app.shell->running()) {
         disconnectSession();
         return;
     }
@@ -4918,6 +5092,7 @@ void revealTerminalMatch() {
 }
 
 void refreshTerminalSearch(bool reveal) {
+    if (!foregroundSession()) return;
     if (!g_app.searchOpen) return;
     std::u32string query;
     const std::wstring text = textOf(g_app.searchEdit);
@@ -5036,7 +5211,7 @@ const RemoteEntry* selectedFileEntry() {
 }
 
 void fsRefresh() {
-    if (!g_app.fsPath.empty()) g_app.fs.listDir(g_app.fsPath);
+    if (!g_app.fsPath.empty()) g_app.fs->listDir(g_app.fsPath);
 }
 
 // quiet：由终端目录跟随触发的导航。远端目录可能进不去（权限 / 已被删除），
@@ -5048,7 +5223,7 @@ void fsNavigate(const std::string& path, bool quiet = false) {
     g_app.fsScroll = 0;
     g_app.fsError.clear();
     g_app.fsEntries.clear();
-    g_app.fs.listDir(g_app.fsPath);
+    g_app.fs->listDir(g_app.fsPath);
     if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
 }
@@ -5166,7 +5341,7 @@ void fsOpenEntry(int index) {
     // 登记下载任务：状态栏会展开列表显示进度，可随时取消
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     addDownloadTask(entry.path, toWide(entry.name), entry.size, false, cancel);
-    g_app.fs.download(entry.path, toUtf8(file), cancel);
+    g_app.fs->download(entry.path, toUtf8(file), cancel);
     setStatus(L"正在下载 " + toWide(entry.name) + L" …");
 }
 
@@ -5202,7 +5377,7 @@ void fsUploadFiles() {
     for (const std::wstring& local : files) {
         const std::string name = localBaseName(toUtf8(local));
         auto cancel = std::make_shared<std::atomic<bool>>(false);
-        g_app.fs.upload(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel);
+        g_app.fs->upload(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel);
         ++g_app.fsPendingUploads;
     }
     setStatus(L"正在上传 " + std::to_wstring(files.size()) + L" 个文件到 " + toWide(g_app.fsPath) +
@@ -5216,7 +5391,7 @@ void fsDeleteSelected() {
     std::wstring text = L"确定删除「" + toWide(entry->name) + L"」吗？";
     if (entry->isDir()) text += L"\n目录必须为空才能删除。";
     if (!messageConfirm(L"删除远端文件", text, L"删除", L"取消")) return;
-    g_app.fs.remove(entry->path, entry->isDir());
+    g_app.fs->remove(entry->path, entry->isDir());
     setStatus(L"正在删除 " + toWide(entry->name) + L" …");
 }
 
@@ -5340,7 +5515,7 @@ void fsMkdirDialog() {
         messageWarn(L"名称无效", L"目录名不能包含 /。");
         return;
     }
-    g_app.fs.mkdir(remoteJoin(g_app.fsPath, dirName));
+    g_app.fs->mkdir(remoteJoin(g_app.fsPath, dirName));
     setStatus(L"正在创建 " + name + L" …");
 }
 
@@ -5728,8 +5903,8 @@ bool renderIconSheet(const std::wstring& outPath) {
 namespace {
 
 // 把拖放层的事件投递到 UI 线程（可能在资源管理器的复制线程上调用）
-void postDndEvent(const dnd::Event& event) {
-    if (!g_app.main) return;
+void postDndEvent(HWND mainWindow, UINT_PTR connectionId, const dnd::Event& event) {
+    if (!mainWindow) return;
     auto* message = new FsEvent();
     switch (event.kind) {
         case dnd::EventKind::Started:
@@ -5755,7 +5930,7 @@ void postDndEvent(const dnd::Event& event) {
     message->bytes = event.done;
     message->total = event.total;
     message->cancel = event.cancel;
-    if (!PostMessageW(g_app.main, WM_FS_EVENT, 0, reinterpret_cast<LPARAM>(message))) {
+    if (!PostMessageW(mainWindow, WM_FS_EVENT, connectionId, reinterpret_cast<LPARAM>(message))) {
         delete message;
     }
 }
@@ -5808,19 +5983,23 @@ void beginDragOut(HWND hwnd) {
     file.cancel = std::make_shared<std::atomic<bool>>(false);
     files.push_back(std::move(file));
 
-    dnd::ReaderFactory factory = [](const std::string& key, std::string* error) {
+    const auto fs = g_app.fs;
+    dnd::ReaderFactory factory = [fs](const std::string& key, std::string* error) {
         dnd::Reader reader;
-        auto source = g_app.fs.openReader(key, error);
+        auto source = fs->openReader(key, error);
         if (!source) return reader;
-        reader.size = [source]() { return source->size(); };
-        reader.read = [source](char* buffer, std::size_t capacity, std::string* readError) {
+        reader.size = [source, fs]() { return source->size(); };
+        reader.read = [source, fs](char* buffer, std::size_t capacity, std::string* readError) {
             return source->read(buffer, capacity, readError);
         };
-        reader.close = [source]() { source->close(); };
+        reader.close = [source, fs]() { source->close(); };
         return reader;
     };
 
-    auto* data = new dnd::VirtualFileData(std::move(files), std::move(factory), &postDndEvent);
+    const HWND mainWindow = g_app.main;
+    const UINT_PTR connectionId = g_app.connectionId;
+    auto* data = new dnd::VirtualFileData(std::move(files), std::move(factory),
+        [mainWindow, connectionId](const dnd::Event& event) { postDndEvent(mainWindow, connectionId, event); });
     // 「下载不卡 UI」的关键：先声明允许目标后台取数，放置目标才会自己起线程读流
     // 并立刻从 Drop 返回；DoDragDrop 一返回，UI 线程马上回到消息循环，后面的
     // 下载全在后台线程（我们的预取线程 + 目标的复制线程）上跑。
@@ -5853,7 +6032,7 @@ void beginDragOut(HWND hwnd) {
 void openFileContextMenu(HWND hwnd, POINT screenPt) {
     const RemoteEntry* entry = selectedFileEntry();
     const bool ready = g_app.fsReady;
-    const bool connected = g_app.shell.running() || g_app.connecting;
+    const bool connected = g_app.shell->running() || g_app.connecting;
 
     std::vector<popup::Item> items;
     auto add = [&items](int id, const wchar_t* text, const wchar_t* shortcut = L"",
@@ -6005,9 +6184,10 @@ ConnectionOptions makeRemoteOptions(const Session& session, const std::wstring& 
     if (options.user.empty()) {
         if (const char* env = std::getenv("USERNAME")) options.user = env;
     }
-    options.confirmHostKey = [](const std::string& hostField, const std::string& fingerprint,
+    const UINT_PTR connectionId = g_app.connectionId;
+    options.confirmHostKey = [connectionId](const std::string& hostField, const std::string& fingerprint,
                                 const std::string& keyType) {
-        return askHostKey(hostField, keyType, fingerprint);
+        return askHostKey(hostField, keyType, fingerprint, connectionId);
     };
     return options;
 }
@@ -6026,7 +6206,7 @@ void startRemoteFs(const Session& session, const std::wstring& password,
     g_app.stats = RemoteStats();
 
     const UINT_PTR connectionId = g_app.connectionId;
-    g_app.fs.setCallbacks(RemoteFsCallbacks{
+    g_app.fs->setCallbacks(RemoteFsCallbacks{
         [connectionId](const FsEvent& event) {
             auto* copy = new FsEvent(event);
             if (!PostMessageW(g_app.main, WM_FS_EVENT, connectionId, reinterpret_cast<LPARAM>(copy)))
@@ -6037,8 +6217,8 @@ void startRemoteFs(const Session& session, const std::wstring& password,
             if (!PostMessageW(g_app.main, WM_FS_STATS, connectionId, reinterpret_cast<LPARAM>(copy)))
                 delete copy;
         }});
-    g_app.fs.setSampleInterval(5);
-    g_app.fs.start(makeRemoteOptions(session, password, keyPassphrase));
+    g_app.fs->setSampleInterval(5);
+    g_app.fs->start(makeRemoteOptions(session, password, keyPassphrase));
 
     layoutMain(g_app.main);
     updateButtons();
@@ -6138,7 +6318,9 @@ void clearFinishedDownloads() {
 }
 
 void stopRemoteFs() {
-    g_app.fs.stop();
+    for (auto& task : g_app.downloads)
+        if (downloadActive(task) && task.cancel) task.cancel->store(true);
+    g_app.fs->stop();
     // 连接没了，还在跑的下载不可能继续：全部标成失败，避免列表里挂着永远不会动的项
     for (auto& task : g_app.downloads) {
         if (!downloadActive(task)) continue;
@@ -6199,7 +6381,7 @@ void handleFsEvent(const FsEvent& event) {
             g_app.fsHome = event.path;  // 路径框里的 ~ 展开用
             if (!event.message.empty()) {
                 g_app.fsError = event.message;
-                messageWarn(L"文件面板不可用",
+                if (foregroundSession()) messageWarn(L"文件面板不可用",
                             L"终端已经连上，但 SFTP 子系统打开失败：\n" + toWide(event.message));
             } else if (!event.path.empty()) {
                 // shell 通道可能比 SFTP 先连上（并且已经上报过 OSC 7），
@@ -6267,7 +6449,7 @@ void handleFsEvent(const FsEvent& event) {
                 if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
                 break;
             }
-            messageError(L"远端操作失败", L"操作没有完成。", toWide(event.message));
+            if (foregroundSession()) messageError(L"远端操作失败", L"操作没有完成。", toWide(event.message));
             break;
     }
     if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
@@ -6277,6 +6459,7 @@ void handleFsEvent(const FsEvent& event) {
 
 
 void layoutMain(HWND hwnd) {
+    if (!foregroundSession()) return;
     hideStatusHint();
     RECT rc;
     GetClientRect(hwnd, &rc);
@@ -6293,7 +6476,9 @@ void layoutMain(HWND hwnd) {
     const int panelH = downloadsPanelHeight();
     g_app.panelTop = rc.bottom - statusH - panelH;
 
-    const int contentTop = titleH + pad;
+    g_app.tabsRect = RECT{pad, titleH, rc.right - pad, titleH + dp(36)};
+    ensureActiveTabVisible(rc.right);
+    const int contentTop = titleH + dp(36) + pad;
     const int contentBottom = rc.bottom - statusH - panelH - pad;
     if (contentBottom - contentTop < dp(110)) return;
 
@@ -6346,7 +6531,7 @@ void layoutMain(HWND hwnd) {
                        std::max(dp(20), static_cast<int>(box.right - box.left) - dp(14)), editH, TRUE);
             SendMessageW(g_app.searchEdit, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
         }
-        if (!g_app.searchOpen && !g_app.shell.running() && !g_app.connecting && selectedSession())
+        if (!g_app.searchOpen && !g_app.shell->running() && !g_app.connecting && selectedSession())
             g_app.buttons.push_back(App::UiButton{IDM_RECONNECT,
                 RECT{rc.right - pad - dp(108), contentTop, rc.right - pad, contentTop + dp(28)}, false, true});
         const int termTop = contentTop + dp(38);
@@ -6362,6 +6547,7 @@ void layoutMain(HWND hwnd) {
 // 左侧文件面板：SFTP 浏览器。文件操作都在右键菜单里，底部只留一个动作按钮。
 // 双击目录进入、双击文件另存为；F5 刷新，Backspace 上级，Delete 删除。
 LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    SessionStateScope visible(findSessionState(g_selectedTabId, false));
     switch (msg) {
         case WM_CREATE:
             DragAcceptFiles(hwnd, TRUE);  // 允许把本地文件拖进来上传
@@ -6519,7 +6705,7 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (attrs & FILE_ATTRIBUTE_DIRECTORY) continue;
                 const std::string name = localBaseName(toUtf8(local));
                 auto cancel = std::make_shared<std::atomic<bool>>(false);
-                g_app.fs.upload(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel);
+                g_app.fs->upload(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel);
                 ++g_app.fsPendingUploads;
                 ++sent;
             }
@@ -6543,7 +6729,7 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 bool buttonEnabled(int id) {
     const bool busy = g_app.connecting;
-    const bool connected = g_app.shell.running();
+    const bool connected = g_app.shell->running();
     switch (id) {
         case ID_BTN_ACTION:
             return connected || !busy;
@@ -6659,7 +6845,7 @@ void paintTitleBar(HDC dc, const RECT& rc) {
     if (g_app.connecting) {
         pillLabel = L"连接中";
         pillColor = ui::warn;
-    } else if (g_app.shell.running()) {
+    } else if (g_app.shell->running()) {
         pillLabel = L"已连接";
         pillColor = ui::success;
     }
@@ -6690,7 +6876,7 @@ void paintTitleBar(HDC dc, const RECT& rc) {
 
 // 侧栏按钮：主按钮实心主色；连接后主按钮变“断开”（危险色描边）
 void paintButtons(HDC dc) {
-    const bool connected = g_app.shell.running();
+    const bool connected = g_app.shell->running();
     for (const auto& b : g_app.buttons) {
         const bool enabled = buttonEnabled(b.id);
         const bool hovered = enabled && g_app.hoverButton == b.id;
@@ -6863,7 +7049,7 @@ StatusLayout statusGeometry(const RECT& client) {
         layout.vault = RECT{right - dp(108), top, right, bottom};
         right = layout.vault.left - dp(12);
     }
-    if (!g_app.connecting && !g_app.shell.running() && selectedSession()) {
+    if (!g_app.connecting && !g_app.shell->running() && selectedSession()) {
         layout.reconnect = RECT{right - dp(76), top, right, bottom};
         right = layout.reconnect.left - dp(12);
     }
@@ -7144,7 +7330,7 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
 
 std::wstring statusConnectionText() {
     std::wstring text = g_app.connecting ? L"连接中" :
-        (g_app.shell.running() ? L"已连接" : (g_app.connectionId ? L"已断开" : L"未连接"));
+        (g_app.shell->running() ? L"已连接" : (g_app.connectionId ? L"已断开" : L"未连接"));
     if (!g_app.currentSession.empty()) text += L" · " + toWide(g_app.currentSession);
     return text;
 }
@@ -7157,7 +7343,7 @@ void paintStatusBar(HDC dc, const RECT& rc) {
     fillRect(dc, RECT{0, y, rc.right, rc.bottom}, ui::bgPanel);
     drawHLine(dc, 0, rc.right, y, ui::border);
     const std::uint32_t dot = g_app.connecting ? ui::warn :
-        (g_app.shell.running() ? ui::success : (g_app.statusError ? ui::danger : ui::textFaint));
+        (g_app.shell->running() ? ui::success : (g_app.statusError ? ui::danger : ui::textFaint));
     fillCircle(dc, dp(14), y + h / 2, dp(3), dot);
     drawText(dc, statusConnectionText(), layout.connection, ui::text, g_app.uiFont,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -7279,6 +7465,7 @@ void paintMain(HWND hwnd) {
 
     fillRect(mem, rc, ui::bgApp);
     paintTitleBar(mem, rc);
+    paintSessionTabs(mem);
 
     const int pad = dp(14);
     const int termX = pad * 2 + g_app.sidebarW;
@@ -7468,7 +7655,7 @@ void vaultCommand() {
 }
 
 void openMainMenu(HWND hwnd) {
-    const bool connected = g_app.shell.running();
+    const bool connected = g_app.shell->running();
     const bool busy = g_app.connecting;
 
     std::vector<popup::Item> items;
@@ -7492,7 +7679,10 @@ void openMainMenu(HWND hwnd) {
     add(IDM_RECONNECT, L"重新连接", L"Ctrl+Shift+R", !connected && !busy && selectedSession());
     add(IDM_CONNECT, connected ? L"断开连接" : L"连接…",
         connected ? L"" : L"Enter", connected || !busy, connected);
-    add(IDM_NEW, L"新建会话…", L"Ctrl+N", !busy);
+    add(IDM_NEW_TAB, L"新建标签", L"Ctrl+T");
+    add(IDM_CLOSE_TAB, L"关闭当前标签", L"Ctrl+Shift+W");
+    sep();
+    add(IDM_NEW, L"新建会话…", L"Ctrl+N");
     add(IDM_EDIT, L"编辑当前会话…", L"", !busy);
     add(IDM_DELETE, L"删除当前会话…", L"", !busy);
     sep();
@@ -7535,7 +7725,6 @@ void deleteSessionCommand() {
         return;
     g_app.store.remove(g_app.currentSession);
     g_app.store.save();
-    g_app.currentSession.clear();
     setStatus(L"已删除会话 " + name);
     updateButtons();
 }
@@ -7558,22 +7747,253 @@ void openTerminalMenu(HWND hwnd, POINT screenPt) {
         items.push_back(std::move(item));
     };
     add(IDM_COPY, L"复制", L"Ctrl+Shift+C", g_app.hasSelection);
-    add(IDM_PASTE, L"粘贴", L"Ctrl+V", g_app.shell.running() && IsClipboardFormatAvailable(CF_UNICODETEXT));
+    add(IDM_PASTE, L"粘贴", L"Ctrl+V", g_app.shell->running() && IsClipboardFormatAvailable(CF_UNICODETEXT));
     add(IDM_SELECT_ALL, L"全选", L"Ctrl+Shift+A");
     popup::Item separator;
     separator.separator = true;
     items.push_back(separator);
     add(IDM_SEARCH, L"搜索终端历史…", L"Ctrl+Shift+F");
     add(IDM_RECONNECT, L"重新连接", L"Ctrl+Shift+R",
-        !g_app.connecting && !g_app.shell.running() && selectedSession());
+        !g_app.connecting && !g_app.shell->running() && selectedSession());
     const int command = popup::run(hwnd, screenPt, items);
     if (command) PostMessageW(g_app.main, WM_COMMAND, command, 0);
 }
 
+// ---------------------------------------------------------------- 多标签会话
+
+struct SessionTabsLayout {
+    std::vector<RECT> items;
+    RECT previous{}, next{}, add{};
+    int capacity = 1;
+};
+
+SessionTabsLayout sessionTabsLayout(int width) {
+    SessionTabsLayout result;
+    const int pad = dp(14), gap = dp(4), button = dp(28);
+    const int top = g_app.titleH + dp(3), bottom = top + dp(30);
+    const int available = std::max(dp(120), width - pad * 2 - button - gap);
+    result.capacity = std::max(1, available / dp(156));
+    const bool overflow = static_cast<int>(g_tabs.size()) > result.capacity;
+    const int arrows = overflow ? button * 2 + gap * 2 : 0;
+    result.capacity = std::max(1, (available - arrows) / dp(156));
+    const int count = std::min<int>(result.capacity, static_cast<int>(g_tabs.size()));
+    const int tabWidth = std::min(dp(200), (available - arrows) / std::max(1, count));
+    for (int i = 0; i < count; ++i)
+        result.items.push_back(RECT{pad + i * tabWidth, top, pad + (i + 1) * tabWidth - gap, bottom});
+    const int right = width - pad;
+    result.add = RECT{right - button, top, right, bottom};
+    if (overflow) {
+        result.next = RECT{result.add.left - gap - button, top, result.add.left - gap, bottom};
+        result.previous = RECT{result.next.left - gap - button, top, result.next.left - gap, bottom};
+    }
+    return result;
+}
+
+void ensureActiveTabVisible(int width) {
+    const int capacity = sessionTabsLayout(width).capacity;
+    if (static_cast<int>(g_activeTab) < g_app.firstVisibleTab)
+        g_app.firstVisibleTab = static_cast<int>(g_activeTab);
+    if (static_cast<int>(g_activeTab) >= g_app.firstVisibleTab + capacity)
+        g_app.firstVisibleTab = static_cast<int>(g_activeTab) - capacity + 1;
+    g_app.firstVisibleTab = std::clamp(g_app.firstVisibleTab, 0,
+        std::max(0, static_cast<int>(g_tabs.size()) - capacity));
+}
+
+SessionState& sessionAt(std::size_t index) {
+    return index == g_activeTab ? static_cast<SessionState&>(g_app) : *g_tabs[index];
+}
+
+void paintSessionTabs(HDC dc) {
+    if (g_tabs.empty()) return;
+    RECT client{};
+    GetClientRect(g_app.main, &client);
+    const auto layout = sessionTabsLayout(client.right);
+    POINT mouse{}; GetCursorPos(&mouse); ScreenToClient(g_app.main, &mouse);
+    for (std::size_t i = 0; i < layout.items.size(); ++i) {
+        const std::size_t index = static_cast<std::size_t>(g_app.firstVisibleTab) + i;
+        if (index >= g_tabs.size()) break;
+        const auto& state = sessionAt(index);
+        const RECT& rect = layout.items[i];
+        const bool active = index == g_activeTab;
+        const bool hover = PtInRect(&rect, mouse) != FALSE;
+        fillRoundRect(dc, rect, dp(6), active ? ui::bgActive : (hover ? ui::bgHover : ui::bgPanel),
+                      active ? ui::accent : ui::borderSoft);
+        const auto color = state.connecting ? ui::warn :
+            (state.shell->running() ? ui::success : (state.statusError ? ui::danger : ui::textFaint));
+        fillCircle(dc, rect.left + dp(11), (rect.top + rect.bottom) / 2, dp(3), color);
+        const std::wstring label = state.currentSession.empty() ? L"新标签" : toWide(state.currentSession);
+        RECT text{rect.left + dp(22), rect.top, rect.right - dp(28), rect.bottom};
+        drawText(dc, label, text, active ? ui::text : ui::textDim,
+                 active ? g_app.uiFontBold : g_app.uiFont,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        if (state.unread && !active)
+            fillCircle(dc, rect.right - dp(30), rect.top + dp(7), dp(2), ui::accent);
+        RECT close{rect.right - dp(23), rect.top + dp(4), rect.right - dp(3), rect.bottom - dp(4)};
+        if (PtInRect(&close, mouse)) fillRoundRect(dc, close, dp(4), ui::bgHover);
+        drawText(dc, L"×", close, ui::textDim, g_app.uiFont,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    auto button = [&](const RECT& rect, const wchar_t* label, bool enabled) {
+        if (IsRectEmpty(&rect)) return;
+        fillRoundRect(dc, rect, dp(5), enabled && PtInRect(&rect, mouse) ? ui::bgHover : ui::bgPanel);
+        drawText(dc, label, rect, enabled ? ui::text : ui::textFaint, g_app.uiFontBold,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    };
+    button(layout.previous, L"‹", g_app.firstVisibleTab > 0);
+    button(layout.next, L"›", g_app.firstVisibleTab + layout.capacity < static_cast<int>(g_tabs.size()));
+    button(layout.add, L"＋", true);
+}
+
+int hitSessionTab(POINT pt, bool* close) {
+    RECT client{}; GetClientRect(g_app.main, &client);
+    const auto layout = sessionTabsLayout(client.right);
+    for (std::size_t i = 0; i < layout.items.size(); ++i) {
+        const auto& rect = layout.items[i];
+        if (!PtInRect(&rect, pt)) continue;
+        if (close) *close = pt.x >= rect.right - dp(26);
+        return g_app.firstVisibleTab + static_cast<int>(i);
+    }
+    return -1;
+}
+
+void restoreSessionUi() {
+    if (g_app.searchEdit) {
+        SetWindowTextW(g_app.searchEdit, g_app.searchQuery.c_str());
+        ShowWindow(g_app.searchEdit, g_app.searchOpen ? SW_SHOW : SW_HIDE);
+    }
+    g_app.unread = false;
+    g_app.sbHover = g_app.sbDrag = g_app.fsDragArmed = false;
+    g_app.hoverButton = g_app.pressButton = g_app.hoverDownloadCancel = -1;
+    g_app.hoverDownloadChip = g_app.hoverPathRect = false;
+    g_app.hoverStatusAction = 0;
+    g_app.cursorOn = true;
+    g_app.swallowChar = -1;
+    expireStatusNotices(GetTickCount64());
+    layoutMain(g_app.main);
+    layoutTerminal(g_app.term);
+    if (g_app.searchOpen) refreshTerminalSearch(false);
+    std::wstring title = L"rshell";
+    if (!g_app.currentSession.empty()) title += L" - " + toWide(g_app.currentSession);
+    if (!g_app.termData.title().empty()) title += L" - " + toWide(g_app.termData.title());
+    SetWindowTextW(g_app.main, title.c_str());
+    updateButtons();
+    InvalidateRect(g_app.term, nullptr, FALSE);
+    SetFocus(g_app.term);
+}
+
+void switchSessionTab(std::size_t index) {
+    initializeSessionTabs();
+    if (index >= g_tabs.size() || index == g_activeTab) return;
+    g_app.searchQuery = textOf(g_app.searchEdit);
+    if (HIMC context = ImmGetContext(g_app.term)) {
+        ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_CANCEL, 0);
+        ImmReleaseContext(g_app.term, context);
+    }
+    g_app.imeComposition.clear(); g_app.imeCursorPos = 0;
+    g_app.selecting = false;
+    SetFocus(g_app.main);
+    if (g_app.fsPathEdit) ShowWindow(g_app.fsPathEdit, SW_HIDE);
+    if (GetCapture() == g_app.term || GetCapture() == g_app.list) ReleaseCapture();
+    g_tabs[g_activeTab] = std::make_unique<SessionState>(std::move(static_cast<SessionState&>(g_app)));
+    static_cast<SessionState&>(g_app) = std::move(*g_tabs[index]);
+    g_tabs[index].reset();
+    g_activeTab = index;
+    g_selectedTabId = g_app.tabId;
+    restoreSessionUi();
+}
+
+void newSessionTab() {
+    initializeSessionTabs();
+    auto state = std::make_unique<SessionState>();
+    state->tabId = g_nextTabId++;
+    state->connectionId = g_nextConnectionId++;
+    state->termData.setTheme(g_app.termData.theme());
+    state->termData.resize(g_app.termData.cols(), g_app.termData.rows());
+    g_tabs.push_back(std::move(state));
+    switchSessionTab(g_tabs.size() - 1);
+}
+
+void disposeSessionState(SessionState& state) {
+    for (UINT_PTR timer = kCwdHookTimer1; timer <= kCwdHookTimer4; ++timer)
+        KillTimer(g_app.main, state.tabId * 8 + timer);
+    state.connectionId = g_nextConnectionId++;
+    for (auto& task : state.downloads) if (task.cancel) task.cancel->store(true);
+    state.fs->stop();
+    if (!state.connecting) state.shell->close();
+    state.currentPassword.clear(); state.currentKeyPassphrase.clear();
+}
+
+void closeSessionTab(std::size_t index) {
+    if (index >= g_tabs.size()) return;
+    auto& state = sessionAt(index);
+    const bool transferring = std::any_of(state.downloads.begin(), state.downloads.end(),
+        [](const SessionState::DownloadTask& task) { return task.state == SessionState::DownloadState::Active; });
+    if (transferring && !messageConfirm(L"关闭标签", L"该标签仍有文件正在传输，关闭会取消这些任务。", L"关闭标签", L"继续传输")) return;
+    if (g_tabs.size() == 1) {
+        const auto theme = g_app.termData.theme();
+        disposeSessionState(g_app);
+        static_cast<SessionState&>(g_app) = SessionState();
+        g_app.termData.setTheme(theme);
+        g_app.tabId = g_nextTabId++;
+        g_app.connectionId = g_nextConnectionId++;
+        g_selectedTabId = g_app.tabId;
+        restoreSessionUi();
+        return;
+    }
+    if (index == g_activeTab) switchSessionTab(index ? index - 1 : index + 1);
+    disposeSessionState(*g_tabs[index]);
+    g_tabs.erase(g_tabs.begin() + static_cast<std::ptrdiff_t>(index));
+    if (g_activeTab > index) --g_activeTab;
+    restoreSessionUi();
+}
+
+void cycleSessionTab(int direction) {
+    if (g_tabs.empty()) return;
+    const int count = static_cast<int>(g_tabs.size());
+    switchSessionTab(static_cast<std::size_t>((static_cast<int>(g_activeTab) + direction + count) % count));
+}
+
+bool handleSessionTabClick(POINT pt) {
+    if (!PtInRect(&g_app.tabsRect, pt)) return false;
+    bool close = false;
+    const int index = hitSessionTab(pt, &close);
+    if (index >= 0) {
+        if (close) closeSessionTab(static_cast<std::size_t>(index));
+        else switchSessionTab(static_cast<std::size_t>(index));
+        return true;
+    }
+    RECT client{}; GetClientRect(g_app.main, &client);
+    const auto layout = sessionTabsLayout(client.right);
+    if (PtInRect(&layout.add, pt)) { newSessionTab(); openSessionManager(); }
+    else if (PtInRect(&layout.previous, pt)) g_app.firstVisibleTab = std::max(0, g_app.firstVisibleTab - 1);
+    else if (PtInRect(&layout.next, pt))
+        g_app.firstVisibleTab = std::min(std::max(0, static_cast<int>(g_tabs.size()) - layout.capacity), g_app.firstVisibleTab + 1);
+    InvalidateRect(g_app.main, nullptr, FALSE);
+    return true;
+}
+
 LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    const bool sessionMessage = msg == WM_SHELL_DATA || msg == WM_SHELL_CLOSED ||
+        msg == WM_CONNECT_OK || msg == WM_CONNECT_FAIL || msg == WM_FS_EVENT || msg == WM_FS_STATS;
+    SessionState* target = sessionMessage ? findSessionState(wp, true) : findSessionState(g_selectedTabId, false);
+    if (msg == WM_TIMER && wp >= 8) {
+        target = findSessionState(wp / 8, false);
+        if (!target) return 0;
+        wp %= 8;
+    }
+    if (sessionMessage && (!target || g_applicationClosing.load())) {
+        if (msg == WM_SHELL_DATA || msg == WM_SHELL_CLOSED || msg == WM_CONNECT_FAIL)
+            delete reinterpret_cast<std::string*>(lp);
+        else if (msg == WM_FS_EVENT) delete reinterpret_cast<FsEvent*>(lp);
+        else if (msg == WM_FS_STATS) delete reinterpret_cast<RemoteStats*>(lp);
+        return 0;
+    }
+    SessionStateScope context(target);
     switch (msg) {
         case WM_CREATE: {
             g_app.main = hwnd;
+            g_applicationClosing.store(false);
+            initializeSessionTabs();
             g_app.dpi = wincompat::windowDpi(hwnd);
 
             g_app.list = CreateWindowExW(
@@ -7648,6 +8068,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEMOVE: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             hideStatusHint();
+            if (msg == WM_LBUTTONDOWN && handleSessionTabClick(pt)) return 0;
+            if (msg == WM_MOUSEMOVE && PtInRect(&g_app.tabsRect, pt)) InvalidateRect(hwnd, &g_app.tabsRect, FALSE);
             RECT client;
             GetClientRect(hwnd, &client);
             const StatusLayout status = statusGeometry(client);
@@ -7680,6 +8102,11 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             TrackMouseEvent(&track);
             return 0;
         }
+        case WM_MBUTTONUP: {
+            const int index = hitSessionTab(POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            if (index >= 0) closeSessionTab(static_cast<std::size_t>(index));
+            return 0;
+        }
         case WM_MOUSEHOVER:
             showStatusHint(hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             return 0;
@@ -7706,6 +8133,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             hideStatusHint();
+            if (msg == WM_LBUTTONDOWN && handleSessionTabClick(pt)) return 0;
+            if (msg == WM_MOUSEMOVE && PtInRect(&g_app.tabsRect, pt)) InvalidateRect(hwnd, &g_app.tabsRect, FALSE);
             RECT client;
             GetClientRect(hwnd, &client);
             const StatusLayout status = statusGeometry(client);
@@ -7807,7 +8236,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (hitButton(pt) >= 0 || hitTitleButton(pt) >= 0 || downloadHit.chip ||
                     downloadHit.close || downloadHit.clear || downloadHit.cancelIndex >= 0 ||
                     PtInRect(&status.reconnect, pt) || PtInRect(&status.dismiss, pt) ||
-                    (g_app.fsReady && PtInRect(&g_app.fsPathRect, pt))) {
+                    PtInRect(&g_app.tabsRect, pt) || (g_app.fsReady && PtInRect(&g_app.fsPathRect, pt))) {
                     SetCursor(LoadCursorW(nullptr, IDC_HAND));
                     return TRUE;
                 }
@@ -7824,72 +8253,55 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.cursorOn = !g_app.cursorOn;
                 if (g_app.term) InvalidateRect(g_app.term, nullptr, FALSE);
             } else if (wp == kCwdHookTimer1) {
-                // 注入第 1 步：shell 还没说话（rc 没跑完）、或者输出/用户输入还没停下来，
-                // 就再等等——这行命令不能插进用户正在敲的半行，也不能插进持续输出里
-                KillTimer(hwnd, kCwdHookTimer1);
-                if (!g_app.shell.running()) return 0;
-                const DWORD now = GetTickCount();
+                killCwdTimer(kCwdHookTimer1);
+                if (!g_app.shell->running()) return 0;
+                // 用户已开始输入时不再把初始化命令插进半行命令中。
+                if (g_app.lastKeyTick) return 0;
                 const bool quiet = g_app.shellGotOutput &&
-                                   now - g_app.lastShellOutputTick > 500 &&
-                                   now - g_app.lastKeyTick > 600;
+                    GetTickCount() - g_app.lastShellOutputTick >= 150;
                 if (!quiet) {
-                    // 一直有输出（tail -f 之类）就别打扰它了，放弃注入
-                    if (++g_app.cwdHookTries > 40) {
-                        guiLog("终端目录跟随：shell 一直不安静，放弃注入 OSC 7 钩子");
-                        g_app.cwdHookTries = 0;
-                        return 0;
-                    }
-                    SetTimer(hwnd, kCwdHookTimer1, 300, nullptr);
+                    if (++g_app.cwdHookTries < 40) setCwdTimer(kCwdHookTimer1, 150);
                     return 0;
                 }
-                g_app.cwdHookTries = 0;
-                // 第 1 步只发纯文本：这时 ECHO 还开着，任何 ESC 序列都会被 tty
-                // 回显成 "^[" 字面垃圾；清屏交给第 2 步（ECHO 已经关掉）来做。
-                // 前导空格是给 HISTCONTROL=ignorespace 的人留的，别进命令历史。
+                g_app.cwdHookSnapshot = std::make_unique<Terminal>(g_app.termData);
                 g_app.cwdHookStartLine = static_cast<long long>(g_app.termData.scrollbackCount()) +
-                                         g_app.termData.cursorRow();
-                g_app.cwdHookStep1Tick = GetTickCount();
-                g_app.holdTermPaint = true;  // 回显的这几行先别画，等第 2 步擦完
-                g_app.shell.write(" stty -echo\r");
-                SetTimer(hwnd, kCwdHookTimer2, 200, nullptr);
+                    g_app.termData.cursorRow();
+                g_app.cwdHookStarted = GetTickCount64();
+                g_app.cwdHookDeadline = g_app.cwdHookStarted + 10000;
+                g_app.cwdHookPhase = 1;
+                g_app.cwdHookAcked = false;
+                g_app.holdTermPaint = true;
+                if (!g_app.shell->write(" stty -echo; " + cwdHookAckCommand(1) + "\r")) {
+                    abortCwdHook(); return 0;
+                }
+                setCwdTimer(kCwdHookTimer2, 40);
             } else if (wp == kCwdHookTimer2) {
-                // 注入第 2 步：先等第 1 步的回显真的回到本地，才数得准要擦几行。
-                // 慢链路上回显可能晚到，按 150ms 重试，最多等 1.5 秒再硬着头皮发。
-                KillTimer(hwnd, kCwdHookTimer2);
-                if (!g_app.shell.running()) return 0;
-                const DWORD hookNow = GetTickCount();
-                const bool echoed = g_app.lastShellOutputTick >= g_app.cwdHookStep1Tick;
-                const bool settled = hookNow - g_app.lastShellOutputTick > 60;
-                if ((!echoed || !settled) && ++g_app.cwdHookTries <= 10) {
-                    SetTimer(hwnd, kCwdHookTimer2, 150, nullptr);
-                    return 0;
+                killCwdTimer(kCwdHookTimer2);
+                if (g_app.cwdHookPhase != 1) return 0;
+                if (!g_app.shell->running()) { stopCwdHook(); return 0; }
+                if (GetTickCount64() >= g_app.cwdHookDeadline) { abortCwdHook(); return 0; }
+                if (!g_app.cwdHookAcked || GetTickCount() - g_app.lastShellOutputTick < 40) {
+                    setCwdTimer(kCwdHookTimer2, 40); return 0;
                 }
-                g_app.cwdHookTries = 0;
-                sendCwdHookScript();
-                SetTimer(hwnd, kCwdHookTimer3, 200, nullptr);
+                g_app.cwdHookPhase = 2;
+                g_app.cwdHookAcked = false;
+                if (!sendCwdHookScript()) { abortCwdHook(); return 0; }
+                setCwdTimer(kCwdHookTimer3, 100);
             } else if (wp == kCwdHookTimer3) {
-                // 注入第 3 步：恢复回显（即使第 2 步的语法不被 shell 接受）
-                KillTimer(hwnd, kCwdHookTimer3);
-                if (!g_app.shell.running()) return 0;
-                // 收尾命令由 util 构造：里面的 \r / \033 必须是给远端 printf 的转义
-                // 文本，末尾这个 "\r" 才是真实回车（提交这一行）
-                g_app.shell.write(buildCwdHookRestoreEcho() + "\r");
-                g_app.cwdHookStep3Tick = GetTickCount();
-                guiLog("已注入终端目录跟随钩子（OSC 7）");
-                // 第 4 步：等清行和重画的提示符落到本地，再解冻画面
-                SetTimer(hwnd, kCwdHookTimer4, 200, nullptr);
+                killCwdTimer(kCwdHookTimer3);
+                if (g_app.cwdHookPhase != 2) return 0;
+                if (!g_app.shell->running()) { stopCwdHook(); return 0; }
+                if (GetTickCount64() >= g_app.cwdHookDeadline) abortCwdHook();
+                else setCwdTimer(kCwdHookTimer3, 100);
             } else if (wp == kCwdHookTimer4) {
-                // 注入第 4 步：最后一批输出到了就解冻；慢链路最多等 1.2 秒就强制解冻
-                KillTimer(hwnd, kCwdHookTimer4);
-                const DWORD thawNow = GetTickCount();
-                const bool landed = g_app.lastShellOutputTick >= g_app.cwdHookStep3Tick;
-                const bool stillQuiet = thawNow - g_app.lastShellOutputTick > 100;
-                if ((!landed || !stillQuiet) && ++g_app.cwdHookTries <= 8) {
-                    SetTimer(hwnd, kCwdHookTimer4, 150, nullptr);
-                    return 0;
+                killCwdTimer(kCwdHookTimer4);
+                if (g_app.cwdHookPhase != 3) return 0;
+                if (g_app.cwdHookAcked && GetTickCount() - g_app.lastShellOutputTick >= 40) {
+                    finishCwdHook(); return 0;
                 }
-                g_app.cwdHookTries = 0;
-                endCwdHookFreeze();
+                if (!g_app.shell->running()) { stopCwdHook(); return 0; }
+                if (GetTickCount64() >= g_app.cwdHookDeadline) abortCwdHook();
+                else setCwdTimer(kCwdHookTimer4, 40);
             }
             return 0;
         case WM_SIZE:
@@ -7941,15 +8353,20 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_COMMAND: {
             const int id = LOWORD(wp);
             if (id == ID_SEARCH_EDIT && HIWORD(wp) == EN_CHANGE) {
+                g_app.searchQuery = textOf(g_app.searchEdit);
                 refreshTerminalSearch();
                 return 0;
             }
             switch (id) {
+                case IDM_NEW_TAB: newSessionTab(); openSessionManager(); return 0;
+                case IDM_CLOSE_TAB: closeSessionTab(g_activeTab); return 0;
+                case IDM_NEXT_TAB: cycleSessionTab(1); return 0;
+                case IDM_PREV_TAB: cycleSessionTab(-1); return 0;
                 case IDM_SEARCH:
                     showTerminalSearch(true);
                     return 0;
                 case IDM_RECONNECT:
-                    if (!g_app.connecting && !g_app.shell.running()) {
+                    if (!g_app.connecting && !g_app.shell->running()) {
                         if (selectedSession()) connectStoredSession(g_app.currentSession);
                         else openSessionManager();
                     }
@@ -8055,13 +8472,15 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.shellGotOutput = true;
                 g_app.lastShellOutputTick = GetTickCount();
                 g_app.termData.feed(*payload);
+                for (const auto& ack : g_app.termData.takeShellIntegrationAcks()) handleCwdHookAck(ack);
+                if (!foregroundSession()) { g_app.unread = true; InvalidateRect(hwnd, &g_app.tabsRect, FALSE); }
                 g_app.searchDirty = g_app.searchOpen;
                 flushTerminalResponse();
                 // shell 的 OSC 7 钩子会在每次画提示符时把 $PWD 报回来，
                 // 目录变了就带着文件面板一起走（单向：面板不反向影响终端）
                 if (g_app.termData.takeCwdChange()) syncTerminalCwd();
                 InvalidateRect(g_app.term, nullptr, FALSE);
-                if (!g_app.termData.title().empty()) {
+                if (foregroundSession() && !g_app.termData.title().empty()) {
                     SetWindowTextW(hwnd,
                                    (L"rshell - " + toWide(g_app.currentSession) + L" - " +
                                     toWide(g_app.termData.title()))
@@ -8073,26 +8492,26 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_CONNECT_OK: {
             if (wp != g_app.connectionId) return 0;
             g_app.connecting = false;
-            if (!g_app.shell.running()) { layoutMain(hwnd); updateButtons(); return 0; }
+            if (!g_app.shell->running()) { layoutMain(hwnd); updateButtons(); return 0; }
             layoutMain(hwnd);
             layoutTerminal(g_app.term);
             std::wstring status = L"已连接 " + toWide(g_app.currentSession);
-            if (!g_app.shell.fingerprint().empty()) {
-                status += L"  ·  " + toWide(g_app.shell.kex());
+            if (!g_app.shell->fingerprint().empty()) {
+                status += L"  ·  " + toWide(g_app.shell->kex());
             }
 
-            // g_currentPassword 平时是密文；这里解出一份明文，供写凭据和启动
+            // g_app.currentPassword 平时是密文；这里解出一份明文，供写凭据和启动
             // 文件通道共用，本分支结束前抹掉
-            std::wstring plainPassword = g_currentPassword.reveal();
+            std::wstring plainPassword = g_app.currentPassword.reveal();
 
             // 勾了「记住密码」：连接成功之后才把口令交给密码保险库，
             // 这样被服务器拒绝的口令不会被存下来
-            if (!g_pendingCredentialTarget.empty()) {
-                const Session* pending = g_app.store.find(g_pendingCredentialSession);
+            if (!g_app.pendingCredentialTarget.empty()) {
+                const Session* pending = g_app.store.find(g_app.pendingCredentialSession);
                 std::string error;
                 // 临时 UTF-8 副本用完就抹掉，别在堆里留明文
                 std::string plain = toUtf8(plainPassword);
-                const bool stored = saveCredential(g_pendingCredentialTarget, plain, &error);
+                const bool stored = saveCredential(g_app.pendingCredentialTarget, plain, &error);
                 wipeString(plain);
                 if (stored) {
                     if (pending) {
@@ -8104,21 +8523,21 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     status += L"  ·  密码已存入密码保险库";
                 } else {
                     guiLog("保存密码失败：" + error);
-                    messageWarn(L"密码没有保存",
+                    if (foregroundSession()) messageWarn(L"密码没有保存",
                                 L"连接已经建立，但口令没能写进 " + activePasswordBackend() +
                                     L"。\n\n" + toWide(error));
                 }
-                g_pendingCredentialTarget.clear();
-                g_pendingCredentialSession.clear();
+                g_app.pendingCredentialTarget.clear();
+                g_app.pendingCredentialSession.clear();
             }
 
-            std::wstring plainKeyPassphrase = g_currentKeyPassphrase.reveal();
-            if (!g_pendingKeyCredentialTarget.empty()) {
-                const Session* pending = g_app.store.find(g_pendingKeyCredentialSession);
+            std::wstring plainKeyPassphrase = g_app.currentKeyPassphrase.reveal();
+            if (!g_app.pendingKeyCredentialTarget.empty()) {
+                const Session* pending = g_app.store.find(g_app.pendingKeyCredentialSession);
                 std::string error;
                 std::string plain = toUtf8(plainKeyPassphrase);
                 const bool stored =
-                    saveCredential(g_pendingKeyCredentialTarget, plain, &error);
+                    saveCredential(g_app.pendingKeyCredentialTarget, plain, &error);
                 wipeString(plain);
                 if (stored) {
                     if (pending) {
@@ -8130,17 +8549,17 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     status += L"  ·  私钥口令已存入密码保险库";
                 } else {
                     guiLog("保存私钥口令失败：" + error);
-                    messageWarn(L"私钥口令没有保存",
+                    if (foregroundSession()) messageWarn(L"私钥口令没有保存",
                                 L"连接已经建立，但口令没能写进 " + activePasswordBackend() +
                                     L"。\n\n" + toWide(error));
                 }
-                g_pendingKeyCredentialTarget.clear();
-                g_pendingKeyCredentialSession.clear();
+                g_app.pendingKeyCredentialTarget.clear();
+                g_app.pendingKeyCredentialSession.clear();
             }
 
             setStatus(status);
-            SetWindowTextW(hwnd, (L"rshell - " + toWide(g_app.currentSession)).c_str());
-            SetFocus(g_app.term);
+            if (foregroundSession()) SetWindowTextW(hwnd, (L"rshell - " + toWide(g_app.currentSession)).c_str());
+            if (foregroundSession()) SetFocus(g_app.term);
             updateButtons();
             InvalidateRect(g_app.term, nullptr, FALSE);
 
@@ -8152,9 +8571,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 等 rc / motd 输出得差不多了，再往 shell 里注入 OSC 7 钩子，
             // 让文件面板能跟着终端里的 cd 走（RSHELL_NO_CWD_SYNC=1 可关闭）
             stopCwdHook();
-            g_app.shellGotOutput = false;
             if (!std::getenv("RSHELL_NO_CWD_SYNC")) {
-                SetTimer(hwnd, kCwdHookTimer1, 900, nullptr);
+                setCwdTimer(kCwdHookTimer1, 250);
             }
             wipeWideString(plainPassword);
             wipeWideString(plainKeyPassphrase);
@@ -8167,11 +8585,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.connecting = false;
             layoutMain(hwnd);
             // 连接都没成功，别把这次输入的口令存进密码保险库
-            g_pendingCredentialTarget.clear();
-            g_pendingCredentialSession.clear();
-            g_pendingKeyCredentialTarget.clear();
-            g_pendingKeyCredentialSession.clear();
-            g_currentKeyPassphrase.clear();
+            g_app.pendingCredentialTarget.clear();
+            g_app.pendingCredentialSession.clear();
+            g_app.pendingKeyCredentialTarget.clear();
+            g_app.pendingKeyCredentialSession.clear();
+            g_app.currentPassword.clear();
+            g_app.currentKeyPassphrase.clear();
             stopRemoteFs();
             updateButtons();
             const std::wstring detail = payload ? toWide(*payload) : L"未知错误";
@@ -8181,7 +8600,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 statusText.resize(lineEnd);
             }
             setStatus(L"连接失败：" + statusText, true);
-            messageError(L"连接失败", L"无法建立 SSH 连接，请检查地址、端口和认证信息。", detail);
+            if (foregroundSession()) messageError(L"连接失败", L"无法建立 SSH 连接，请检查地址、端口和认证信息。", detail);
             return 0;
         }
         case WM_SHELL_CLOSED: {
@@ -8197,10 +8616,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 InvalidateRect(g_app.term, nullptr, FALSE);
                 setStatus(toWide(detail), detail.rfind("远端会话已结束", 0) != 0);
                 guiLog("会话结束：" + detail);
-                SetWindowTextW(hwnd, L"rshell");
+                if (foregroundSession()) SetWindowTextW(hwnd, L"rshell");
                 stopRemoteFs();
-                g_currentPassword.clear();
-                g_currentKeyPassphrase.clear();
+                g_app.currentPassword.clear();
+                g_app.currentKeyPassphrase.clear();
             }
             layoutMain(hwnd);
             updateButtons();
@@ -8254,7 +8673,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_ASK_HOSTKEY: {
             auto* request = reinterpret_cast<HostKeyRequest*>(lp);
-            if (request) {
+            if (request && !g_applicationClosing.load() &&
+                (!request->connectionId || findSessionState(request->connectionId, true))) {
                 request->accepted =
                     runHostKeyDialog(request->host, request->keyType, request->fingerprint);
             }
@@ -8262,11 +8682,13 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_DESTROY:
             KillTimer(hwnd, 1);
+            g_applicationClosing.store(true);
+            for (auto& state : g_tabs) if (state) disposeSessionState(*state);
+            disposeSessionState(g_app);
+            g_tabs.clear();
             g_app.downloads.clear();
             setCredentialVault(nullptr);  // 进程退出前断开后端，别留悬空指针
             g_app.vault.lock();           // 退出前把 DEK 抹掉，别留在进程内存里
-            g_app.shell.close();
-            g_app.fs.stop();
             destroyBackBuffer();
             if (g_app.font) DeleteObject(g_app.font);
             if (g_app.fontBold) DeleteObject(g_app.fontBold);
@@ -8395,7 +8817,8 @@ int runGui(HINSTANCE inst, int showCommand) {
     }
 
     // libssh2 全局初始化（含 Winsock 启动）必须覆盖所有会话的生命周期
-    Libssh2Runtime libssh2Runtime;
+    auto libssh2Runtime = std::make_shared<Libssh2Runtime>();
+    g_app.runtime = libssh2Runtime;
     g_app.store = SessionStore::load();
     g_app.store.seedFromConfigIfEmpty();
     if (!g_app.store.loaded() && !g_app.store.sessions().empty()) g_app.store.save();
@@ -8561,6 +8984,15 @@ int runGui(HINSTANCE inst, int showCommand) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) &&
+            !(GetKeyState(VK_MENU) & 0x8000) &&
+            (msg.hwnd == window || IsChild(window, msg.hwnd))) {
+            const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+            int command = msg.wParam == 'T' ? IDM_NEW_TAB :
+                (msg.wParam == VK_TAB ? (shift ? IDM_PREV_TAB : IDM_NEXT_TAB) :
+                 (msg.wParam == 'W' && shift ? IDM_CLOSE_TAB : 0));
+            if (command) { SendMessageW(window, WM_COMMAND, command, 0); continue; }
+        }
         if (accel && TranslateAcceleratorW(window, accel, &msg)) continue;
         TranslateMessage(&msg);
         DispatchMessageW(&msg);

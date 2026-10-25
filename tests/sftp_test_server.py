@@ -248,6 +248,16 @@ class TestSSHServer(paramiko.ServerInterface):
         """最小交互 shell：echo/pwd/uname/size/cat/boxes/exit，用于验证 PTY 与终端渲染。"""
         buffer = b""
         pending = b""
+        echo_enabled = True
+        delayed_echo = False
+        hook_delay = float(os.environ.get("RSHELL_TEST_CWD_DELAY", "0"))
+
+        def integration_ack(token):
+            # 确认帧故意逐字节分包，验证 GUI 不依赖 SSH 回调边界。
+            for part in b"\x1b]777;rshell-cwd;" + token.encode("ascii") + b"\x07":
+                channel.sendall(bytes([part]))
+                if hook_delay:
+                    time.sleep(0.002)
         try:
             channel.sendall(b"rshell-test-shell\r\n$ ")
             while True:
@@ -275,7 +285,22 @@ class TestSSHServer(paramiko.ServerInterface):
                             channel.shutdown_write()
                             channel.close()
                             return
-                        if command.startswith("probe-sink "):
+                        hook_ack = re.search(r"rshell-cwd;(\d+:[123])", command)
+                        if hook_ack and command.startswith("stty -echo;"):
+                            echo_enabled = False
+                            integration_ack(hook_ack[1])
+                        elif hook_ack and "__rshell_cwd()" in command:
+                            erase = re.search(r"\\033\[(\d+)A", command)
+                            if erase:
+                                channel.sendall(f"\x1b[{erase[1]}A\r\x1b[J".encode())
+                            channel.sendall(b"\x1b]7;file://localhost/\x07\r\x1b[2K")
+                            integration_ack(hook_ack[1])
+                        elif command.startswith("stty echo"):
+                            echo_enabled = True
+                            channel.sendall(b"\r\x1b[2K")
+                            if hook_ack:
+                                integration_ack(hook_ack[1])
+                        elif command.startswith("probe-sink "):
                             # 制造 SSH 窗口背压，验证客户端入队不阻塞 UI、数据顺序完整。
                             remaining = int(command.split()[1])
                             total = remaining
@@ -336,7 +361,11 @@ class TestSSHServer(paramiko.ServerInterface):
                         channel.sendall(b"^C\r\n$ ")
                     elif byte >= b" ":
                         pending += byte
-                        channel.sendall(byte)
+                        if not delayed_echo and pending.startswith(b" stty -echo"):
+                            delayed_echo = True
+                            time.sleep(hook_delay)
+                        if echo_enabled:
+                            channel.sendall(byte)
         except Exception:  # noqa: BLE001 - 测试服务器只关注流程
             pass
         finally:

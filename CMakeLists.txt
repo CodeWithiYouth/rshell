@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(rshell VERSION 1.0.2 LANGUAGES CXX)
+project(rshell VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -258,6 +258,15 @@ if(RSHELL_BUILD_TESTS)
     add_executable(rshell_tests tests/test_main.cpp src/terminal.cpp src/session_store.cpp)
     target_link_libraries(rshell_tests PRIVATE rshell_core)
     add_test(NAME rshell_tests COMMAND rshell_tests)
+
+    if(WIN32)
+        # 隐藏窗口回归：直接调用 GUI 的标签、事件分发及连接清理路径。
+        add_executable(rshell_gui_tabs_probe tests/gui_tabs_probe.cpp
+            src/terminal.cpp src/ssh_shell.cpp src/session_store.cpp src/remote_fs.cpp)
+        target_link_libraries(rshell_gui_tabs_probe PRIVATE rshell_core
+            comdlg32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32)
+        add_test(NAME rshell_gui_tabs COMMAND rshell_gui_tabs_probe)
+    endif()
 
     # 无 GUI 的交互式 shell 冒烟测试（配合 tests/sftp_test_server.py 使用）
     add_executable(rshell_shell_probe tests/shell_probe.cpp src/ssh_shell.cpp)

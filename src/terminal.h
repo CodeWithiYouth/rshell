@@ -93,6 +93,14 @@ public:
         cwdChanged_ = false;
         return changed;
     }
+    // 私有 shell 集成确认帧，分包解析后交给 GUI，不参与终端显示。
+    std::vector<std::string> takeShellIntegrationAcks() {
+        std::vector<std::string> result;
+        result.swap(shellIntegrationAcks_);
+        return result;
+    }
+    // 撤去本端初始化命令的临时画面，保留最新目录、标题和终端尺寸。
+    void restoreDisplay(Terminal&& snapshot);
 
     // ---- 渲染访问 --------------------------------------------------------
     // 行索引连续：0..scrollbackCount()-1 是回滚历史，其后的 rows() 行是当前屏幕
@@ -216,6 +224,7 @@ private:
     std::string title_;
     std::string cwd_;        // 最近一次 OSC 7 上报的目录（空 = 还没收到）
     bool cwdChanged_ = false;  // 有新目录待 GUI 消费
+    std::vector<std::string> shellIntegrationAcks_;
     bool dirty_ = true;
 };
 

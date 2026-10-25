@@ -1,0 +1,286 @@
+// GUI 状态回归使用隐藏窗口，不发送真实键鼠输入，不读取用户的会话配置。
+#include "../src/gui_main.cpp"
+#include <iostream>
+#include <stdexcept>
+
+namespace {
+int checks = 0;
+void check(bool value, const char* message) {
+    ++checks;
+    if (!value) throw std::runtime_error(message);
+}
+std::string output(const SessionState& state) {
+    std::string text;
+    for (std::size_t i = 0; i < state.termData.lineCount(); ++i)
+        text += state.termData.plainLine(i) + "\n";
+    return text;
+}
+void registerClass(const wchar_t* name, WNDPROC proc) {
+    WNDCLASSW wc{}; wc.hInstance = g_app.inst; wc.lpfnWndProc = proc; wc.lpszClassName = name;
+    check(RegisterClassW(&wc) != 0, "register test window class");
+}
+void dispatchText(UINT_PTR connection, const std::string& text) {
+    SendMessageW(g_app.main, WM_SHELL_DATA, connection, reinterpret_cast<LPARAM>(new std::string(text)));
+}
+void dispatchFs(UINT_PTR connection, const FsEvent& event) {
+    SendMessageW(g_app.main, WM_FS_EVENT, connection, reinterpret_cast<LPARAM>(new FsEvent(event)));
+}
+void stateRegression() {
+    check(g_tabs.size() == 1, "initial blank tab exists");
+    g_app.currentSession = "alpha";
+    g_app.termData.reset(); g_app.termData.feed("ALPHA\r\n");
+    g_app.fsPath = "/alpha"; g_app.fsHome = "/home/alpha";
+    g_app.currentPassword.assign(L"alpha-test-secret");
+    g_app.pendingCredentialTarget = "alpha-target";
+    g_app.pendingCredentialSession = "alpha";
+    const auto firstConnection = g_app.connectionId, firstTab = g_app.tabId;
+    const auto firstShell = g_app.shell;
+    const auto firstFs = g_app.fs;
+    showTerminalSearch(true); SetWindowTextW(g_app.searchEdit, L"ALPHA");
+    newSessionTab();
+    check(g_tabs.size() == 2 && g_activeTab == 1, "new tab becomes active");
+    check(g_app.shell != firstShell && g_app.fs != firstFs, "backends belong to each tab");
+    check(g_app.currentPassword.empty() && g_app.pendingCredentialTarget.empty(), "credentials do not move into a new tab");
+    check(g_app.fsPath.empty() && output(g_app).find("ALPHA") == std::string::npos, "new tab starts with separate output and directory");
+    g_app.currentSession = "beta"; g_app.termData.reset(); g_app.termData.feed("BETA\r\n");
+    g_app.fsPath = "/beta";
+    Session savedAlpha; savedAlpha.name="alpha"; savedAlpha.host="alpha.example.test";
+    g_app.store.upsert(savedAlpha);
+    g_mgr = SessionMgrState();
+    HWND manager=CreateWindowW(L"TabsManagerProbe",L"",WS_POPUP,0,0,mgrWidth(),mgrHeight(),nullptr,nullptr,g_app.inst,nullptr);
+    check(manager!=nullptr,"create hidden session manager"); g_mgr.dlg=manager;
+    Session added; added.name="new-config"; added.host="new.example.test";
+    mgrLoadSession(added);
+    check(mgrSave(manager) && g_app.currentSession=="beta", "saving another configuration never relabels the active connection");
+    const auto& saved=g_app.store.sessions();
+    for (std::size_t i=0;i<saved.size();++i) if (saved[i].name=="alpha") g_mgr.selected=static_cast<int>(i);
+    savedAlpha.name="renamed-alpha"; mgrLoadSession(savedAlpha);
+    check(mgrSave(manager) && findSessionState(firstConnection,true)->currentSession=="renamed-alpha" && g_app.currentSession=="beta",
+          "renaming a saved session updates only matching tabs");
+    check(findSessionState(firstConnection,true)->pendingCredentialTarget==credentialTarget("renamed-alpha"), "pending credentials follow the correct renamed session");
+    DestroyWindow(manager);
+    const auto secondConnection = g_app.connectionId;
+    RECT before{}; GetWindowRect(g_app.term, &before);
+    dispatchText(firstConnection, "BACKGROUND_ALPHA\r\n\x1b]0;alpha-title\a");
+    check(output(g_app).find("BACKGROUND_ALPHA") == std::string::npos, "background output is isolated");
+    check(output(*findSessionState(firstConnection, true)).find("BACKGROUND_ALPHA") != std::string::npos, "background output is retained");
+    check(findSessionState(firstConnection, true)->unread, "background activity is marked");
+    FsEvent listing; listing.kind = FsEventKind::Listing; listing.path = "/alpha/logs";
+    RemoteEntry entry; entry.name = "alpha.log"; entry.path = "/alpha/logs/alpha.log";
+    listing.entries.push_back(entry); dispatchFs(firstConnection, listing);
+    check(g_app.fsPath == "/beta" && g_app.fsEntries.empty(), "background SFTP listing cannot replace visible directory");
+    check(findSessionState(firstConnection, true)->fsEntries.front().name == "alpha.log", "background directory listing is retained");
+    auto* stats = new RemoteStats(); stats->valid = true; stats->host = "alpha-host";
+    SendMessageW(g_app.main, WM_FS_STATS, firstConnection, reinterpret_cast<LPARAM>(stats));
+    check(g_app.stats.host.empty() && findSessionState(firstConnection, true)->stats.host == "alpha-host", "remote metrics are isolated");
+    RECT afterListing{}; GetWindowRect(g_app.term, &afterListing);
+    check(EqualRect(&before, &afterListing), "background listings do not change foreground layout");
+    FsEvent started; started.kind = FsEventKind::Started; started.path = "/same-name";
+    started.message = "same-name"; started.total = 100; started.cancel = std::make_shared<std::atomic<bool>>(false);
+    dispatchFs(firstConnection, started); dispatchFs(secondConnection, started);
+    FsEvent progress; progress.kind = FsEventKind::Progress; progress.path = started.path;
+    progress.bytes = 37; progress.total = 100; dispatchFs(firstConnection, progress);
+    check(g_app.downloads.front().done == 0 && findSessionState(firstConnection, true)->downloads.front().done == 37,
+          "same-name transfers cannot update another tab");
+    RECT after{}; GetWindowRect(g_app.term, &after);
+    // 可见标签的新任务会展开面板；背景事件不能再次改变该标签的布局。
+    dispatchFs(firstConnection, progress); RECT unchanged{}; GetWindowRect(g_app.term, &unchanged);
+    check(EqualRect(&after, &unchanged), "background transfer events do not relayout visible controls");
+    auto* alpha = findSessionState(firstConnection, true);
+    alpha->holdTermPaint = true; alpha->lastShellOutputTick = GetTickCount() - 300;
+    alpha->cwdHookPhase = 3; alpha->cwdHookAcked = true;
+    alpha->cwdHookDeadline = GetTickCount64() + 1000;
+    SendMessageW(g_app.main, WM_TIMER, firstTab * 8 + kCwdHookTimer4, 0);
+    check(!alpha->holdTermPaint && !g_app.holdTermPaint, "cwd timers are dispatched to their own tab");
+    g_app.downloads.front().state = SessionState::DownloadState::Done;
+    alpha->downloads.front().state = SessionState::DownloadState::Done;
+    switchSessionTab(0);
+    check(g_app.shell == firstShell && g_app.fs == firstFs, "switching restores original backend objects");
+    check(g_app.fsPath == "/alpha/logs" && g_app.currentPassword.reveal() == L"alpha-test-secret", "directory and credentials survive switching");
+    check(g_app.searchOpen && textOf(g_app.searchEdit) == L"ALPHA", "search query is retained per tab");
+    check(!g_app.unread && output(g_app).find("BACKGROUND_ALPHA") != std::string::npos, "activating a tab reveals its unread output");
+    switchSessionTab(1);
+    const auto betaText = output(g_app);
+    closeSessionTab(0);
+    check(g_tabs.size() == 1 && g_app.connectionId == secondConnection, "closing another tab preserves selected connection");
+    dispatchText(firstConnection, "STALE_CALLBACK"); dispatchFs(firstConnection, listing);
+    check(output(g_app) == betaText && g_app.fsPath == "/beta", "late callbacks from a closed tab are discarded");
+    const auto stale = g_app.connectionId;
+    disconnectSession(); dispatchText(stale, "STALE_RECONNECT");
+    check(output(g_app).find("STALE_RECONNECT") == std::string::npos, "callbacks from old connection generations are discarded");
+    for (int i = 0; i < 16; ++i) { newSessionTab(); g_app.currentSession = "tab-" + std::to_string(i); }
+    MoveWindow(g_app.main,0,0,900,650,FALSE);
+    check(std::all_of(g_tabs.begin(),g_tabs.end(),[](const std::unique_ptr<SessionState>& state) {
+        return !state || (state->termData.cols()==g_app.termData.cols() && state->termData.rows()==g_app.termData.rows());
+    }), "resizing updates inactive terminal grids");
+    for (int dpi : {96,144,192}) {
+        g_app.dpi = dpi;
+        for (int width : {760,1120,1600}) {
+            const int pixels = dp(width); ensureActiveTabVisible(pixels);
+            const auto layout = sessionTabsLayout(pixels);
+            check(g_app.firstVisibleTab <= static_cast<int>(g_activeTab) &&
+                  static_cast<int>(g_activeTab) < g_app.firstVisibleTab + layout.capacity, "active tab remains visible at varied DPI");
+            check(!layout.items.empty() && layout.items.back().right < layout.previous.left && layout.next.right < layout.add.left,
+                  "overflow navigation never overlaps tab or add button");
+        }
+    }
+    g_app.dpi = 96; createFonts();
+    cycleSessionTab(1); check(g_activeTab == 0, "next tab wraps to first");
+    cycleSessionTab(-1); check(g_activeTab == g_tabs.size()-1, "previous tab wraps to last");
+    while (g_tabs.size() > 1) closeSessionTab(g_tabs.size()-1);
+    closeSessionTab(0);
+    check(g_tabs.size() == 1 && g_app.currentSession.empty() && g_app.currentPassword.empty(), "closing last tab leaves clean blank tab");
+    g_app.termData.feed("LOGIN_BANNER\r\n$ ");
+    g_app.cwdHookSnapshot=std::make_unique<Terminal>(g_app.termData);
+    g_app.cwdHookPhase=1; g_app.holdTermPaint=true;
+    g_app.termData.feed(" stty -echo\r\n"); sendInput("echo QUEUED\r");
+    {
+        TerminalDisplayScope display;
+        check(output(g_app).find("stty -echo")==std::string::npos && output(g_app).find("LOGIN_BANNER")!=std::string::npos,
+              "a frozen tab paints its own snapshot instead of another tab's previous pixels");
+    }
+    check(output(g_app).find("stty -echo")!=std::string::npos, "snapshot painting preserves the live protocol decoder");
+    check(g_app.cwdHookPendingInput=="echo QUEUED\r", "input is held while shell integration changes echo mode");
+    handleCwdHookAck("wrong-connection:1");
+    check(!g_app.cwdHookAcked, "stale integration acknowledgements are ignored");
+    stopCwdHook();
+    check(!g_app.holdTermPaint && g_app.cwdHookPendingInput.empty() && output(g_app).find("stty -echo")==std::string::npos,
+          "disconnecting integration restores original display and drops unsent input");
+}
+
+template<typename Predicate>
+void waitUntil(Predicate ready, const char* label) {
+    const auto deadline = GetTickCount64() + 20000;
+    while (!ready() && GetTickCount64() < deadline) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message); DispatchMessageW(&message);
+        }
+        Sleep(5);
+    }
+    check(ready(), label);
+}
+
+void renderTabsPreview() {
+    const char* path=std::getenv("RSHELL_TABS_PREVIEW");
+    if (!path) return;
+    RECT client{}; GetClientRect(g_app.main,&client);
+    const int width=client.right, height=g_app.titleH+dp(40);
+    HDC screen=GetDC(nullptr), dc=CreateCompatibleDC(screen);
+    BITMAPINFO info{}; info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth=width; info.bmiHeader.biHeight=-height;
+    info.bmiHeader.biPlanes=1; info.bmiHeader.biBitCount=32;
+    void* pixels=nullptr;
+    HBITMAP bitmap=CreateDIBSection(screen,&info,DIB_RGB_COLORS,&pixels,nullptr,0);
+    if (!bitmap) { DeleteDC(dc); ReleaseDC(nullptr,screen); throw std::runtime_error("create preview bitmap"); }
+    HGDIOBJ old=SelectObject(dc,bitmap);
+    fillRect(dc,RECT{0,0,width,height},ui::bgApp);
+    paintTitleBar(dc,RECT{0,0,width,height}); paintSessionTabs(dc); GdiFlush();
+    BITMAPFILEHEADER header{}; header.bfType=0x4D42; header.bfOffBits=sizeof(header)+sizeof(BITMAPINFOHEADER);
+    header.bfSize=header.bfOffBits+width*height*4;
+    std::ofstream out(utf8ToPath(path),std::ios::binary);
+    out.write(reinterpret_cast<const char*>(&header),sizeof(header));
+    out.write(reinterpret_cast<const char*>(&info.bmiHeader),sizeof(info.bmiHeader));
+    out.write(static_cast<const char*>(pixels),width*height*4);
+    SelectObject(dc,old); DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(nullptr,screen);
+}
+
+void networkRegression(int port, const std::string& upload, const std::string& download, const std::string& key) {
+    Session alpha; alpha.name="alpha-ssh"; alpha.host="127.0.0.1"; alpha.port=port; alpha.user="tester";
+    Session beta=alpha; beta.name="beta-ssh"; beta.keyPath=key;
+    g_app.store.upsert(alpha); g_app.store.upsert(beta);
+    connectToSession(alpha,L"testpass",L"");
+    const UINT_PTR alphaConnection=g_app.connectionId;
+    connectStoredSession(beta.name);
+    check(g_tabs.size()==2 && g_activeTab==1, "opening another saved session preserves a connecting tab");
+    const UINT_PTR betaConnection=g_app.connectionId;
+    auto state = [](UINT_PTR id) { return findSessionState(id,true); };
+    waitUntil([&] { return state(alphaConnection)->fsReady && state(betaConnection)->fsReady &&
+        !state(alphaConnection)->connecting && !state(betaConnection)->connecting; }, "two real SSH and SFTP connections establish concurrently");
+    check(state(alphaConnection)->shell->running() && state(betaConnection)->shell->running(), "both real shells stay connected");
+    if (std::getenv("RSHELL_TEST_CWD_HOOKS")) {
+        waitUntil([&] { return state(alphaConnection)->cwdHookPhase==1 && state(betaConnection)->cwdHookPhase==1; },
+                  "integration starts from already-received login output in both tabs");
+        { SessionStateScope scope(state(alphaConnection)); sendInput("echo QUEUED_ALPHA\r"); }
+        sendInput("echo QUEUED_BETA\r");
+        waitUntil([&] { return !state(alphaConnection)->cwdHookPhase && !state(betaConnection)->cwdHookPhase &&
+            output(*state(alphaConnection)).find("QUEUED_ALPHA")!=std::string::npos &&
+            output(*state(betaConnection)).find("QUEUED_BETA")!=std::string::npos; },
+                  "delayed split integration acknowledgements finish and release queued input");
+        for (auto connection : {alphaConnection,betaConnection}) {
+            const auto text=output(*state(connection));
+            check(text.find("stty -echo")==std::string::npos && text.find("__rshell_cwd")==std::string::npos,
+                  "integration commands never remain in visible output or history");
+            check(text.find("rshell-test-shell")!=std::string::npos, "login banner is retained through integration");
+        }
+    }
+    sendInput("echo BETA_ONLY\r");
+    switchSessionTab(0); writeWideInput(L"echo 中文_ALPHA\r");
+    state(betaConnection)->shell->write("echo BACKGROUND_BETA\r");
+    waitUntil([&] { return output(*state(alphaConnection)).find("中文_ALPHA")!=std::string::npos &&
+        output(*state(betaConnection)).find("BACKGROUND_BETA")!=std::string::npos; }, "foreground Chinese and background output arrive on their own sessions");
+    check(output(g_app).find("BETA_ONLY")==std::string::npos && output(*state(betaConnection)).find("中文_ALPHA")==std::string::npos,
+          "real terminal input and output never cross tabs");
+    fsNavigate("/alpha-dir");
+    { SessionStateScope scope(state(betaConnection)); fsNavigate("/beta-dir"); }
+    waitUntil([&] { return state(alphaConnection)->fsPath=="/alpha-dir" && state(betaConnection)->fsPath=="/beta-dir"; }, "two real SFTP directories stay independent");
+    state(betaConnection)->fs->upload(upload,"/beta-dir/upload.bin");
+    auto downloadCancel=std::make_shared<std::atomic<bool>>(false);
+    addDownloadTask("/alpha-dir/alpha.txt",L"alpha.txt",23,false,downloadCancel);
+    state(alphaConnection)->fs->download("/alpha-dir/alpha.txt",download,downloadCancel);
+    for (int i=0;i<8;++i) { switchSessionTab(static_cast<std::size_t>(i%2)); Sleep(5); }
+    auto completed = [&](UINT_PTR connection,const std::string& path) {
+        const auto& tasks=state(connection)->downloads;
+        return std::any_of(tasks.begin(),tasks.end(),[&](const SessionState::DownloadTask& task) {
+            return task.remote==path && task.state==SessionState::DownloadState::Done;
+        });
+    };
+    waitUntil([&] { return completed(alphaConnection,"/alpha-dir/alpha.txt") && completed(betaConnection,"/beta-dir/upload.bin"); },
+              "background upload and download finish while switching tabs");
+    std::ifstream file(utf8ToPath(download),std::ios::binary);
+    const std::string downloaded((std::istreambuf_iterator<char>(file)),std::istreambuf_iterator<char>());
+    check(downloaded=="alpha-download-content\n", "download bytes come from the intended server path");
+    switchSessionTab(0); renderTabsPreview(); closeSessionTab(1);
+    check(g_app.connectionId==alphaConnection && g_app.shell->running(), "closing beta leaves alpha live");
+    sendInput("echo ALPHA_AFTER_CLOSE\r");
+    waitUntil([&] { return output(g_app).find("ALPHA_AFTER_CLOSE")!=std::string::npos; }, "remaining shell works after closing another tab");
+    disconnectSession(); connectToSession(alpha,L"testpass",L"");
+    const auto reconnected=g_app.connectionId;
+    waitUntil([&] { return !g_app.connecting && g_app.fsReady; }, "active tab reconnects successfully");
+    dispatchText(alphaConnection,"STALE_OLD_SSH");
+    check(output(g_app).find("STALE_OLD_SSH")==std::string::npos && reconnected!=alphaConnection, "old real-connection callbacks cannot reach reconnected session");
+    newSessionTab(); connectToSession(beta,L"testpass",L"");
+    std::weak_ptr<SshShell> pending=g_app.shell;
+    closeSessionTab(1);
+    waitUntil([&] { return pending.expired(); }, "closing a connecting tab releases its backend without touching active shell");
+    check(g_app.shell->running(), "active connection survives closing a pending connection");
+}
+}
+
+int main(int argc, char** argv) {
+    HWND window = nullptr;
+    const auto settings=std::filesystem::temp_directory_path() / ("rshell-tabs-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+".ini");
+    try {
+        g_app.inst = GetModuleHandleW(nullptr); g_app.dpi = 96;
+        auto runtime = std::make_shared<Libssh2Runtime>(); g_app.runtime = runtime;
+        g_app.store=SessionStore::load(pathToUtf8(settings));
+        startGdiplus();
+        registerClass(kMainClass, mainProc); registerClass(kListClass, fileListProc); registerClass(kTermClass, terminalProc);
+        registerClass(L"TabsManagerProbe",sessionMgrProc);
+        window = CreateWindowExW(0,kMainClass,L"tab-regression",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
+            0,0,1120,720,nullptr,nullptr,g_app.inst,nullptr);
+        check(window != nullptr,"create hidden GUI window");
+        stateRegression();
+        if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);
+        DestroyWindow(window); window = nullptr;
+        stopGdiplus(); g_app.runtime.reset();
+        std::error_code error; std::filesystem::remove(settings,error);
+        std::cout << "PASS: " << checks << " multi-tab state, event routing, cleanup and DPI checks\n";
+        return 0;
+    } catch (const std::exception& ex) {
+        if (window) DestroyWindow(window);
+        std::error_code error; std::filesystem::remove(settings,error);
+        std::cerr << "FAIL after " << checks << " checks: " << ex.what() << '\n';
+        return 1;
+    }
+}

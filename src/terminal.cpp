@@ -218,8 +218,22 @@ void Terminal::reset() {
     title_.clear();
     cwd_.clear();
     cwdChanged_ = false;
+    shellIntegrationAcks_.clear();
     response_.clear();
     ensureScreen();
+    dirty_ = true;
+}
+
+void Terminal::restoreDisplay(Terminal&& snapshot) {
+    const int columns = cols_, lines = rows_;
+    std::string cwd = std::move(cwd_), title = std::move(title_), response = std::move(response_);
+    auto acks = std::move(shellIntegrationAcks_);
+    const bool changed = cwdChanged_;
+    *this = std::move(snapshot);
+    cwd_ = std::move(cwd); title_ = std::move(title); response_ = std::move(response);
+    shellIntegrationAcks_ = std::move(acks);
+    cwdChanged_ = changed;
+    resize(columns, lines);
     dirty_ = true;
 }
 
@@ -556,6 +570,12 @@ std::string percentDecode(const std::string& text) {
 }
 
 void Terminal::finishOsc() {
+    const std::string ackPrefix = "777;rshell-cwd;";
+    if (osc_.compare(0, ackPrefix.size(), ackPrefix) == 0) {
+        if (shellIntegrationAcks_.size() < 8)
+            shellIntegrationAcks_.push_back(osc_.substr(ackPrefix.size()));
+        return;
+    }
     // 窗口标题：OSC 0 ; title / OSC 2 ; title
     if (osc_.size() > 2 && (osc_[0] == '0' || osc_[0] == '2') && osc_[1] == ';') {
         title_ = osc_.substr(2);

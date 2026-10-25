@@ -1011,6 +1011,32 @@ void testTerminalAltScreenAndMisc() {
         CHECK(restore.find('\x1b') == std::string::npos);
     }
 
+    // 私有集成确认可跨任意分包；恢复初始化画面时保留新目录、标题和尺寸。
+    {
+        Terminal integration(24,4);
+        integration.feed("LOGIN\r\n$ ");
+        Terminal snapshot=integration;
+        const std::string ack="\x1b]777;rshell-cwd;42:1\x07";
+        for (char byte : ack) integration.feed(std::string(1,byte));
+        auto acknowledgements=integration.takeShellIntegrationAcks();
+        CHECK_EQ(acknowledgements.size(),static_cast<std::size_t>(1));
+        CHECK_EQ(acknowledgements.front(),std::string("42:1"));
+        CHECK(integration.takeShellIntegrationAcks().empty());
+        integration.feed(std::string(240,'x')+"stty -echo\r\n\x1b]7;file://localhost/new-dir\x07\x1b]0;new-title\x07");
+        integration.resize(30,5);
+        integration.restoreDisplay(std::move(snapshot));
+        CHECK_EQ(integration.cols(),30); CHECK_EQ(integration.rows(),5);
+        CHECK_EQ(integration.cwd(),std::string("/new-dir"));
+        CHECK_EQ(integration.title(),std::string("new-title"));
+        CHECK_EQ(integration.plainLine(0),std::string("LOGIN"));
+        for (std::size_t row=0;row<integration.lineCount();++row)
+            CHECK(integration.plainLine(row).find("stty")==std::string::npos);
+        for (int i=0;i<12;++i) integration.feed(ack);
+        CHECK_EQ(integration.takeShellIntegrationAcks().size(),static_cast<std::size_t>(8));
+        integration.feed(ack); integration.reset();
+        CHECK(integration.takeShellIntegrationAcks().empty());
+    }
+
     // 光标位置查询响应
     term.feed("\x1b[2;3H\x1b[6n");
     CHECK_EQ(term.takeResponse(), std::string("\x1b[2;3R"));

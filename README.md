@@ -6,9 +6,9 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 ## 下载
 
-**Windows 10/11，64 位：** [下载 rshell v1.0.2](https://github.com/CodeWithiYouth/rshell/releases/download/v1.0.2/rshell-windows-x64.zip)。
+**Windows 10/11，64 位：** [下载 rshell v1.1.0](https://github.com/CodeWithiYouth/rshell/releases/download/v1.1.0/rshell-windows-x64.zip)。
 
-压缩包包含桌面程序 `rshell-gui.exe` 和命令行工具 `rshell.exe`。解压后即可运行，无需安装。校验值见 [SHA256SUMS.txt](https://github.com/CodeWithiYouth/rshell/releases/download/v1.0.2/SHA256SUMS.txt)。
+压缩包包含桌面程序 `rshell-gui.exe` 和命令行工具 `rshell.exe`。解压后即可运行，无需安装。校验值见 [SHA256SUMS.txt](https://github.com/CodeWithiYouth/rshell/releases/download/v1.1.0/SHA256SUMS.txt)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -24,6 +24,8 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 ## 常用操作
 
 - **连接管理：** Ctrl+O 打开会话列表；Ctrl+N 新建会话。
+- **多标签会话：** 点击顶部 `＋` 或按 Ctrl+T 打开新标签；连接另一台主机会保留已有连接。
+- **切换与关闭：** Ctrl+Tab / Ctrl+Shift+Tab 切换标签；点击标签上的 `×`、鼠标中键或 Ctrl+Shift+W 关闭当前标签。
 - **远端路径：** 点 SFTP 面板顶部的路径框，输入路径并回车；Ctrl+L 也可打开路径输入。
 - **搜索终端输出：** Ctrl+Shift+F，然后按 Enter / Shift+Enter 浏览匹配项。
 - **断线重连：** Ctrl+Shift+R。

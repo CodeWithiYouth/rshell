@@ -35,24 +35,20 @@ jobs:
           $env:TMP = $testTemp
           .\build.ps1 -Modern -Test -BuildDir build\release
 
-      - name: Package binaries and checksums
+      - name: Prepare standalone executables
         shell: pwsh
         run: |
           $dist = Join-Path $PWD 'dist'
           New-Item -ItemType Directory -Force -Path $dist | Out-Null
           Copy-Item -LiteralPath 'build\release\rshell.exe', 'build\release\rshell-gui.exe' -Destination $dist
-          Compress-Archive -LiteralPath 'build\release\rshell.exe', 'build\release\rshell-gui.exe' `
-            -DestinationPath (Join-Path $dist 'rshell-windows-x64.zip') -CompressionLevel Optimal
-          $checksums = Get-ChildItem -LiteralPath $dist -File | Sort-Object Name | ForEach-Object {
-            "$( (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant() )  $($_.Name)"
-          }
-          [IO.File]::WriteAllLines((Join-Path $dist 'SHA256SUMS.txt'), $checksums, [Text.Encoding]::ASCII)
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: rshell-windows-x64
-          path: dist/*
+          path: |
+            dist/rshell-gui.exe
+            dist/rshell.exe
           if-no-files-found: error
           retention-days: 30
 
@@ -79,10 +75,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $checksums = @('dist/rshell-gui.exe', 'dist/rshell.exe') | ForEach-Object {
+            "$( (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant() )  $([IO.Path]::GetFileName($_))"
+          }
+          $notes = @('## SHA-256', '', '```text') + $checksums + @('```')
+          [IO.File]::WriteAllLines((Join-Path $PWD 'release-notes.md'), $notes, [Text.UTF8Encoding]::new($false))
           $ghReleaseArgs = @(
             'release', 'create', $env:GITHUB_REF_NAME,
-            'dist/rshell-windows-x64.zip', 'dist/SHA256SUMS.txt',
-            '--verify-tag', '--generate-notes'
+            'dist/rshell-gui.exe', 'dist/rshell.exe',
+            '--verify-tag', '--generate-notes', '--notes-file', 'release-notes.md'
           )
           gh @ghReleaseArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

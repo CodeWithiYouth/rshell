@@ -6,15 +6,18 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 ## 下载
 
-**Windows 10/11，64 位：** [下载 rshell v1.1.0](https://github.com/CodeWithiYouth/rshell/releases/download/v1.1.0/rshell-windows-x64.zip)。
+**Windows 10/11，64 位，按需下载：**
 
-压缩包包含桌面程序 `rshell-gui.exe` 和命令行工具 `rshell.exe`。解压后即可运行，无需安装。校验值见 [SHA256SUMS.txt](https://github.com/CodeWithiYouth/rshell/releases/download/v1.1.0/SHA256SUMS.txt)。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.1.0/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.1.0/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.1.0 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.1.0)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
 ## 第一次连接
 
-1. 解压 ZIP，运行 `rshell-gui.exe`。
+1. 下载并运行 `rshell-gui.exe`。
 2. 按 **Ctrl+N** 添加会话，填写会话名称、主机、用户名和 SSH 端口（默认 22）。可选填私钥路径和备注。
 3. 保存会话，然后点「连接」。密码登录时输入密码；第一次连接新主机时，先核对屏幕上的主机指纹，再选择是否信任。
 4. 连接成功后，右侧是 SSH 终端，左侧可浏览远端文件。
@@ -40,7 +43,7 @@ rshell 不会把连接密码写进会话列表。若选择记住密码，密码�
 
 ## 命令行示例
 
-在 PowerShell 中进入解压目录，运行：
+在 PowerShell 中进入 `rshell.exe` 所在目录，运行：
 
 ```powershell
 .\rshell.exe exec user@host "uname -a"

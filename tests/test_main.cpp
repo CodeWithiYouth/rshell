@@ -1009,6 +1009,21 @@ void testTerminalAltScreenAndMisc() {
         CHECK_EQ(restore, std::string("stty echo; printf '\\r\\033[2K'"));
         CHECK(restore.find('\r') == std::string::npos);    // 真正的回车由调用方补
         CHECK(restore.find('\x1b') == std::string::npos);
+        const std::string input=buildCwdHookInput(restore,"test-unique-3");
+        CHECK(input.front()==' ');
+        CHECK(input.find(restore)!=std::string::npos);
+        CHECK(input.find("builtin history -d \"${__rshell_number%\\*}\"")!=std::string::npos);
+        CHECK(input.find("$HISTCMD")==std::string::npos);
+        CHECK(input.find("unset -f __rshell_hist_test_unique_3")!=std::string::npos);
+        CHECK(input.find(" # __rshell_init_test-unique-3")!=std::string::npos);
+        CHECK(input.find("history -c")==std::string::npos);
+        CHECK(input.find("HISTCONTROL=")==std::string::npos && input.find("HISTIGNORE=")==std::string::npos);
+        bool invalid=false;
+        try { buildCwdHookInput("stty echo","bad'; tag"); } catch(const Error&) { invalid=true; }
+        CHECK(invalid);
+        invalid=false;
+        try { buildCwdHookInput("stty echo\nother-command","valid-tag"); } catch(const Error&) { invalid=true; }
+        CHECK(invalid);
     }
 
     // 私有集成确认可跨任意分包；恢复初始化画面时保留新目录、标题和尺寸。

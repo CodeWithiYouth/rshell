@@ -158,6 +158,7 @@ struct SessionState {
     ULONGLONG cwdHookDeadline = 0;
     std::unique_ptr<Terminal> cwdHookSnapshot;
     std::string cwdHookPendingInput;
+    std::string cwdHookHistoryTag;
     bool holdTermPaint = false;
     std::shared_ptr<RemoteFs> fs = std::make_shared<RemoteFs>();                 // 独立 SSH 连接：SFTP + 机器状态采样
     bool fsReady = false;        // 独立连接已建立
@@ -2305,12 +2306,24 @@ void stopCwdHook() {
     g_app.cwdHookAcked = false;
     g_app.cwdHookDeadline = 0;
     g_app.cwdHookPendingInput.clear();
+    g_app.cwdHookHistoryTag.clear();
     endCwdHookFreeze();  // 断线 / 取消注入时画面不能一直冻着
 }
 
 std::string cwdHookAckCommand(int phase) {
     return "printf '\\033]777;rshell-cwd;" + std::to_string(g_app.connectionId) + ":" +
         std::to_string(phase) + "\\007'";
+}
+
+std::string cwdHookInput(const std::string& command, int phase) {
+    if (g_app.cwdHookHistoryTag.empty()) {
+        GUID guid{}; wchar_t text[40]{};
+        if (SUCCEEDED(CoCreateGuid(&guid)) && StringFromGUID2(guid, text, 40))
+            g_app.cwdHookHistoryTag = toUtf8(std::wstring(text + 1, 36));
+        else g_app.cwdHookHistoryTag = std::to_string(GetCurrentProcessId()) + "-" +
+            std::to_string(GetTickCount64()) + "-" + std::to_string(g_app.connectionId);
+    }
+    return buildCwdHookInput(command, g_app.cwdHookHistoryTag + "-" + std::to_string(phase));
 }
 
 void finishCwdHook(bool timedOut = false) {
@@ -2326,7 +2339,7 @@ void finishCwdHook(bool timedOut = false) {
 }
 
 void abortCwdHook() {
-    if (g_app.shell->running()) g_app.shell->write(" stty echo\r");
+    if (g_app.shell->running()) g_app.shell->write(cwdHookInput("stty echo", 4) + "\r");
     finishCwdHook(true);
 }
 
@@ -2340,7 +2353,7 @@ void handleCwdHookAck(const std::string& ack) {
         killCwdTimer(kCwdHookTimer3);
         g_app.cwdHookPhase = 3;
         g_app.cwdHookAcked = false;
-        g_app.shell->write(buildCwdHookRestoreEcho() + "; " + cwdHookAckCommand(3) + "\r");
+        g_app.shell->write(cwdHookInput(buildCwdHookRestoreEcho() + "; " + cwdHookAckCommand(3), 3) + "\r");
         setCwdTimer(kCwdHookTimer4, 40);
     } else {
         g_app.cwdHookAcked = true;
@@ -2358,7 +2371,7 @@ bool sendCwdHookScript() {
     const int erase = std::clamp(static_cast<int>(nowLine - g_app.cwdHookStartLine), 1,
                                  std::max(1, g_app.termData.cursorRow()));
     // 擦除序列和钩子本体都在 util.cpp 的 buildCwdHookScript 里，这里只补一个回车
-    return g_app.shell->write(buildCwdHookScript(erase) + "; " + cwdHookAckCommand(2) + "\r");
+    return g_app.shell->write(cwdHookInput(buildCwdHookScript(erase) + "; " + cwdHookAckCommand(2), 2) + "\r");
 }
 
 void disconnectSession() {
@@ -8271,7 +8284,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.cwdHookPhase = 1;
                 g_app.cwdHookAcked = false;
                 g_app.holdTermPaint = true;
-                if (!g_app.shell->write(" stty -echo; " + cwdHookAckCommand(1) + "\r")) {
+                if (!g_app.shell->write(cwdHookInput("stty -echo; " + cwdHookAckCommand(1), 1) + "\r")) {
                     abortCwdHook(); return 0;
                 }
                 setCwdTimer(kCwdHookTimer2, 40);

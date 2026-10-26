@@ -195,14 +195,23 @@ void networkRegression(int port, const std::string& upload, const std::string& d
     check(g_tabs.size()==2 && g_activeTab==1, "opening another saved session preserves a connecting tab");
     const UINT_PTR betaConnection=g_app.connectionId;
     auto state = [](UINT_PTR id) { return findSessionState(id,true); };
-    waitUntil([&] { return state(alphaConnection)->fsReady && state(betaConnection)->fsReady &&
-        !state(alphaConnection)->connecting && !state(betaConnection)->connecting; }, "two real SSH and SFTP connections establish concurrently");
+    const bool testHooks=std::getenv("RSHELL_TEST_CWD_HOOKS")!=nullptr;
+    bool queuedAlpha=false, queuedBeta=false;
+    waitUntil([&] {
+        auto queueDuringIntegration=[&](UINT_PTR connection,bool& queued,const char* command) {
+            if (testHooks && !queued && state(connection)->cwdHookPhase) {
+                SessionStateScope scope(state(connection)); sendInput(command); queued=true;
+            }
+        };
+        queueDuringIntegration(alphaConnection,queuedAlpha,"echo QUEUED_ALPHA\r");
+        queueDuringIntegration(betaConnection,queuedBeta,"echo QUEUED_BETA\r");
+        return state(alphaConnection)->fsReady && state(betaConnection)->fsReady &&
+            !state(alphaConnection)->connecting && !state(betaConnection)->connecting &&
+            (!testHooks || (queuedAlpha && queuedBeta));
+    }, "two real SSH and SFTP connections establish concurrently");
     check(state(alphaConnection)->shell->running() && state(betaConnection)->shell->running(), "both real shells stay connected");
-    if (std::getenv("RSHELL_TEST_CWD_HOOKS")) {
-        waitUntil([&] { return state(alphaConnection)->cwdHookPhase==1 && state(betaConnection)->cwdHookPhase==1; },
-                  "integration starts from already-received login output in both tabs");
-        { SessionStateScope scope(state(alphaConnection)); sendInput("echo QUEUED_ALPHA\r"); }
-        sendInput("echo QUEUED_BETA\r");
+    if (testHooks) {
+        check(queuedAlpha && queuedBeta, "each tab accepts queued input during its own integration phase");
         waitUntil([&] { return !state(alphaConnection)->cwdHookPhase && !state(betaConnection)->cwdHookPhase &&
             output(*state(alphaConnection)).find("QUEUED_ALPHA")!=std::string::npos &&
             output(*state(betaConnection)).find("QUEUED_BETA")!=std::string::npos; },
@@ -258,6 +267,15 @@ void networkRegression(int port, const std::string& upload, const std::string& d
 }
 
 int main(int argc, char** argv) {
+    if (argc == 3 && std::string(argv[1]) == "--history-commands") {
+        g_app.connectionId=31337;
+        std::ofstream out(utf8ToPath(argv[2]),std::ios::binary);
+        out << cwdHookInput("stty -echo; "+cwdHookAckCommand(1),1) << '\n'
+            << cwdHookInput(buildCwdHookScript(2)+"; "+cwdHookAckCommand(2),2) << '\n'
+            << cwdHookInput(buildCwdHookRestoreEcho()+"; "+cwdHookAckCommand(3),3) << '\n'
+            << cwdHookInput("stty echo",4) << '\n';
+        return out ? 0 : 1;
+    }
     HWND window = nullptr;
     const auto settings=std::filesystem::temp_directory_path() / ("rshell-tabs-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+".ini");
     try {

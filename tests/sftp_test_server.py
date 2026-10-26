@@ -286,7 +286,7 @@ class TestSSHServer(paramiko.ServerInterface):
                             channel.close()
                             return
                         hook_ack = re.search(r"rshell-cwd;(\d+:[123])", command)
-                        if hook_ack and command.startswith("stty -echo;"):
+                        if hook_ack and "stty -echo;" in command:
                             echo_enabled = False
                             integration_ack(hook_ack[1])
                         elif hook_ack and "__rshell_cwd()" in command:
@@ -295,7 +295,7 @@ class TestSSHServer(paramiko.ServerInterface):
                                 channel.sendall(f"\x1b[{erase[1]}A\r\x1b[J".encode())
                             channel.sendall(b"\x1b]7;file://localhost/\x07\r\x1b[2K")
                             integration_ack(hook_ack[1])
-                        elif command.startswith("stty echo"):
+                        elif "stty echo" in command:
                             echo_enabled = True
                             channel.sendall(b"\r\x1b[2K")
                             if hook_ack:
@@ -361,7 +361,7 @@ class TestSSHServer(paramiko.ServerInterface):
                         channel.sendall(b"^C\r\n$ ")
                     elif byte >= b" ":
                         pending += byte
-                        if not delayed_echo and pending.startswith(b" stty -echo"):
+                        if not delayed_echo and b"stty -echo" in pending:
                             delayed_echo = True
                             time.sleep(hook_delay)
                         if echo_enabled:

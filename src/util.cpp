@@ -236,6 +236,27 @@ std::string buildCwdHookScript(int eraseLines) {
 // 绝不能写成 "\r" / "\033"，那是真实的 CR / ESC 字节，会把这一行拆成两行。
 std::string buildCwdHookRestoreEcho() { return "stty echo; printf '\\r\\033[2K'"; }
 
+std::string buildCwdHookInput(const std::string& command, const std::string& historyTag) {
+    if (historyTag.empty() || !std::all_of(historyTag.begin(), historyTag.end(), [](unsigned char c) {
+            return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                   (c >= '0' && c <= '9') || c == '-';
+        }) || command.find_first_of("\r\n\x1b") != std::string::npos || command.find('\0') != std::string::npos)
+        throw Error("无效的 shell 初始化命令或历史标记");
+    const std::string marker = " # __rshell_init_" + historyTag;
+    std::string function = "__rshell_hist_" + historyTag;
+    std::replace(function.begin(), function.end(), '-', '_');
+    // Bash 4.4 执行期间的 HISTCMD 可能比实际历史编号多 1，不能用它定位。
+    // 从同一条已匹配标记的历史输出取实际编号；临时变量限制在唯一函数内。
+    return " if [ -n \"${BASH_VERSION-}\" ]; then " + function +
+        "(){ local __rshell_line __rshell_number; "
+        "__rshell_line=\"$(HISTTIMEFORMAT= builtin history 1)\"; "
+        "case \"$__rshell_line\" in *'" + marker + "') "
+        "__rshell_line=\"${__rshell_line#\"${__rshell_line%%[0-9]*}\"}\"; "
+        "__rshell_number=\"${__rshell_line%%[[:space:]]*}\"; "
+        "builtin history -d \"${__rshell_number%\\*}\" 2>/dev/null || : ;; esac; }; " +
+        function + "; unset -f " + function + "; fi; " + command + marker;
+}
+
 bool isAbsoluteRemotePath(const std::string& p) { return !p.empty() && p[0] == '/'; }
 
 std::string normalizeRemotePath(const std::string& p) {

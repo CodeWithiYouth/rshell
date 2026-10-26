@@ -117,5 +117,7 @@ std::string buildCwdHookScript(int eraseLines);
 // 只能有一层反斜杠。如果这里写成了真实的 CR 字节，远端 tty 的 ICRNL 会把它变成
 // 换行，`printf '` 的单引号就悬空，bash 直接掉进 PS2 续行——屏幕上会多出一个 "> "。
 std::string buildCwdHookRestoreEcho();
+// 初始化输入包装：Bash 仅移除带本次唯一标记的当前历史项，不改用户历史设置。
+std::string buildCwdHookInput(const std::string& command, const std::string& historyTag);
 
 }  // namespace rshell

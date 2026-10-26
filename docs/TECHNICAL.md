@@ -164,6 +164,8 @@ Win7 兼容构建的 KEX 有 `diffie-hellman-*` 和 `curve25519-sha256`（内嵌
      DEC 图形字符集（`ESC ( 0`）、`REP` 重复、emoji 呈现（`U+FE0F`）、
      焦点上报与 SGR 鼠标上报；查询类序列（`CSI ? Ps $ p` 模式查询、
      `CSI ? u` kitty 键盘查询）都会应答，程序不必等超时；
+   - 暂不渲染 Kitty 图形；其 APC 探测/图像控制字符串会完整忽略，保留 DA1 能力查询响应，
+     避免退出 OpenCode 等 TUI 后把 `Gi=31337...` 图形探测负载显示成文本；
      带前缀的 `CSI`（例如 xterm 的 `CSI > 4 ; n m` modifyOtherKeys）
      不会被误当成 SGR 属性；
    - 拖动选择文本会自动复制，`Ctrl+V`（或 `Ctrl+Shift+V`、`Shift+Insert`）粘贴

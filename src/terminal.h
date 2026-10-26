@@ -167,13 +167,13 @@ private:
     void decodeUtf8(unsigned char byte);
 
     // 解析状态
-    enum class State { Ground, Escape, Csi, Osc, Charset, Dcs };
+    enum class State { Ground, Escape, Csi, Osc, Charset, Dcs, IgnoredString };
     State state_ = State::Ground;
     std::string csi_;   // CSI 参数字节
     std::string osc_;   // OSC 内容
     std::uint32_t utf8Pending_ = 0;
     int utf8Remain_ = 0;
-    bool escPending_ = false;  // OSC/DCS 内的 ESC，用于识别 ST
+    bool escPending_ = false;  // 控制字符串内的 ESC，用于识别 ST（ESC \）
 
     // 屏幕
     int cols_ = 80;

@@ -462,6 +462,11 @@ void Terminal::feed(const std::string& data) {
                 } else if (b == 'P') {
                     state_ = State::Dcs;
                     escPending_ = false;
+                } else if (b == '_' || b == '^' || b == 'X') {
+                    // APC（含 Kitty 图形探测）、PM、SOS：暂不支持的控制字符串
+                    // 整段跳过，不缓存负载，直到 ST；不能把 G/参数/base64 当成文本。
+                    state_ = State::IgnoredString;
+                    escPending_ = false;
                 } else if (b == '(' || b == ')' || b == '*' || b == '+' || b == '-' ||
                            b == '.' || b == '/') {
                     charsetSlot_ = static_cast<char>(b);
@@ -500,6 +505,14 @@ void Terminal::feed(const std::string& data) {
                     g0Charset_ = static_cast<char>(b);
                 }
                 state_ = State::Ground;
+                break;
+            case State::IgnoredString:
+                if (b == 0x18 || b == 0x1A || (escPending_ && b == '\\')) {
+                    state_ = State::Ground;
+                    escPending_ = false;
+                } else {
+                    escPending_ = b == 0x1B;
+                }
                 break;
             case State::Dcs:
                 if (b == 0x1B) {

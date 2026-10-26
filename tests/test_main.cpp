@@ -1124,6 +1124,53 @@ void testTerminalTuiCompat() {
     rqm.feed("\x1b[?1049h\x1b[?1049$p");
     CHECK_EQ(rqm.takeResponse(), std::string("\x1b[?1049;1$y"));
 
+    // OpenCode 发送的 Kitty 图形探测是 APC 控制字符串，不应出现在文本画面。
+    {
+        Terminal graphics(100,4);
+        graphics.feed("before\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\after");
+        CHECK_EQ(graphics.plainLine(0),std::string("beforeafter"));
+        const std::string probe="\x1b_Gi=31337,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+        for (std::size_t split=0;split<=probe.size();++split) {
+            Terminal fragments(100,4);
+            fragments.feed("before"); fragments.feed(probe.substr(0,split));
+            fragments.feed(probe.substr(split)); fragments.feed("after\x1b[c");
+            CHECK_EQ(fragments.plainLine(0),std::string("beforeafter"));
+            CHECK_EQ(fragments.takeResponse(),std::string("\x1b[?1;2c"));
+        }
+        Terminal bytes(100,4);
+        for (char byte : probe) bytes.feed(std::string(1,byte));
+        bytes.feed("中文提示符");
+        CHECK_EQ(bytes.plainLine(0),std::string("中文提示符"));
+        CHECK(bytes.takeResponse().empty());  // 不宣称支持 Kitty 图形协议。
+        Terminal tui(100,4);
+        const std::string command="[root@host ~]# opencode";
+        tui.feed(command+"\x1b[?1049hTUI"); tui.feed(probe);
+        tui.feed("\x1b[?1049l\r\n[root@host ~]# ");
+        CHECK_EQ(tui.plainLine(0),command);
+        CHECK_EQ(tui.plainLine(1),std::string("[root@host ~]#"));
+        for (std::size_t row=0;row<tui.lineCount();++row)
+            CHECK(tui.plainLine(row).find("31337")==std::string::npos);
+        for (char introducer : {'_','^','X'}) {
+            Terminal strings(100,3);
+            strings.feed(std::string("\x1b")+introducer+"hidden\x07still-hidden\x1b");
+            strings.feed("\\visible");
+            CHECK_EQ(strings.plainLine(0),std::string("visible"));
+            for (char cancel : {'\x18','\x1a'}) {
+                strings.reset(); strings.feed(std::string("\x1b")+introducer+"hidden"+cancel+"visible");
+                CHECK_EQ(strings.plainLine(0),std::string("visible"));
+            }
+        }
+        Terminal large(100,4);
+        large.feed("\x1b_Ga=t;");
+        const std::string chunk(4096,'A');
+        for (int i=0;i<256;++i) large.feed(chunk);
+        large.feed("\x1b\\prompt");
+        CHECK_EQ(large.plainLine(0),std::string("prompt"));
+        CHECK_EQ(large.scrollbackCount(),static_cast<std::size_t>(0));
+        large.reset(); large.feed("Gi=31337,s=1;");
+        CHECK_EQ(large.plainLine(0),std::string("Gi=31337,s=1;")); // 普通文本不能被过滤。
+    }
+
     // kitty 键盘查询（CSI ? u）要回复“不支持”，避免程序等超时
     rqm.feed("\x1b[?u");
     CHECK_EQ(rqm.takeResponse(), std::string("\x1b[?0u"));

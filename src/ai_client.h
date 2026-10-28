@@ -126,17 +126,33 @@ public:
                             const std::function<bool()>& shouldCancel) = 0;
 };
 
+// ------------------------------------------------------------------ 模型列表
+
+
 struct ApiConfig {
     // 末尾是否带 /v1 都可以；带不带 /chat/completions 也都能识别
     std::string baseUrl = "https://api.openai.com/v1";
     std::string apiKey;
     std::string model = "gpt-4o-mini";
-    std::string userAgent = "rshell-gui/1.1";
+    // OpenCode Go 要求每个对话带稳定的会话 ID，用于路由与提示缓存；
+    // 其它服务商不需要，留空就不发这个头
+    std::string sessionId;
+    std::string userAgent = "rshell-gui/1.2";
     int connectTimeoutMs = 15000;
     int sendTimeoutMs = 30000;
     int idleTimeoutMs = 600000;  // 流式长连接的空闲超时，不是总时长
     bool includeUsage = true;
 };
+
+struct ModelCatalog {
+    bool ok = false;
+    std::string error;
+    std::vector<std::string> ids;
+};
+
+// GET {url}，解析 {"data":[{"id":...}]}；带 supported_endpoints 的条目会过滤掉
+// 不支持 /chat/completions 的模型（例如 Command Code 的 Claude 只走 /messages）。
+ModelCatalog listModels(const ApiConfig& config, const std::string& url);
 
 class Client : public ChatBackend {
 public:

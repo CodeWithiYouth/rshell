@@ -42,6 +42,7 @@ struct AiTabContext {
     HFONT captionFont = nullptr;
     std::function<void()> onSettingsSaved;  // 可选：宿主刷新界面
     std::function<void()> onToggleFullScreen;  // 面板头部「全屏/停靠」按钮
+    std::function<void()> onClose;             // 面板头部「×」
 };
 
 class AiTab {
@@ -70,6 +71,7 @@ private:
     void finishSettings(bool save);
     void createSettingsControls();
     void layoutSettings();
+    void startModelFetch();
     void updateHostLabel();
     void updateKeyNotice();
     void updateWelcome();

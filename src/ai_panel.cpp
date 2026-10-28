@@ -531,6 +531,13 @@ void ChatPanel::drawHeader(HDC dc) {
 
     int right = row1.right - kPad;
     const int btnW = 48;
+
+    // 关闭按钮放最右，宽度窄一点，和三个操作按钮区分开
+    RECT closeRect{right - 32, row1.top + 7, right, row1.bottom - 5};
+    drawButton(dc, closeRect, L"×", bgCard, textDim, hover_ == Hit::Close);
+    hits_.push_back({closeRect, Hit::Close, 0});
+    right = closeRect.left - 6;
+
     auto addButton = [&](const wchar_t* label, Hit hit, bool hovered) {
         RECT rect{right - btnW, row1.top + 7, right, row1.bottom - 5};
         drawButton(dc, rect, label, bgCard, textDim, hovered);
@@ -873,6 +880,9 @@ bool ChatPanel::onMouseUp(POINT pt) {
                 return true;
             case Hit::Full:
                 if (actions_.onToggleFullScreen) actions_.onToggleFullScreen();
+                return true;
+            case Hit::Close:
+                if (actions_.onClose) actions_.onClose();
                 return true;
             case Hit::WelcomeSettings:
                 if (actions_.onWelcome)

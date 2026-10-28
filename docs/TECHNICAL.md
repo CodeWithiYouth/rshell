@@ -546,6 +546,8 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
 - 只用系统 `winhttp.dll`，TLS 由 SChannel 提供，不打包 OpenSSL/curl
 - Win7 回退：`AUTOMATIC_PROXY` 失败退 `DEFAULT_PROXY`；TLS 1.3 标志被拒时退 TLS 1.2
 - 请求头固定 `Accept-Encoding: identity`（`WINHTTP_OPTION_DECOMPRESSION` 需要 Win8.1+）
+- OpenCode Go（`opencode.ai`）要求每个对话带稳定的 `x-opencode-session`，用于路由与提示缓存；
+  仅当 baseURL 含 `opencode.ai` 时发送，会话 ID 每个 AI 标签生成一次并保持
 - 明文 HTTP 只允许本机地址（Ollama / vLLM）
 - Win7 仍需系统已启用 TLS 1.2 并更新根证书，否则会在握手阶段失败
 

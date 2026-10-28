@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <random>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -28,17 +30,55 @@ namespace {
 constexpr wchar_t kAiClass[] = L"RshellAiTab";
 constexpr UINT kAiEventMessage = WM_APP + 61;
 constexpr UINT kAiFlushMessage = WM_APP + 62;
+constexpr UINT kAiModelsMessage = WM_APP + 63;
 constexpr UINT_PTR kCaretTimer = 11;
 constexpr UINT_PTR kRepaintTimer = 12;
 constexpr int kRepaintIntervalMs = 40;  // 流式刷新上限约 25fps
 
 // 设置视图的固定排版（绘制与建控件共用）
-constexpr int kFieldTop = 48;
-constexpr int kFieldGap = 86;
+constexpr int kProviderTop = 54;
+constexpr int kProviderH = 28;
+constexpr int kFieldTop = 100;
+constexpr int kFieldGap = 66;
 constexpr int kEditOffset = 24;
 constexpr int kEditHeight = 30;
-constexpr int kButtonTop = kFieldTop + kFieldGap * 3 + 8;
+constexpr int kFetchW = 88;
+constexpr int kButtonTop = kFieldTop + kFieldGap * 3 + 4;
 constexpr int kButtonHeight = 34;
+
+struct ModelFetchPayload {
+    std::vector<std::string> ids;
+    std::string error;
+};
+
+// 每个对话一个稳定的会话 ID（OpenCode Go 用来做路由与提示缓存）
+std::string makeSessionId() {
+    std::random_device device;
+    std::mt19937_64 generator(device());
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(32);
+    for (int i = 0; i < 4; ++i) {
+        std::uint64_t value = generator();
+        for (int j = 0; j < 16; ++j) {
+            out += hex[value & 0xF];
+            value >>= 4;
+        }
+    }
+    return out;
+}
+
+ApiConfig makeApiConfig(const AiSettings& settings, const std::string& key,
+                        const std::string& sessionId) {
+    ApiConfig config;
+    config.baseUrl = settings.baseUrl;
+    config.apiKey = key;
+    config.model = settings.model;
+    config.userAgent = "rshell-gui/1.2";
+    // 只有 OpenCode Go 需要这个头；其它服务商发了也不会被接受方理解
+    if (config.baseUrl.find("opencode.ai") != std::string::npos) config.sessionId = sessionId;
+    return config;
+}
 
 std::wstring toWideText(const std::string& text) {
     if (text.empty()) return std::wstring();
@@ -59,6 +99,15 @@ std::string toUtf8Text(const std::wstring& text) {
     WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), length,
                         nullptr, nullptr);
     return out;
+}
+
+int textWidthOf(HDC dc, const std::wstring& text, HFONT font) {
+    if (text.empty() || !font) return 0;
+    HGDIOBJ old = SelectObject(dc, font);
+    SIZE size{};
+    GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size);
+    SelectObject(dc, old);
+    return size.cx;
 }
 
 void fillRect(HDC dc, const RECT& rc, std::uint32_t color) {
@@ -184,12 +233,18 @@ struct AiTab::Impl {
 
     AiSettings settings;
     std::string apiKey;
+    std::string sessionId = makeSessionId();
     bool keyNoticeShown = false;
 
     // 设置视图
     HWND editBase = nullptr;
-    HWND editModel = nullptr;
     HWND editKey = nullptr;
+    HWND modelCombo = nullptr;
+    std::string draftProvider;
+    std::vector<RECT> providerRects;
+    RECT fetchRect{};
+    bool fetching = false;
+    std::string fetchStatus;
     RECT saveRect{};
     RECT cancelRect{};
 };
@@ -257,6 +312,9 @@ void AiTab::initialize(HWND) {
     actions.onCancel = [this]() { cancelTurn(); };
     actions.onSettings = [this]() { startSettings(false); };
     actions.onWelcome = [this]() { startSettings(true); };
+    actions.onClose = [this]() {
+        if (context_.onClose) context_.onClose();
+    };
     actions.onClear = [this]() {
         if (impl_->busy) return;
         impl_->agent.reset();
@@ -274,7 +332,7 @@ void AiTab::initialize(HWND) {
     panel_.setCallbacks(std::move(actions));
 
     impl_->settings = loadAiSettings();
-    impl_->client.setConfig(ApiConfig{impl_->settings.baseUrl, std::string(), impl_->settings.model});
+    impl_->client.setConfig(makeApiConfig(impl_->settings, std::string(), impl_->sessionId));
     panel_.setModelName(toWideText(impl_->settings.model));
 
     // Agent 的流式回调 → 界面线程事件
@@ -427,7 +485,7 @@ void AiTab::sendMessage(const std::wstring& text) {
         return slot->decision;
     });
 
-    impl_->client.setConfig(ApiConfig{impl_->settings.baseUrl, impl_->apiKey, impl_->settings.model});
+    impl_->client.setConfig(makeApiConfig(impl_->settings, impl_->apiKey, impl_->sessionId));
     impl_->busy = true;
     impl_->cancel = false;
     impl_->assistantIndex = static_cast<std::size_t>(-1);
@@ -652,11 +710,16 @@ void AiTab::startSettings(bool unlockOnly) {
     }
 
     createSettingsControls();
+    impl_->draftProvider = impl_->settings.provider;
+    impl_->fetchStatus.clear();
     SetWindowTextW(impl_->editBase, toWideText(impl_->settings.baseUrl).c_str());
-    SetWindowTextW(impl_->editModel, toWideText(impl_->settings.model).c_str());
     SetWindowTextW(impl_->editKey, L"");
+    SetWindowTextW(impl_->modelCombo, toWideText(impl_->settings.model).c_str());
 
     layoutSettings();
+    HWND controls[] = {impl_->editBase, impl_->editKey, impl_->modelCombo};
+    for (HWND control : controls)
+        if (control) ShowWindow(control, SW_SHOW);
     SetFocus(impl_->editBase);
     InvalidateRect(window_, nullptr, TRUE);
 }
@@ -671,8 +734,17 @@ void AiTab::createSettingsControls() {
         return edit;
     };
     if (!impl_->editBase) impl_->editBase = makeEdit(0);
-    if (!impl_->editModel) impl_->editModel = makeEdit(0);
     if (!impl_->editKey) impl_->editKey = makeEdit(ES_PASSWORD);
+    if (!impl_->modelCombo) {
+        impl_->modelCombo = CreateWindowExW(0, L"COMBOBOX", L"",
+                                            WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWN |
+                                                CBS_AUTOHSCROLL,
+                                            0, 0, 10, 240, window_, nullptr,
+                                            GetModuleHandleW(nullptr), nullptr);
+        if (impl_->modelCombo && context_.uiFont)
+            SendMessageW(impl_->modelCombo, WM_SETFONT,
+                         reinterpret_cast<WPARAM>(context_.uiFont), TRUE);
+    }
 }
 
 void AiTab::layoutSettings() {
@@ -682,14 +754,77 @@ void AiTab::layoutSettings() {
     const int left = 24;
     const int width = std::max(120, static_cast<int>(client.right) - left * 2);
 
-    HWND edits[3] = {impl_->editBase, impl_->editModel, impl_->editKey};
-    for (int i = 0; i < 3; ++i) {
-        MoveWindow(edits[i], left, kFieldTop + i * kFieldGap + kEditOffset, width, kEditHeight,
-                   TRUE);
+    // 预设 chips：自定义 + 内置三家
+    impl_->providerRects.clear();
+    int chipX = left;
+    const std::wstring labels[] = {L"自定义", L"OpenCode Go", L"Command Code", L"Cline"};
+    HDC dc = GetDC(window_);
+    for (const std::wstring& label : labels) {
+        const int chipW = textWidthOf(dc, label, context_.uiFont) + 20;
+        impl_->providerRects.push_back(RECT{chipX, kProviderTop, chipX + chipW,
+                                            kProviderTop + kProviderH});
+        chipX += chipW + 6;
     }
+    ReleaseDC(window_, dc);
+
+    MoveWindow(impl_->editBase, left, kFieldTop + kEditOffset, width, kEditHeight, TRUE);
+    MoveWindow(impl_->editKey, left, kFieldTop + kFieldGap + kEditOffset, width, kEditHeight,
+               TRUE);
+    const int comboTop = kFieldTop + kFieldGap * 2 + kEditOffset;
+    impl_->fetchRect = RECT{left + width - kFetchW, comboTop, left + width,
+                            comboTop + kEditHeight};
+    MoveWindow(impl_->modelCombo, left, comboTop, width - kFetchW - 8, 240, TRUE);
+
     impl_->saveRect = RECT{left, kButtonTop, left + 96, kButtonTop + kButtonHeight};
     impl_->cancelRect = RECT{left + 108, kButtonTop, left + 108 + 96,
                              kButtonTop + kButtonHeight};
+}
+
+void AiTab::startModelFetch() {
+    if (impl_->fetching) return;
+
+    auto readText = [](HWND handle) {
+        wchar_t buffer[2048]{};
+        GetWindowTextW(handle, buffer, 2048);
+        return toUtf8Text(buffer);
+    };
+
+    const std::string base = trim(readText(impl_->editBase));
+    std::string key = trim(readText(impl_->editKey));
+    if (key.empty()) key = impl_->apiKey;
+    if (base.empty()) {
+        impl_->fetchStatus = "先填 API 地址";
+        InvalidateRect(window_, nullptr, FALSE);
+        return;
+    }
+    if (key.empty()) {
+        impl_->fetchStatus = "先填 API Key";
+        InvalidateRect(window_, nullptr, FALSE);
+        return;
+    }
+
+    AiSettings draft = impl_->settings;
+    draft.provider = impl_->draftProvider;
+    draft.baseUrl = base;
+    const std::string url = aiModelsUrl(draft);
+
+    ApiConfig config;
+    config.baseUrl = base;
+    config.apiKey = key;
+    config.userAgent = "rshell-gui/1.2";
+    if (base.find("opencode.ai") != std::string::npos) config.sessionId = impl_->sessionId;
+
+    impl_->fetching = true;
+    impl_->fetchStatus = "正在获取模型列表…";
+    InvalidateRect(window_, nullptr, FALSE);
+
+    // 走工作线程，避免网络慢时把界面卡住；窗口关掉后 PostMessage 会被忽略
+    HWND target = window_;
+    std::thread([target, url, config]() {
+        ModelCatalog catalog = listModels(config, url);
+        auto* payload = new ModelFetchPayload{std::move(catalog.ids), catalog.error};
+        PostMessageW(target, kAiModelsMessage, 0, reinterpret_cast<LPARAM>(payload));
+    }).detach();
 }
 
 void AiTab::finishSettings(bool save) {
@@ -703,7 +838,8 @@ void AiTab::finishSettings(bool save) {
     if (save) {
         AiSettings settings = impl_->settings;
         settings.baseUrl = trim(readText(impl_->editBase));
-        settings.model = trim(readText(impl_->editModel));
+        settings.provider = impl_->draftProvider;
+        settings.model = trim(readText(impl_->modelCombo));
         if (settings.baseUrl.empty() || settings.model.empty()) {
             panel_.addNotice(L"API 地址和模型都不能为空", true);
             return;
@@ -733,7 +869,7 @@ void AiTab::finishSettings(bool save) {
             if (loadApiKey(*context_.vault, stored)) impl_->apiKey = stored;
         }
         panel_.setModelName(toWideText(settings.model));
-        impl_->client.setConfig(ApiConfig{settings.baseUrl, impl_->apiKey, settings.model});
+        impl_->client.setConfig(makeApiConfig(settings, impl_->apiKey, impl_->sessionId));
         panel_.setStatus(L"就绪");
         // 关键：密钥/模型变了，空状态文案要跟着变，否则还会显示「没有配置 API Key」
         updateWelcome();
@@ -744,8 +880,8 @@ void AiTab::finishSettings(bool save) {
 
     settingsOpen_ = false;
     ShowWindow(impl_->editBase, SW_HIDE);
-    ShowWindow(impl_->editModel, SW_HIDE);
     ShowWindow(impl_->editKey, SW_HIDE);
+    ShowWindow(impl_->modelCombo, SW_HIDE);
     SetFocus(window_);
     panel_.focusInput();
     InvalidateRect(window_, nullptr, TRUE);
@@ -805,6 +941,43 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 panel_.appendAssistant(impl_->assistantIndex, text);
             }
             requestRepaint();
+            return 0;
+        }
+
+        case kAiModelsMessage: {
+            std::unique_ptr<ModelFetchPayload> payload(
+                reinterpret_cast<ModelFetchPayload*>(lParam));
+            impl_->fetching = false;
+            if (!payload) return 0;
+
+            if (payload->ids.empty()) {
+                impl_->fetchStatus =
+                    payload->error.empty() ? "没有取到模型" : payload->error;
+            } else {
+                wchar_t current[512]{};
+                GetWindowTextW(impl_->modelCombo, current, 512);
+                SendMessageW(impl_->modelCombo, CB_RESETCONTENT, 0, 0);
+                for (const std::string& id : payload->ids) {
+                    const std::wstring wide = toWideText(id);
+                    SendMessageW(impl_->modelCombo, CB_ADDSTRING, 0,
+                                 reinterpret_cast<LPARAM>(wide.c_str()));
+                }
+                // 保留用户原来填的模型（列表里没有就补一条）
+                if (current[0] != L'\0') {
+                    if (SendMessageW(impl_->modelCombo, CB_FINDSTRINGEXACT,
+                                     static_cast<WPARAM>(-1),
+                                     reinterpret_cast<LPARAM>(current)) < 0) {
+                        SendMessageW(impl_->modelCombo, CB_ADDSTRING, 0,
+                                     reinterpret_cast<LPARAM>(current));
+                    }
+                    SetWindowTextW(impl_->modelCombo, current);
+                } else {
+                    SetWindowTextW(impl_->modelCombo,
+                                   toWideText(payload->ids.front()).c_str());
+                }
+                impl_->fetchStatus = "已获取 " + std::to_string(payload->ids.size()) + " 个模型";
+            }
+            InvalidateRect(window_, nullptr, TRUE);
             return 0;
         }
 
@@ -914,6 +1087,25 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONUP: {
             POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             if (settingsOpen_) {
+                // 服务商预设
+                const auto& presets = aiProviderPresets();
+                for (std::size_t i = 0; i < impl_->providerRects.size(); ++i) {
+                    if (!PtInRect(&impl_->providerRects[i], pt)) continue;
+                    if (i == 0) {
+                        impl_->draftProvider.clear();
+                    } else if (i - 1 < presets.size()) {
+                        impl_->draftProvider = presets[i - 1].id;
+                        SetWindowTextW(impl_->editBase,
+                                       toWideText(presets[i - 1].baseUrl).c_str());
+                    }
+                    impl_->fetchStatus.clear();
+                    InvalidateRect(window_, nullptr, FALSE);
+                    return 0;
+                }
+                if (PtInRect(&impl_->fetchRect, pt)) {
+                    startModelFetch();
+                    return 0;
+                }
                 if (PtInRect(&impl_->saveRect, pt)) {
                     finishSettings(true);
                     return 0;
@@ -987,31 +1179,63 @@ void AiTab::paint(HDC dc) {
 
     const int left = 24;
     const int width = std::max(120, static_cast<int>(client.right) - left * 2);
+
+    // 服务商预设：选一个就把地址填好，只差 Key
+    drawText(dc, L"服务商", RECT{left, kProviderTop - 22, left + width, kProviderTop - 2},
+             ui::textDim, context_.captionFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    const auto& presets = aiProviderPresets();
+    const std::wstring chipLabels[] = {L"自定义", L"OpenCode Go", L"Command Code", L"Cline"};
+    for (std::size_t i = 0; i < impl_->providerRects.size(); ++i) {
+        const bool selected =
+            (i == 0) ? impl_->draftProvider.empty()
+                     : (i - 1 < presets.size() && impl_->draftProvider == presets[i - 1].id);
+        const RECT& chip = impl_->providerRects[i];
+        HBRUSH fill = CreateSolidBrush(toColorRef(selected ? ui::bgActive : ui::bgCard));
+        FillRect(dc, &chip, fill);
+        DeleteObject(fill);
+        HBRUSH border = CreateSolidBrush(toColorRef(selected ? ui::accent : ui::borderSoft));
+        FrameRect(dc, &chip, border);
+        DeleteObject(border);
+        drawText(dc, chipLabels[i], chip, selected ? ui::text : ui::textDim,
+                 context_.captionFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
     const wchar_t* labels[3] = {
-        L"API 地址（baseURL，需带 /v1 或完整 /chat/completions）",
-        L"模型名称",
+        L"API 地址（baseURL）",
         L"API Key（保存在主密码保险库；留空表示不修改）",
+        L"模型（可先点「获取模型」再选）",
     };
     for (int i = 0; i < 3; ++i) {
         const int top = kFieldTop + i * kFieldGap;
         drawText(dc, labels[i], RECT{left, top, left + width, top + 20}, ui::textDim,
-                 context_.captionFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                 context_.captionFont,
+                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
-    drawText(dc, L"提示：API Key 只写入本机保险库，不会写进 ai.ini。",
-             RECT{left, kButtonTop + kButtonHeight + 12, left + width,
-                  kButtonTop + kButtonHeight + 40},
-             ui::textFaint, context_.captionFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-    auto button = [&](const RECT& rc, const wchar_t* text, std::uint32_t fill,
+    auto button = [&](const RECT& rc, const std::wstring& text, std::uint32_t fill,
                       std::uint32_t color) {
         HBRUSH brush = CreateSolidBrush(toColorRef(fill));
         FillRect(dc, &rc, brush);
         DeleteObject(brush);
-        drawText(dc, text, rc, color, context_.uiFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        drawText(dc, text, rc, color, context_.captionFont,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     };
+    button(impl_->fetchRect, impl_->fetching ? L"获取中…" : L"获取模型",
+           impl_->fetching ? ui::bgCard : ui::bgCard, ui::accent);
     button(impl_->saveRect, L"保存", ui::action, 0xFFFFFF);
     button(impl_->cancelRect, L"取消", ui::bgCard, ui::textDim);
+
+    // 状态/错误 + 使用说明
+    const std::wstring hint =
+        !impl_->fetchStatus.empty()
+            ? toWideText(impl_->fetchStatus)
+            : std::wstring(L"选服务商 → 填 API Key → 获取模型 → 保存");
+    drawText(dc, hint,
+             RECT{left, kButtonTop + kButtonHeight + 12, left + width,
+                  kButtonTop + kButtonHeight + 38},
+             impl_->fetchStatus.empty() ? ui::textFaint : ui::accent, context_.captionFont,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 }
 
 }  // namespace rshell::ai

@@ -7976,6 +7976,7 @@ ai::AiTab* ensureAiPanel(SessionState& state) {
     context.captionFont = g_app.tinyFont;
     context.onSettingsSaved = []() {};
     context.onToggleFullScreen = []() { setAiPanelFull(!g_app.aiFull); };
+    context.onClose = []() { toggleAiPanel(); };
 
     state.aiTab = ai::AiTab::create(g_app.main, std::move(context));
     if (state.aiTab) state.aiTab->setFullScreen(state.aiFull);

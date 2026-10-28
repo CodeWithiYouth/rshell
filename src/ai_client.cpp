@@ -273,19 +273,177 @@ Handle openSession(const ApiConfig& config) {    constexpr DWORD kAccessAutomati
     return handle;
 }
 
-std::string readAll(HINTERNET request) {    std::string out;
+std::string readAll(HINTERNET request) {
+    std::string out;
     char buffer[8192];
     for (;;) {
         DWORD got = 0;
         if (!WinHttpReadData(request, buffer, sizeof(buffer), &got)) break;
         if (got == 0) break;
         out.append(buffer, got);
-        if (out.size() > 256u * 1024u) break;  // 错误响应不会太大
+        if (out.size() > 1024u * 1024u) break;  // 模型列表比错误体重，给 1 MB
     }
     return out;
 }
 
+struct SimpleUrl {
+    std::wstring host;
+    std::wstring path;
+    int port = 443;
+    bool https = true;
+};
+
+// 只拆 host/port/path，不像 Client::parseUrl 那样补 /chat/completions
+bool parseHttpUrl(const std::string& text, SimpleUrl& out, std::string& error) {
+    std::string rest = trim(text);
+    if (rest.empty()) {
+        error = "地址为空";
+        return false;
+    }
+    if (startsWith(rest, "https://")) {
+        rest = rest.substr(8);
+        out.https = true;
+        out.port = 443;
+    } else if (startsWith(rest, "http://")) {
+        rest = rest.substr(7);
+        out.https = false;
+        out.port = 80;
+    } else {
+        out.https = true;
+        out.port = 443;
+    }
+
+    const std::size_t slash = rest.find('/');
+    std::string authority = slash == std::string::npos ? rest : rest.substr(0, slash);
+    std::string path = slash == std::string::npos ? "/" : rest.substr(slash);
+
+    if (!authority.empty() && authority.back() != ']') {
+        const std::size_t colon = authority.rfind(':');
+        if (colon != std::string::npos) {
+            const std::string port = authority.substr(colon + 1);
+            if (!port.empty() && std::all_of(port.begin(), port.end(),
+                                             [](unsigned char c) { return c >= '0' && c <= '9'; })) {
+                const int value = std::atoi(port.c_str());
+                if (value > 0 && value < 65536) {
+                    out.port = value;
+                    authority.erase(colon);
+                }
+            }
+        }
+    }
+    if (authority.empty()) {
+        error = "地址缺少主机名";
+        return false;
+    }
+    if (!out.https && !isLoopbackHost(authority)) {
+        error = "模型列表地址必须使用 HTTPS（本机地址除外）";
+        return false;
+    }
+    out.host = toWide(authority);
+    out.path = toWide(path.empty() ? "/" : path);
+    return true;
+}
+
 }  // namespace
+
+ModelCatalog listModels(const ApiConfig& config, const std::string& url) {
+    ModelCatalog result;
+    if (config.apiKey.empty()) {
+        result.error = "先填写 API Key";
+        return result;
+    }
+
+    SimpleUrl target;
+    std::string error;
+    if (!parseHttpUrl(url, target, error)) {
+        result.error = error;
+        return result;
+    }
+
+    try {
+        Handle session = openSession(config);
+        Handle connection(WinHttpConnect(session.get(), target.host.c_str(),
+                                         static_cast<INTERNET_PORT>(target.port), 0));
+        if (!connection) {
+            result.error = "连接失败：" + lastErrorText();
+            return result;
+        }
+        Handle request(WinHttpOpenRequest(connection.get(), L"GET", target.path.c_str(), nullptr,
+                                          WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                          target.https ? WINHTTP_FLAG_SECURE : 0));
+        if (!request) {
+            result.error = "创建请求失败：" + lastErrorText();
+            return result;
+        }
+
+        std::wstring headers = L"Accept: application/json\r\n";
+        headers += L"Authorization: Bearer " + toWide(config.apiKey) + L"\r\n";
+        if (!config.sessionId.empty())
+            headers += L"x-opencode-session: " + toWide(config.sessionId) + L"\r\n";
+        if (!WinHttpSendRequest(request.get(), headers.c_str(),
+                                static_cast<DWORD>(headers.size()), WINHTTP_NO_REQUEST_DATA, 0, 0,
+                                0)) {
+            result.error = "发送请求失败：" + lastErrorText();
+            return result;
+        }
+        if (!WinHttpReceiveResponse(request.get(), nullptr)) {
+            result.error = "读取响应失败：" + lastErrorText();
+            return result;
+        }
+
+        DWORD status = 0;
+        DWORD size = sizeof(status);
+        WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &size, WINHTTP_NO_HEADER_INDEX);
+        const std::string body = readAll(request.get());
+        if (status < 200 || status >= 300) {
+            result.error = "HTTP " + std::to_string(status) +
+                           (body.empty() ? std::string() : "：" + body.substr(0, 200));
+            return result;
+        }
+
+        Json root;
+        std::string parseError;
+        if (!Json::parse(body, root, &parseError)) {
+            result.error = "模型列表不是合法 JSON：" + parseError;
+            return result;
+        }
+        const Json* list = root.find("data");
+        if (!list) list = root.find("models");
+        if (!list || !list->isArray()) {
+            result.error = "模型列表格式不认识（缺少 data 数组）";
+            return result;
+        }
+
+        for (const Json& item : list->items()) {
+            if (!item.isObject()) continue;
+            const Json* id = item.find("id");
+            if (!id || !id->isString() || id->asString().empty()) continue;
+
+            // 有 supported_endpoints 的（Command Code）只保留支持 chat/completions 的，
+            // 否则选了 Claude 会在 /chat/completions 上直接 400
+            if (const Json* endpoints = item.find("supported_endpoints");
+                endpoints && endpoints->isArray()) {
+                bool supported = false;
+                for (const Json& entry : endpoints->items()) {
+                    if (entry.isString() &&
+                        entry.asString().find("chat/completions") != std::string::npos) {
+                        supported = true;
+                        break;
+                    }
+                }
+                if (!supported) continue;
+            }
+            result.ids.push_back(id->asString());
+        }
+        result.ok = true;
+        if (result.ids.empty()) result.error = "模型列表为空";
+        return result;
+    } catch (const std::exception& e) {
+        result.error = e.what();
+        return result;
+    }
+}
 
 Client::Client(ApiConfig config) : config_(std::move(config)) {}
 
@@ -434,6 +592,11 @@ ChatResult Client::chat(const std::vector<Message>& messages, const std::vector<
     headers += L"Accept: text/event-stream\r\n";
     headers += L"Accept-Encoding: identity\r\n";
     headers += L"Authorization: Bearer " + toWide(config_.apiKey) + L"\r\n";
+    // OpenCode Go 用这个头做路由和提示缓存；别的服务商不认识也无所谓，
+    // 所以只在调用方显式给了 sessionId 时才发
+    if (!config_.sessionId.empty()) {
+        headers += L"x-opencode-session: " + toWide(config_.sessionId) + L"\r\n";
+    }
 
     if (!WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(headers.size()),
                             const_cast<char*>(body.data()), static_cast<DWORD>(body.size()),

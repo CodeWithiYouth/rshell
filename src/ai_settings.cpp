@@ -29,8 +29,27 @@ int parseInt(const std::string& text, int fallback) {
 
 }  // namespace
 
-std::string aiConfigPath() {
-    const std::string override = envOrEmpty("RSHELL_AI_CONFIG");
+const std::vector<AiProviderPreset>& aiProviderPresets() {
+    // 地址与模型列表端点均按各家官方文档（2026-10 核对，均可匿名 GET /models）
+    static const std::vector<AiProviderPreset> presets = {
+        {"opencode-go", "OpenCode Go", "https://opencode.ai/inference/go/openai/v1",
+         "https://opencode.ai/inference/go/v1/models", true},
+        {"commandcode", "Command Code", "https://api.commandcode.ai/provider/v1",
+         "https://api.commandcode.ai/provider/v1/models", false},
+        {"cline", "Cline", "https://api.cline.bot/api/v1",
+         "https://api.cline.bot/api/v1/models", false},
+    };
+    return presets;
+}
+
+const AiProviderPreset* findAiProvider(const std::string& id) {
+    if (id.empty()) return nullptr;
+    for (const AiProviderPreset& preset : aiProviderPresets())
+        if (preset.id == id) return &preset;
+    return nullptr;
+}
+
+std::string aiConfigPath() {    const std::string override = envOrEmpty("RSHELL_AI_CONFIG");
     if (!override.empty()) return override;
     return homeDirectory() + kDefaultPathSuffix;
 }
@@ -53,7 +72,9 @@ AiSettings loadAiSettings(const std::string& path) {
         const std::string key = toLower(trim(text.substr(0, eq)));
         const std::string value = trim(text.substr(eq + 1));
 
-        if (key == "base_url" || key == "baseurl") {
+        if (key == "provider") {
+            settings.provider = value;
+        } else if (key == "base_url" || key == "baseurl") {
             if (!value.empty()) settings.baseUrl = value;
         } else if (key == "model") {
             if (!value.empty()) settings.model = value;
@@ -86,6 +107,7 @@ bool saveAiSettings(const AiSettings& settings, std::string* error, const std::s
 
     // 不写 API Key：它只存在保险库里
     out << "# rshell AI 配置（API Key 保存在主密码保险库，不在此文件）\n";
+    out << "provider=" << settings.provider << "\n";
     out << "base_url=" << settings.baseUrl << "\n";
     out << "model=" << settings.model << "\n";
     out << "redact_secrets=" << (settings.redactSecrets ? "1" : "0") << "\n";
@@ -95,6 +117,14 @@ bool saveAiSettings(const AiSettings& settings, std::string* error, const std::s
         return false;
     }
     return true;
+}
+
+std::string aiModelsUrl(const AiSettings& settings) {
+    if (const AiProviderPreset* preset = findAiProvider(settings.provider))
+        if (!preset->modelsUrl.empty()) return preset->modelsUrl;
+    std::string base = settings.baseUrl;
+    while (!base.empty() && base.back() == '/') base.pop_back();
+    return base + "/models";
 }
 
 bool loadApiKey(Vault& vault, std::string& out) {

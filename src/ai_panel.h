@@ -58,6 +58,7 @@ struct PanelActions {
     std::function<void()> onToggleFullScreen;
     // 空状态里的按钮（与标题栏「设置」分开：可能只是去解锁保险库）
     std::function<void()> onWelcome;
+    std::function<void()> onClose;
     // 审批结果：index 是 addApproval 返回的下标
     std::function<void(std::size_t index, bool allowed)> onApproval;
 };
@@ -122,7 +123,7 @@ public:
     void setInput(std::wstring text);
 
 private:
-    enum class Hit { None, Send, Cancel, Settings, Clear, Allow, Deny, Toggle, Host, Full, WelcomeSettings };
+    enum class Hit { None, Send, Cancel, Settings, Clear, Allow, Deny, Toggle, Host, Full, WelcomeSettings, Close };
 
     struct HitRect {
         RECT rect{};

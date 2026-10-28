@@ -8,10 +8,10 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 **Windows 10/11，64 位，按需下载：**
 
-- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.0/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
-- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.0/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.1/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.1/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
 
-两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.2.0 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.2.0)。
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.2.1 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.2.1)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -42,10 +42,11 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 1. 先连上一台主机（文件面板就绪）。
 2. 按 **Ctrl+J** 或菜单 →「AI 助手」打开面板。
-3. 点「设置」填写 API 地址、模型名称和 API Key。地址需要兼容 OpenAI 的 `/chat/completions`，例如：
+3. 点「设置」，选一个服务商预设（OpenCode Go / Command Code / Cline），地址会自动填好；填 API Key 后点「获取模型」，从列表里挑一个，保存即可。自定义服务商可以手填地址，或用底下这些常见地址：
    - OpenAI：`https://api.openai.com/v1`
    - DeepSeek：`https://api.deepseek.com/v1`
    - 本地 Ollama：`http://127.0.0.1:11434/v1`（仅本机允许明文 HTTP）
+   - OpenCode Go：`https://opencode.ai/inference/go/openai/v1`，模型填 `kimi-k3` / `deepseek-v4.1-flash` 这类不带前缀的 ID
 4. 直接提问，例如「磁盘怎么满了」「看看 nginx 为什么返回 502」。
 
 **权限模型：**

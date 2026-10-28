@@ -357,6 +357,27 @@ void panelScrollRegression() {
     check(!items.empty() && items.back().kind == ai::ItemKind::Reasoning, "reasoning item created");
     check(items.back().expanded, "reasoning is expanded by default");
 
+    // 输入法组字串：拼音必须看得见，光标要停在组字串内部而不是末尾
+    panel.focusInput();
+    panel.setInput(L"");
+    panel.paint(mem);
+    const int emptyCaret = panel.caretRect().left;
+    panel.setPreedit(L"nihao", 5);
+    check(panel.preedit() == L"nihao", "preedit string is stored");
+    panel.paint(mem);
+    const int composedCaret = panel.caretRect().left;
+    check(composedCaret > emptyCaret, "pinyin pushes the caret right so the composition is visible");
+    panel.setPreedit(L"nihao", 2);
+    panel.paint(mem);
+    check(panel.caretRect().left < composedCaret, "composition caret follows the pinyin cursor");
+    panel.setPreedit(L"nihao", 99);  // 越界的组字光标要夹回来
+    panel.paint(mem);
+    check(panel.caretRect().left == composedCaret, "out-of-range composition caret is clamped");
+    panel.clearPreedit();
+    check(panel.preedit().empty(), "committing the composition clears the preedit");
+    panel.paint(mem);
+    check(panel.caretRect().left == emptyCaret, "caret returns to the input after committing");
+
     SelectObject(mem, old);
     DeleteObject(bmp);
     DeleteDC(mem);

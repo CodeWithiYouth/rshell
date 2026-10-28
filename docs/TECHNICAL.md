@@ -547,6 +547,20 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
 - `Ctrl+J`
 - 菜单 →「AI 助手」（`IDM_AI_PANEL`）
 
+### 输入法与组字串
+
+输入框是 GDI 自绘的（没有 EDIT 控件帮忙），所以拼音的组字串也得自己画：
+
+- `WM_IME_COMPOSITION` 里取 `GCS_COMPSTR` + `GCS_CURSORPOS` 交给 `ChatPanel::setPreedit()`；
+  提交时取 `GCS_RESULTSTR` 逐字 `onChar()` 上屏，并清空组字串。
+- `WM_IME_SETCONTEXT` 去掉 `ISC_SHOWUICOMPOSITIONWINDOW`：否则输入法会另开一个组字窗口，
+  既压住输入框，又和自绘的拼音重叠。
+- 绘制时按「已输入前半 + 拼音（带下划线）+ 已输入后半」三段拼接；光标落在拼音内部
+  （回改拼音时在中间，`GCS_CURSORPOS` 给了位置），组字期间常亮不闪。
+  组字串参与水平滚动计算，长拼音不会被输入框右边缘截断。
+- 定位：`caretRect()` 同时喂给 `ImmSetCompositionWindow` 和 `ImmSetCandidateWindow`（`CFS_EXCLUDE`），
+  候选框贴着光标而不是屏幕左上角；组字串变化后先 `UpdateWindow` 再定位，否则拿到的是上一帧的位置。
+
 ### 线程模型
 
 界面线程只碰面板；AI 工作线程负责请求与工具调用；`RemoteFs` 的文件线程负责 libssh2。

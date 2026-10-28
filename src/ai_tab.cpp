@@ -1021,32 +1021,59 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
 
         case WM_IME_STARTCOMPOSITION:
             impl_->imeComposing = true;
+            panel_.clearPreedit();
             positionIme();
+            InvalidateRect(window_, nullptr, FALSE);
             return 0;
 
         case WM_IME_COMPOSITION: {
-            positionIme();
-            // 自绘窗口没有 EDIT 帮忙上屏：结果串必须自己取出来插入输入框
-            if (lParam & GCS_RESULTSTR) {
-                HIMC context = ImmGetContext(window_);
-                if (context) {
+            // 组字串自己画：自绘输入框没有 EDIT 代劳，只靠输入法的组字窗口时，
+            // 那些只开候选窗的输入法会让用户完全看不到已经打出来的拼音。
+            HIMC context = ImmGetContext(window_);
+            if (context) {
+                if (lParam & GCS_COMPSTR) {
+                    std::wstring text;
+                    const LONG bytes = ImmGetCompositionStringW(context, GCS_COMPSTR, nullptr, 0);
+                    if (bytes > 0) {
+                        text.resize(static_cast<std::size_t>(bytes) / sizeof(wchar_t));
+                        ImmGetCompositionStringW(context, GCS_COMPSTR, text.data(), bytes);
+                        while (!text.empty() && text.back() == L'\0') text.pop_back();
+                    }
+                    // GCS_CURSORPOS：低字是字符下标，只取低字
+                    const LONG caret =
+                        ImmGetCompositionStringW(context, GCS_CURSORPOS, nullptr, 0);
+                    panel_.setPreedit(std::move(text), static_cast<int>(caret & 0xFFFF));
+                }
+                // 结论串还是得自己取出来上屏
+                if (lParam & GCS_RESULTSTR) {
                     const LONG bytes =
                         ImmGetCompositionStringW(context, GCS_RESULTSTR, nullptr, 0);
                     if (bytes > 0) {
                         std::wstring text(static_cast<std::size_t>(bytes) / sizeof(wchar_t), L'\0');
                         ImmGetCompositionStringW(context, GCS_RESULTSTR, text.data(), bytes);
                         for (const wchar_t ch : text) panel_.onChar(ch);
-                        InvalidateRect(window_, nullptr, FALSE);
                     }
-                    ImmReleaseContext(window_, context);
+                    panel_.clearPreedit();
                 }
+                ImmReleaseContext(window_, context);
             }
+            InvalidateRect(window_, nullptr, FALSE);
+            // 先画一帧再定位：caretRect_ 是绘制时算出来的，否则还是上一帧的位置
+            UpdateWindow(window_);
+            positionIme();
             return 0;
         }
 
         case WM_IME_ENDCOMPOSITION:
             impl_->imeComposing = false;
+            panel_.clearPreedit();
+            InvalidateRect(window_, nullptr, FALSE);
             return 0;
+
+        case WM_IME_SETCONTEXT:
+            // 组字串自绘，让输入法别再开一个组字窗口压住输入框
+            lParam &= static_cast<LPARAM>(~ISC_SHOWUICOMPOSITIONWINDOW);
+            return DefWindowProcW(window_, message, wParam, lParam);
 
         case WM_IME_NOTIFY:
             // 候选窗刚打开时再钉一次位置，有的输入法在这一刻才读取位置

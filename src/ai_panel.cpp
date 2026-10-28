@@ -431,6 +431,18 @@ void ChatPanel::setInput(std::wstring text) {
     caret_ = input_.size();
 }
 
+void ChatPanel::setPreedit(std::wstring text, int caretPos) {
+    preedit_ = std::move(text);
+    const std::size_t limit = preedit_.size();
+    const int pos = caretPos < 0 ? 0 : caretPos;
+    preeditCaret_ = std::min<std::size_t>(static_cast<std::size_t>(pos), limit);
+}
+
+void ChatPanel::clearPreedit() {
+    preedit_.clear();
+    preeditCaret_ = 0;
+}
+
 // ---------------------------------------------------------------- 布局与绘制
 
 int ChatPanel::itemHeight(HDC dc, const ChatItem& item, int width) const {
@@ -660,14 +672,16 @@ void ChatPanel::drawComposer(HDC dc) {
     editRect.left += 10;
     editRect.right -= 10;
 
-    // 输入过长时向左滚动，保证光标可见
+    // 输入过长时向左滚动，保证光标（以及组字串）可见
     const std::wstring before = input_.substr(0, caret_);
     const int caretX = textWidth(dc, before, fonts_.ui);
+    const int preeditW = preedit_.empty() ? 0 : textWidth(dc, preedit_, fonts_.ui);
     const int avail = editRect.right - editRect.left - 2;
     int offset = 0;
-    if (caretX > avail) offset = caretX - avail;
+    if (caretX + preeditW > avail) offset = caretX + preeditW - avail;
 
-    if (input_.empty()) {
+    const std::uint32_t inkColor = inputEnabled_ ? text : textFaint;
+    if (input_.empty() && preedit_.empty()) {
         drawText(dc, inputEnabled_ ? L"描述你的问题，Enter 发送" : L"先连接一台主机",
                  editRect, textFaint, fonts_.ui, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
     } else {
@@ -675,17 +689,44 @@ void ChatPanel::drawComposer(HDC dc) {
         SelectClipRgn(dc, clip);
         RECT drawRect = editRect;
         drawRect.left -= offset;
-        drawText(dc, input_, drawRect, inputEnabled_ ? text : textFaint, fonts_.ui,
-                 DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        if (preedit_.empty()) {
+            drawText(dc, input_, drawRect, inkColor, fonts_.ui,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            // 三段拼起来：已输入前半 + 组字串（带下划线）+ 已输入后半。
+            // 单行框总是从同一条基线开始画，所以只用左边界平移即可。
+            int x = drawRect.left;
+            auto segment = [&](const std::wstring& text, bool underlined) {
+                if (text.empty()) return;
+                const int width = textWidth(dc, text, fonts_.ui);
+                RECT rc{x, editRect.top, x + width + dp(2), editRect.bottom};
+                drawText(dc, text, rc, inkColor, fonts_.ui,
+                         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+                if (underlined && width > 0) {
+                    // 下划线告诉用户这段还没上屏
+                    fillRect(dc, RECT{x, editRect.bottom - dp(5), x + width,
+                                      editRect.bottom - dp(5) + std::max(1, dp(1))},
+                             inkColor);
+                }
+                x += width;
+            };
+            segment(before, false);
+            segment(preedit_, true);
+            segment(input_.substr(caret_), false);
+        }
         SelectClipRgn(dc, nullptr);
         DeleteObject(clip);
     }
 
-    // 光标：空输入框时也要画，否则看起来像没聚焦；位置同时给输入法用
+    // 光标：空输入框时也要画，否则看起来像没聚焦；位置同时给输入法用。
+    // 组字期间光标落在拼音内部（回改拼音时会在中间），并且常亮不闪。
     {
-        const int x = editRect.left + caretX - offset;
+        const int inner = preedit_.empty()
+                              ? 0
+                              : textWidth(dc, preedit_.substr(0, preeditCaret_), fonts_.ui);
+        const int x = editRect.left + caretX + inner - offset;
         caretRect_ = RECT{x, editRect.top + 4, x + 1, editRect.bottom - 4};
-        if (inputFocused_ && (GetTickCount64() / 500) % 2 == 0)
+        if (inputFocused_ && (!preedit_.empty() || (GetTickCount64() / 500) % 2 == 0))
             fillRect(dc, caretRect_, text);
     }
 

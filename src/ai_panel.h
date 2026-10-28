@@ -115,6 +115,11 @@ public:
     void blurInput() { inputFocused_ = false; }
     bool inputFocused() const { return inputFocused_; }
     bool needsCaret() const { return inputFocused_; }
+    // 输入法组字串（拼音）。自绘输入框没有 EDIT 代画，必须自己画，
+    // 否则有些输入法只开候选窗、不开组字窗，用户就看不到已经打出来的拼音。
+    void setPreedit(std::wstring text, int caretPos);
+    void clearPreedit();
+    std::wstring preedit() const { return preedit_; }
     // 最近一次绘制时光标的客户区位置：输入法合成窗/候选窗要摆在这里
     RECT caretRect() const { return caretRect_; }
     // 供宿主/回归测试观察滚动状态
@@ -170,6 +175,8 @@ private:
     RECT caretRect_{};
     std::wstring input_;
     std::size_t caret_ = 0;
+    std::wstring preedit_;       // 输入法组字串，插在 caret_ 位置显示
+    std::size_t preeditCaret_ = 0;  // 组字串内部的光标（拼音回改时用）
     bool inputFocused_ = false;
     bool inputEnabled_ = true;
     bool busy_ = false;

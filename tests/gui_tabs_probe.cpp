@@ -264,7 +264,111 @@ void networkRegression(int port, const std::string& upload, const std::string& d
     waitUntil([&] { return pending.expired(); }, "closing a connecting tab releases its backend without touching active shell");
     check(g_app.shell->running(), "active connection survives closing a pending connection");
 }
+
+void panelScrollRegression() {
+    ai::ChatPanel panel;
+    ai::PanelFonts fonts;
+    fonts.ui = g_app.uiFont;
+    fonts.bold = g_app.uiFontBold;
+    fonts.mono = g_app.font;
+    fonts.caption = g_app.tinyFont;
+    panel.setFonts(fonts);
+    panel.setBounds(RECT{0, 0, 420, 300});
+
+    // 造出明显超过一屏的内容
+    for (int i = 0; i < 40; ++i) panel.addUser(L"第 " + std::to_wstring(i) + L" 条消息");
+
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 420, 300);
+    HGDIOBJ old = SelectObject(mem, bmp);
+
+    panel.paint(mem);
+    check(panel.stickToBottom() && panel.scrollOffset() == 0, "chat starts pinned to the bottom");
+
+    // 滚轮向上 = 看更早内容
+    panel.onMouseWheel(WHEEL_DELTA);
+    panel.paint(mem);
+    check(panel.scrollOffset() > 0, "wheel up scrolls towards older messages");
+    check(!panel.stickToBottom(), "scrolling up releases bottom lock");
+
+    // 滚轮向下回到底部后重新锁定
+    panel.onMouseWheel(-WHEEL_DELTA);
+    panel.paint(mem);
+    check(panel.scrollOffset() == 0, "wheel down returns to the bottom");
+    check(panel.stickToBottom(), "reaching the bottom re-locks");
+
+    // 滚上去之后新增内容不应该把视图拽回底部
+    panel.onMouseWheel(WHEEL_DELTA);
+    panel.paint(mem);
+    const int parked = panel.scrollOffset();
+    panel.addTool(L"读取 /etc/hosts", L"127.0.0.1 localhost", true, L"0.1 KB");
+    panel.paint(mem);
+    check(panel.scrollOffset() >= parked, "new content does not yank a scrolled-up view");
+
+    // 贴底状态下新增内容要跟随
+    panel.onMouseWheel(-WHEEL_DELTA);
+    panel.paint(mem);
+    panel.addTool(L"读取 /etc/os-release", L"NAME=Linux", true, L"0.2 KB");
+    panel.paint(mem);
+    check(panel.scrollOffset() == 0, "new content follows when pinned");
+
+    // 思考过程默认展开
+    panel.appendReasoning(L"先看磁盘，再看日志");
+    const auto& items = panel.items();
+    check(!items.empty() && items.back().kind == ai::ItemKind::Reasoning, "reasoning item created");
+    check(items.back().expanded, "reasoning is expanded by default");
+
+    SelectObject(mem, old);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
 }
+
+void aiTabRegression() {    auto visible = [](HWND window) {
+        return window != nullptr &&
+               (GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE) != 0;
+    };
+
+    toggleAiPanel();
+    ai::AiTab* docked = g_app.aiTab;
+    check(docked != nullptr, "AI dock panel is created");
+    check(g_app.aiOpen, "Ctrl+J opens the docked panel");
+    check(visible(docked->window()), "docked panel is visible");
+
+    RECT dockRect{}; GetWindowRect(docked->window(), &dockRect);
+    const int dockWidth = dockRect.right - dockRect.left;
+    check(dockWidth > 300 && dockWidth < 600, "docked panel keeps a bounded width");
+
+    setAiPanelFull(true);
+    check(g_app.aiFull, "full screen flag is set");
+    RECT fullRect{}; GetWindowRect(docked->window(), &fullRect);
+    check(fullRect.right - fullRect.left > dockWidth, "full screen is wider than docked");
+    setAiPanelFull(false);
+    check(!g_app.aiFull, "back to docked mode");
+
+    newSessionTab();
+    check(g_app.aiTab == nullptr, "a new session starts without an AI panel");
+    check(!visible(docked->window()), "inactive session's panel is hidden");
+
+    for (std::size_t i = 0; i < g_tabs.size(); ++i) {
+        if (g_tabs[i] && g_tabs[i]->aiTab == docked) {
+            switchSessionTab(i);
+            break;
+        }
+    }
+    check(g_app.aiTab == docked && visible(docked->window()),
+          "the panel comes back with its own session");
+
+    toggleAiPanel();
+    check(!g_app.aiOpen && !visible(docked->window()), "Ctrl+J hides the docked panel");
+    toggleAiPanel();
+    check(g_app.aiOpen && visible(docked->window()), "Ctrl+J reopens it");
+
+    closeSessionTab(g_activeTab);
+    check(g_app.aiTab == nullptr, "closing the session destroys its AI panel");
+}
+}  // namespace
 
 int main(int argc, char** argv) {
     if (argc == 3 && std::string(argv[1]) == "--history-commands") {
@@ -278,6 +382,8 @@ int main(int argc, char** argv) {
     }
     HWND window = nullptr;
     const auto settings=std::filesystem::temp_directory_path() / ("rshell-tabs-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+".ini");
+    const auto aiSettings=std::filesystem::temp_directory_path() / ("rshell-ai-"+std::to_string(GetCurrentProcessId())+".ini");
+    SetEnvironmentVariableW(L"RSHELL_AI_CONFIG", aiSettings.c_str());
     try {
         g_app.inst = GetModuleHandleW(nullptr); g_app.dpi = 96;
         auto runtime = std::make_shared<Libssh2Runtime>(); g_app.runtime = runtime;
@@ -289,6 +395,8 @@ int main(int argc, char** argv) {
             0,0,1120,720,nullptr,nullptr,g_app.inst,nullptr);
         check(window != nullptr,"create hidden GUI window");
         stateRegression();
+        panelScrollRegression();
+        aiTabRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);
         DestroyWindow(window); window = nullptr;
         stopGdiplus(); g_app.runtime.reset();

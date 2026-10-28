@@ -39,6 +39,8 @@
 #include <vector>
 
 #include "credential_store.h"
+#include "ai_panel.h"
+#include "ai_tab.h"
 #include "dnd_virtual_file.h"
 #include "protected_secret.h"
 #include "remote_fs.h"
@@ -47,6 +49,7 @@
 #include "ssh_session.h"
 #include "ssh_shell.h"
 #include "terminal.h"
+#include "ui_theme.h"
 #include "util.h"
 #include "vault.h"
 #include "win_compat.h"
@@ -105,6 +108,7 @@ enum : int {
     IDM_CLOSE_TAB,
     IDM_NEXT_TAB,
     IDM_PREV_TAB,
+    IDM_AI_PANEL,
     // 文件面板右键菜单（都在 popup::Item 里，走同一个 WM_COMMAND 分发）
     IDM_FS_UPLOAD = 2101,
     IDM_FS_MKDIR,
@@ -119,6 +123,9 @@ enum : int {
 
 struct SessionState {
     UINT_PTR tabId = 0;
+    bool aiOpen = false;   // 右侧 AI 面板是否展开
+    bool aiFull = false;   // 展开时是否全屏
+    ai::AiTab* aiTab = nullptr;  // 每个会话各有一份对话
     bool unread = false;
     enum class DownloadState { Active, Done, Failed, Cancelled };
     struct DownloadTask {
@@ -246,6 +253,7 @@ struct App : SessionState {
     // ---- 自绘布局状态 ----
     int titleH = 0;
     int statusH = 0;
+    int termHeaderH = 0;  // 终端上方的辅助条（搜索框 / 重连按钮），平时为 0
     int listTop = 0;
     int sidebarW = 0;
     int contentTop = 0;
@@ -406,6 +414,8 @@ void stepTerminalSearch(int direction);
 void hideStatusHint();
 void openMainMenu(HWND hwnd);
 void layoutMain(HWND hwnd);
+void toggleAiPanel();
+void setAiPanelFull(bool full);
 bool askHostKey(const std::string& host, const std::string& keyType,
                 const std::string& fingerprint, UINT_PTR connectionId = 0);
 void openSessionManager(bool startBlank = false);
@@ -740,44 +750,9 @@ bool ensureBackBuffer(HDC ref, int width, int height) {
     return true;
 }
 
-inline COLORREF toColorRef(std::uint32_t c) {
-    return RGB((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
-}
-
 // ---------------------------------------------------------------- 主题与绘制原语
-
-// 界面配色：深石板灰底色，亮蓝用于文字/焦点，深蓝实心按钮保证白字对比度。
-// 全部是编译期常量，换主题只动这里。
-namespace ui {
-using std::uint32_t;
-
-constexpr uint32_t bgApp = 0x0C121B;       // 窗口底色
-constexpr uint32_t bgPanel = 0x141E2B;     // 侧栏 / 标题栏
-constexpr uint32_t bgCard = 0x1E2C3E;      // 卡片 / 次级按钮
-constexpr uint32_t bgHover = 0x2B4059;     // 悬停
-constexpr uint32_t bgActive = 0x1E416B;    // 选中
-constexpr uint32_t border = 0x485E7B;      // 常规描边
-constexpr uint32_t borderSoft = 0x2C3D53;  // 弱描边
-constexpr uint32_t text = 0xF1F5FC;        // 主文字
-constexpr uint32_t textDim = 0xBDCADC;     // 次要文字
-constexpr uint32_t textFaint = 0x99ABC3;   // 提示文字
-constexpr uint32_t accent = 0x8AB8FF;      // 深色底上的强调文字 / 焦点
-constexpr uint32_t action = 0x2563EB;      // 实心主操作
-constexpr uint32_t actionHover = 0x2D6BEA; // 主操作悬停
-constexpr uint32_t actionPressed = 0x1D4ED8;
-constexpr uint32_t success = 0x61D5AC;
-constexpr uint32_t warn = 0xE5B76A;
-constexpr uint32_t danger = 0xF07888;
-
-// t=0 取 a，t=1 取 b
-inline uint32_t mix(uint32_t a, uint32_t b, double t) {
-    auto channel = [&](int shift) {
-        const double v = ((a >> shift) & 0xFF) * (1.0 - t) + ((b >> shift) & 0xFF) * t;
-        return static_cast<uint32_t>(v + 0.5) & 0xFF;
-    };
-    return (channel(16) << 16) | (channel(8) << 8) | channel(0);
-}
-}  // namespace ui
+//
+// 配色常量已抽到 ui_theme.h，GUI 与 AI 面板共用同一份。
 
 ULONG_PTR g_gdiplusToken = 0;
 bool g_gdiplusReady = false;
@@ -1699,6 +1674,12 @@ bool handleKeyDown(HWND hwnd, WPARAM key, bool alt) {
     if (ctrl && shift && !alt && key == 'R') {
         g_app.swallowChar = 0x12;
         PostMessageW(g_app.main, WM_COMMAND, IDM_RECONNECT, 0);
+        return true;
+    }
+    if (ctrl && !alt && key == 'J') {
+        // Ctrl+J：打开/切换到全局 AI 标签
+        g_app.swallowChar = 0x0A;
+        toggleAiPanel();
         return true;
     }
     if (g_app.searchOpen && !ctrl && !alt && (key == VK_F3 || key == VK_ESCAPE)) {
@@ -6495,6 +6476,43 @@ void layoutMain(HWND hwnd) {
     const int contentBottom = rc.bottom - statusH - panelH - pad;
     if (contentBottom - contentTop < dp(110)) return;
 
+    // AI 面板：停靠在内容区右侧，或全屏占据内容区
+    const int aiWidth = g_app.aiOpen && !g_app.aiFull
+                            ? std::clamp<int>(rc.right / 3, dp(360), dp(560))
+                            : 0;
+    RECT aiRect{};
+    if (g_app.aiOpen) {
+        if (g_app.aiFull) {
+            aiRect = RECT{pad, contentTop, rc.right - pad, rc.bottom};
+        } else {
+            aiRect = RECT{rc.right - pad - aiWidth, contentTop, rc.right - pad, contentBottom};
+        }
+    }
+    // 只显示当前会话的 AI 窗口，其余隐藏（每个会话各有一份对话）
+    for (auto& other : g_tabs) {
+        if (other && other->aiTab)
+            other->aiTab->show(false);
+    }
+    if (g_app.aiTab) {
+        g_app.aiTab->setBounds(aiRect);
+        g_app.aiTab->show(g_app.aiOpen);
+    }
+
+    if (g_app.aiFull) {
+        // 全屏模式：会话控件全部让位
+        if (g_app.list) ShowWindow(g_app.list, SW_HIDE);
+        if (g_app.term) ShowWindow(g_app.term, SW_HIDE);
+        if (g_app.fsPathEdit) ShowWindow(g_app.fsPathEdit, SW_HIDE);
+        if (g_app.searchEdit) ShowWindow(g_app.searchEdit, SW_HIDE);
+        if (g_app.status) ShowWindow(g_app.status, SW_HIDE);
+        return;
+    }
+
+    if (g_app.list) ShowWindow(g_app.list, SW_SHOW);
+    if (g_app.term) ShowWindow(g_app.term, SW_SHOW);
+    if (g_app.status) ShowWindow(g_app.status, SW_SHOW);
+    if (g_app.fsPathEdit) ShowWindow(g_app.fsPathEdit, SW_SHOW);
+
     // 侧栏：分组标题 + 文件列表 + 底部一个动作按钮（打开会话 / 断开）
     const int headerH = dp(76);
     const int listTop = contentTop + headerH;
@@ -6532,11 +6550,14 @@ void layoutMain(HWND hwnd) {
 
     if (g_app.term) {
         const int termX = pad * 2 + sidebarW;
-        const int termW = std::max(dp(120), static_cast<int>(rc.right) - termX - pad);
-        g_app.searchBox = RECT{termX + dp(4), contentTop, rc.right - pad - dp(170), contentTop + dp(28)};
-        g_app.searchPrev = RECT{rc.right - pad - dp(88), contentTop, rc.right - pad - dp(60), contentTop + dp(28)};
-        g_app.searchNext = RECT{rc.right - pad - dp(58), contentTop, rc.right - pad - dp(30), contentTop + dp(28)};
-        g_app.searchClose = RECT{rc.right - pad - dp(28), contentTop, rc.right - pad, contentTop + dp(28)};
+        // 停靠模式下右侧让给 AI 面板
+        const int termRight = (g_app.aiOpen && !g_app.aiFull) ? aiRect.left - dp(10)
+                                                              : rc.right - pad;
+        const int termW = std::max(dp(120), termRight - termX);
+        g_app.searchBox = RECT{termX + dp(4), contentTop, termRight - dp(170), contentTop + dp(28)};
+        g_app.searchPrev = RECT{termRight - dp(88), contentTop, termRight - dp(60), contentTop + dp(28)};
+        g_app.searchNext = RECT{termRight - dp(58), contentTop, termRight - dp(30), contentTop + dp(28)};
+        g_app.searchClose = RECT{termRight - dp(28), contentTop, termRight, contentTop + dp(28)};
         if (g_app.searchEdit) {
             const RECT& box = g_app.searchBox;
             const int editH = std::min<int>(box.bottom - box.top - dp(4), g_app.uiTextH);
@@ -6546,8 +6567,14 @@ void layoutMain(HWND hwnd) {
         }
         if (!g_app.searchOpen && !g_app.shell->running() && !g_app.connecting && selectedSession())
             g_app.buttons.push_back(App::UiButton{IDM_RECONNECT,
-                RECT{rc.right - pad - dp(108), contentTop, rc.right - pad, contentTop + dp(28)}, false, true});
-        const int termTop = contentTop + dp(38);
+                RECT{termRight - dp(108), contentTop, termRight, contentTop + dp(28)}, false, true});
+        // 终端上方的旧标题栏已删（标签栏已有会话名）；
+        // 只有搜索框或重连按钮需要时才留出这条辅助条
+        const bool needTermHeader =
+            g_app.searchOpen ||
+            (!g_app.shell->running() && !g_app.connecting && selectedSession());
+        g_app.termHeaderH = needTermHeader ? dp(38) : 0;
+        const int termTop = contentTop + g_app.termHeaderH;
         MoveWindow(g_app.term, termX, termTop, termW,
                    std::max(dp(80), contentBottom - termTop), TRUE);
     }
@@ -7481,7 +7508,7 @@ void paintMain(HWND hwnd) {
     paintSessionTabs(mem);
 
     const int pad = dp(14);
-    const int termX = pad * 2 + g_app.sidebarW;
+
     if (g_app.contentTop > 0) {
         fillRoundRect(mem, RECT{pad - dp(6), g_app.contentTop - dp(4),
                                pad + g_app.sidebarW + dp(6), g_app.contentBottom + dp(6)},
@@ -7494,17 +7521,9 @@ void paintMain(HWND hwnd) {
         drawText(mem, L"SFTP", protocol, ui::textDim, g_app.tinyFont,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
-        if (!g_app.searchOpen) {
-            drawText(mem, L">_", RECT{termX + dp(8), g_app.contentTop, termX + dp(32), g_app.contentTop + dp(28)},
-                     ui::accent, g_app.uiFontBold);
-            const std::wstring label = g_app.currentSession.empty() ? L"终端" : toWide(g_app.currentSession);
-            drawText(mem, label, RECT{termX + dp(40), g_app.contentTop, rc.right - pad - dp(116),
-                                     g_app.contentTop + dp(28)}, ui::text, g_app.uiFontBold,
-                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            drawText(mem, L"SSH / 终端", RECT{rc.right - pad - dp(108), g_app.contentTop,
-                                            rc.right - pad - dp(8), g_app.contentTop + dp(28)},
-                     ui::textFaint, g_app.tinyFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        } else {
+        // 终端上方的会话名标题栏已删除：标签栏已经显示会话名。
+        // 只有搜索框打开时才需要这条辅助条。
+        if (g_app.searchOpen) {
             fillRoundRect(mem, g_app.searchBox, dp(6), dlg::bgInput, ui::accent);
             const std::wstring count = g_app.searchMatches.empty() ? L"0 / 0" :
                 std::to_wstring(g_app.searchIndex + 1) + L" / " + std::to_wstring(g_app.searchMatches.size());
@@ -7694,6 +7713,7 @@ void openMainMenu(HWND hwnd) {
         connected ? L"" : L"Enter", connected || !busy, connected);
     add(IDM_NEW_TAB, L"新建标签", L"Ctrl+T");
     add(IDM_CLOSE_TAB, L"关闭当前标签", L"Ctrl+Shift+W");
+    add(IDM_AI_PANEL, L"AI 助手", L"Ctrl+J");
     sep();
     add(IDM_NEW, L"新建会话…", L"Ctrl+N");
     add(IDM_EDIT, L"编辑当前会话…", L"", !busy);
@@ -7926,9 +7946,72 @@ void newSessionTab() {
     switchSessionTab(g_tabs.size() - 1);
 }
 
+// ---------------------------------------------------------------- 会话内 AI 面板
+
+std::vector<ai::AiHostInfo> aiHostList() {
+    std::vector<ai::AiHostInfo> hosts;
+    auto add = [&hosts](SessionState& state) {
+        if (!state.shell->running() && !state.fs->ready()) return;
+        ai::AiHostInfo info;
+        info.label = state.currentSession.empty() ? L"未命名会话" : toWide(state.currentSession);
+        if (state.fs->ready()) info.backend = state.fs.get();
+        hosts.push_back(std::move(info));
+    };
+    for (auto& state : g_tabs)
+        if (state) add(*state);
+    add(static_cast<SessionState&>(g_app));
+    return hosts;
+}
+
+ai::AiTab* ensureAiPanel(SessionState& state) {
+    if (state.aiTab || !g_app.main) return state.aiTab;
+
+    ai::AiTabContext context;
+    context.hosts = aiHostList;
+    context.vault = &g_app.vault;
+    context.ensureVaultUnlocked = []() { return ensureVaultUnlocked(); };
+    context.uiFont = g_app.uiFont;
+    context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font;
+    context.captionFont = g_app.tinyFont;
+    context.onSettingsSaved = []() {};
+    context.onToggleFullScreen = []() { setAiPanelFull(!g_app.aiFull); };
+
+    state.aiTab = ai::AiTab::create(g_app.main, std::move(context));
+    if (state.aiTab) state.aiTab->setFullScreen(state.aiFull);
+    return state.aiTab;
+}
+
+void toggleAiPanel() {
+    if (g_app.aiOpen) {
+        g_app.aiOpen = false;
+        if (g_app.aiTab) g_app.aiTab->show(false);
+    } else {
+        if (!ensureAiPanel(g_app)) return;
+        g_app.aiOpen = true;
+        g_app.aiTab->show(true);
+        g_app.aiTab->focus();
+    }
+    layoutMain(g_app.main);
+    InvalidateRect(g_app.main, nullptr, TRUE);
+}
+
+void setAiPanelFull(bool full) {
+    if (!g_app.aiOpen) return;
+    g_app.aiFull = full;
+    if (g_app.aiTab) g_app.aiTab->setFullScreen(full);
+    layoutMain(g_app.main);
+    InvalidateRect(g_app.main, nullptr, TRUE);
+}
+
 void disposeSessionState(SessionState& state) {
     for (UINT_PTR timer = kCwdHookTimer1; timer <= kCwdHookTimer4; ++timer)
         KillTimer(g_app.main, state.tabId * 8 + timer);
+    if (state.aiTab) {
+        // 关掉会话 = 结束这路对话并停掉工作线程
+        ai::AiTab::destroy(state.aiTab);
+        state.aiTab = nullptr;
+    }
     state.connectionId = g_nextConnectionId++;
     for (auto& task : state.downloads) if (task.cancel) task.cancel->store(true);
     state.fs->stop();
@@ -8372,6 +8455,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             switch (id) {
                 case IDM_NEW_TAB: newSessionTab(); openSessionManager(); return 0;
+        case IDM_AI_PANEL: toggleAiPanel(); return 0;
                 case IDM_CLOSE_TAB: closeSessionTab(g_activeTab); return 0;
                 case IDM_NEXT_TAB: cycleSessionTab(1); return 0;
                 case IDM_PREV_TAB: cycleSessionTab(-1); return 0;
@@ -8797,6 +8881,32 @@ int runGui(HINSTANCE inst, int showCommand) {
         if (argv) {
             if (argc >= 3 && std::wstring(argv[1]) == L"--icons") {
                 const bool ok = renderIconSheet(argv[2]);
+                LocalFree(argv);
+                stopGdiplus();
+                return ok ? 0 : 2;
+            }
+            if (argc >= 3 && std::wstring(argv[1]) == L"--ai-paths") {
+                const int w = argc >= 4 ? _wtoi(argv[3]) : 460;
+                const int h = argc >= 5 ? _wtoi(argv[4]) : 780;
+                const bool ok = ai::renderPreview(argv[2], w > 0 ? w : 460, h > 0 ? h : 780, 2);
+                LocalFree(argv);
+                stopGdiplus();
+                return ok ? 0 : 2;
+            }
+            if (argc >= 3 && std::wstring(argv[1]) == L"--ai-welcome") {
+                const int w = argc >= 4 ? _wtoi(argv[3]) : 440;
+                const int h = argc >= 5 ? _wtoi(argv[4]) : 780;
+                const bool ok = ai::renderPreview(argv[2], w > 0 ? w : 440, h > 0 ? h : 780, 1);
+                LocalFree(argv);
+                stopGdiplus();
+                return ok ? 0 : 2;
+            }
+            if (argc >= 3 && std::wstring(argv[1]) == L"--ai-preview") {
+                // rshell-gui.exe --ai-preview <out.bmp> [宽] [高]
+                // 用与真实面板相同的绘制代码渲染一段演示对话，便于核对排版
+                const int w = argc >= 4 ? _wtoi(argv[3]) : 440;
+                const int h = argc >= 5 ? _wtoi(argv[4]) : 780;
+                const bool ok = ai::renderPreview(argv[2], w > 0 ? w : 440, h > 0 ? h : 780);
                 LocalFree(argv);
                 stopGdiplus();
                 return ok ? 0 : 2;

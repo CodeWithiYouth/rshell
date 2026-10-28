@@ -77,6 +77,10 @@ public:
     void rename(const std::string& from, const std::string& to);
     void chmod(const std::string& path, unsigned int mode);
 
+    // 以内存内容整体覆盖远端文件（不存在则创建）。给 AI 的 write_file 工具用，
+    // 不经过本地临时文件，也不做断点续传。
+    void writeFileContent(const std::string& path, const std::string& content);
+
     TransferResult upload(const std::string& localPath, const std::string& remotePath,
                           const TransferOptions& options = TransferOptions());
     TransferResult download(const std::string& remotePath, const std::string& localPath,

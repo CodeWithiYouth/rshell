@@ -659,10 +659,15 @@ void RemoteFs::runSample() {
 }
 
 bool RemoteFs::execCapture(const std::string& command, std::string& out, int timeoutMs,
-                           int* latencyMs) {
+                           int* latencyMs, int* exitCode, std::size_t maxOutputBytes,
+                           bool* truncated) {
     if (!session_) return false;
     LIBSSH2_SESSION* raw = session_->raw();
     if (!raw) return false;
+
+    if (exitCode) *exitCode = -1;
+    if (truncated) *truncated = false;
+    if (maxOutputBytes == 0) maxOutputBytes = static_cast<std::size_t>(-1);
 
     const auto started = std::chrono::steady_clock::now();
 
@@ -687,7 +692,18 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
         bool active = false;
         ssize_t n = libssh2_channel_read(channel, buf.data(), buf.size());
         while (n > 0) {
-            out.append(buf.data(), static_cast<std::size_t>(n));
+            // 超出上限的部分照样读掉（否则远端会卡在写满的管道上），只是不保留
+            const std::size_t chunk = static_cast<std::size_t>(n);
+            const std::size_t room =
+                out.size() < maxOutputBytes ? maxOutputBytes - out.size() : 0;
+            if (room == 0) {
+                if (truncated) *truncated = true;
+            } else if (chunk > room) {
+                out.append(buf.data(), room);
+                if (truncated) *truncated = true;
+            } else {
+                out.append(buf.data(), chunk);
+            }
             active = true;
             n = libssh2_channel_read(channel, buf.data(), buf.size());
         }
@@ -705,6 +721,12 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
         }
     }
 
+    if (exitCode) {
+        // 只有正常收到 EOF 时退出码才有意义；超时/中断保持 -1
+        if (ok && libssh2_channel_eof(channel) == 1)
+            *exitCode = libssh2_channel_get_exit_status(channel);
+    }
+
     if (latencyMs) {
         *latencyMs = static_cast<int>(
             std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
@@ -717,6 +739,219 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
     libssh2_channel_free(channel);
     libssh2_session_set_blocking(raw, 1);
     return ok;
+}
+
+// ---------------------------------------------------------------- AI 工具的同步接口
+//
+// 这几个方法会从 AI 工作线程调用，而 libssh2 会话只能由文件线程触碰，
+// 所以统一走 runSync。注意：runSync 超时返回后，排队的任务仍可能在文件线程里
+// 继续跑，因此结果缓冲区一律用 shared_ptr 持有，不能捕获栈上变量的引用。
+
+RemoteFs::ExecOutcome RemoteFs::execSync(const std::string& command, int timeoutMs,
+                                         std::size_t maxOutputBytes) {
+    ExecOutcome outcome;
+    if (!running_.load()) {
+        outcome.error = "远端连接尚未建立";
+        return outcome;
+    }
+
+    struct State {
+        std::string output;
+        int exitCode = -1;
+        bool truncated = false;
+        bool ok = false;
+        std::string error;
+    };
+    auto state = std::make_shared<State>();
+    const int waitMs = std::max(timeoutMs, 1000) + 5000;
+
+    const bool finished = runSync(
+        [this, state, command, timeoutMs, maxOutputBytes]() {
+            try {
+                state->ok = execCapture(command, state->output, timeoutMs, nullptr,
+                                        &state->exitCode, maxOutputBytes, &state->truncated);
+                if (!state->ok) state->error = "命令执行失败或超时";
+            } catch (const std::exception& ex) {
+                state->ok = false;
+                state->error = ex.what();
+            }
+        },
+        waitMs);
+
+    if (!finished) {
+        outcome.error = "等待远端响应超时";
+        return outcome;
+    }
+
+    outcome.ok = state->ok;
+    outcome.exitCode = state->exitCode;
+    outcome.output = std::move(state->output);
+    outcome.truncated = state->truncated;
+    outcome.error = std::move(state->error);
+    return outcome;
+}
+
+bool RemoteFs::readFileSync(const std::string& path, std::size_t maxBytes, std::string& out,
+                            bool& truncated, std::string& error) {
+    truncated = false;
+    error.clear();
+    if (!running_.load()) {
+        error = "远端连接尚未建立";
+        return false;
+    }
+    if (maxBytes == 0) maxBytes = static_cast<std::size_t>(-1);
+
+    struct State {
+        std::string data;
+        bool truncated = false;
+        bool ok = false;
+        std::string error;
+    };
+    auto state = std::make_shared<State>();
+
+    const bool finished = runSync(
+        [this, state, path, maxBytes]() {
+            if (!sftp_) {
+                state->error = "SFTP 尚未就绪";
+                return;
+            }
+            LIBSSH2_SFTP_HANDLE* handle = nullptr;
+            try {
+                std::uint64_t size = 0;
+                handle = sftp_->openReadHandle(path, size);
+                std::vector<char> buffer(32 * 1024);
+                for (;;) {
+                    if (state->data.size() >= maxBytes) {
+                        state->truncated = true;
+                        break;
+                    }
+                    const std::size_t got = sftp_->readHandle(handle, buffer.data(), buffer.size());
+                    if (got == 0) break;
+                    const std::size_t room = maxBytes - state->data.size();
+                    if (got > room) {
+                        state->data.append(buffer.data(), room);
+                        state->truncated = true;
+                        break;
+                    }
+                    state->data.append(buffer.data(), got);
+                }
+                sftp_->closeReadHandle(handle);
+                handle = nullptr;
+                state->ok = true;
+            } catch (const std::exception& ex) {
+                if (handle) sftp_->closeReadHandle(handle);
+                state->error = ex.what();
+            }
+        },
+        60000);
+
+    if (!finished) {
+        error = "等待远端响应超时";
+        return false;
+    }
+    if (!state->ok) {
+        error = state->error.empty() ? "读取失败" : state->error;
+        return false;
+    }
+    out = std::move(state->data);
+    truncated = state->truncated;
+    return true;
+}
+
+bool RemoteFs::writeFileSync(const std::string& path, const std::string& content,
+                             std::string& error) {
+    error.clear();
+    if (!running_.load()) {
+        error = "远端连接尚未建立";
+        return false;
+    }
+
+    struct State {
+        bool ok = false;
+        std::string error;
+    };
+    auto state = std::make_shared<State>();
+
+    const bool finished = runSync(
+        [this, state, path, content]() {
+            if (!sftp_) {
+                state->error = "SFTP 尚未就绪";
+                return;
+            }
+            try {
+                sftp_->writeFileContent(path, content);
+                state->ok = true;
+            } catch (const std::exception& ex) {
+                state->error = ex.what();
+            }
+        },
+        60000);
+
+    if (!finished) {
+        error = "等待远端响应超时";
+        return false;
+    }
+    if (!state->ok) {
+        error = state->error.empty() ? "写入失败" : state->error;
+        return false;
+    }
+    return true;
+}
+
+bool RemoteFs::listDirSync(const std::string& path, std::vector<RemoteEntry>& out,
+                           std::string& error) {
+    error.clear();
+    out.clear();
+    if (!running_.load()) {
+        error = "远端连接尚未建立";
+        return false;
+    }
+
+    struct State {
+        std::vector<RemoteEntry> entries;
+        bool ok = false;
+        std::string error;
+    };
+    auto state = std::make_shared<State>();
+
+    const bool finished = runSync(
+        [this, state, path]() {
+            if (!sftp_) {
+                state->error = "SFTP 尚未就绪";
+                return;
+            }
+            try {
+                for (const SftpEntry& item : sftp_->listDir(path)) {
+                    RemoteEntry entry;
+                    entry.name = item.name;
+                    entry.path = item.path.empty() ? remoteJoin(path, item.name) : item.path;
+                    entry.size = item.size;
+                    entry.mode = item.mode;
+                    entry.mtime = item.mtime;
+                    state->entries.push_back(std::move(entry));
+                }
+                std::sort(state->entries.begin(), state->entries.end(),
+                          [](const RemoteEntry& a, const RemoteEntry& b) {
+                              if (a.isDir() != b.isDir()) return a.isDir();
+                              return toLower(a.name) < toLower(b.name);
+                          });
+                state->ok = true;
+            } catch (const std::exception& ex) {
+                state->error = ex.what();
+            }
+        },
+        30000);
+
+    if (!finished) {
+        error = "等待远端响应超时";
+        return false;
+    }
+    if (!state->ok) {
+        error = state->error.empty() ? "列目录失败" : state->error;
+        return false;
+    }
+    out = std::move(state->entries);
+    return true;
 }
 
 }  // namespace rshell

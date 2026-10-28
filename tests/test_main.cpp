@@ -28,6 +28,11 @@
 #include "vault.h"
 #ifdef _WIN32
 #include <windows.h>
+#include "ai_agent.h"
+#include "ai_client.h"
+#include "ai_json.h"
+#include "ai_settings.h"
+#include "ai_tools.h"
 #include "dnd_virtual_file.h"
 #include "win_compat.h"
 #endif
@@ -1630,6 +1635,653 @@ void testTerminalSearch() {
     CHECK(limited.findAll(U"old").empty());
 }
 
+#ifdef _WIN32
+void testAiJson() {
+    using ai::Json;
+
+    Json value;
+    std::string error;
+    CHECK(Json::parse(R"({"a":1,"b":[true,null,"x"],"c":{"d":0.5}})", value, &error));
+    CHECK(error.empty());
+    CHECK(value.isObject());
+    CHECK_EQ(value.size(), static_cast<std::size_t>(3));
+
+    const Json* a = value.find("a");
+    CHECK(a != nullptr);
+    CHECK_EQ(a->asInt(), 1);
+    const Json* b = value.find("b");
+    CHECK(b != nullptr);
+    CHECK_EQ(b->items().size(), static_cast<std::size_t>(3));
+    CHECK(b->items()[0].asBool());
+    CHECK(b->items()[1].isNull());
+    CHECK_EQ(b->items()[2].asString(), std::string("x"));
+    CHECK(value.find("missing") == nullptr);
+
+    // 非法输入不能破坏已有值
+    Json keep = Json::string("keep");
+    CHECK(!Json::parse("{\"a\":", keep, &error));
+    CHECK(!error.empty());
+    CHECK_EQ(keep.asString(), std::string("keep"));
+    CHECK(!Json::parse("{,}", keep, &error));
+    CHECK(!Json::parse("{} trailing", keep, &error));
+
+    // 转义往返
+    const Json escaped = Json::string(std::string("a\"b\\c\n\t"));
+    CHECK_EQ(escaped.dump(), std::string("\"a\\\"b\\\\c\\n\\t\""));
+
+    // \u 代理对合成一个 UTF-8 码点
+    Json emoji;
+    CHECK(Json::parse("\"\\ud83d\\ude00\"", emoji));
+    CHECK_EQ(emoji.asString(), std::string("\xF0\x9F\x98\x80"));
+
+    // 构建：键顺序稳定，数字不带多余尾零
+    Json body = Json::object();
+    body["model"] = Json::string("gpt-4o-mini");
+    body["stream"] = Json::boolean(true);
+    body["temperature"] = Json::number(0.7);
+    body["tools"].push(Json::object());
+    CHECK_EQ(body.dump(),
+             std::string(R"({"model":"gpt-4o-mini","stream":true,"temperature":0.7,"tools":[{}]})"));
+
+    // 数值边界
+    Json number;
+    CHECK(Json::parse("-1.5e3", number));
+    CHECK_EQ(number.asInt(), -1500);
+}
+
+void testAiSse() {
+    using ai::SseDecoder;
+
+    std::vector<std::pair<std::string, std::string>> events;
+    SseDecoder decoder;
+    decoder.setHandler([&events](const std::string& event, const std::string& data) {
+        events.emplace_back(event, data);
+    });
+
+    const std::string stream =
+        "data: {\"a\":1}\r\n"
+        "\r\n"
+        ": keep-alive\r\n"
+        "\r\n"
+        "event: delta\r\n"
+        "data: line1\r\n"
+        "data: line2\r\n"
+        "\r\n"
+        "data: [DONE]\r\n"
+        "\r\n";
+
+    // 逐字节喂入：任何切分位置都必须还原出相同的事件
+    for (const char c : stream) decoder.feed(std::string_view(&c, 1));
+    decoder.finish();
+
+    CHECK_EQ(events.size(), static_cast<std::size_t>(3));
+    CHECK_EQ(events[0].second, std::string("{\"a\":1}"));
+    CHECK_EQ(events[1].first, std::string("delta"));
+    CHECK_EQ(events[1].second, std::string("line1\nline2"));
+    CHECK_EQ(events[2].second, std::string("[DONE]"));
+
+    // 服务端不发结束空行就断开：残留事件也要交出去
+    std::vector<std::string> tail;
+    SseDecoder abrupt;
+    abrupt.setHandler([&tail](const std::string&, const std::string& data) { tail.push_back(data); });
+    abrupt.feed("data: {\"x\":1}\n\n");
+    abrupt.feed("data: {\"y\":2}");
+    abrupt.finish();
+    CHECK_EQ(tail.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(tail[0], std::string("{\"x\":1}"));
+    CHECK_EQ(tail[1], std::string("{\"y\":2}"));
+
+    // 同一事件里的多个 data: 行按规范用换行拼接，中途断开也不会拆成两个事件
+    std::vector<std::string> merged;
+    SseDecoder multiline;
+    multiline.setHandler(
+        [&merged](const std::string&, const std::string& data) { merged.push_back(data); });
+    multiline.feed("data: {\"x\":1}\n");
+    multiline.feed("data: {\"y\":2}");
+    multiline.finish();
+    CHECK_EQ(merged.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(merged[0], std::string("{\"x\":1}\n{\"y\":2}"));
+}
+
+void testAiStreamAccumulator() {
+    std::string text;
+    std::string reasoning;
+    int deltas = 0;
+
+    ai::ChatStreamAccumulator::Callbacks callbacks;
+    callbacks.onText = [&text](const std::string& chunk) { text += chunk; };
+    callbacks.onReasoning = [&reasoning](const std::string& chunk) { reasoning += chunk; };
+    callbacks.onToolCallDelta = [&deltas](const std::string&, const std::string&) { ++deltas; };
+
+    ai::ChatStreamAccumulator accumulator(callbacks);
+    accumulator.handle("", R"({"choices":[{"index":0,"delta":{"reasoning_content":"想"}}]})");
+    accumulator.handle("", R"({"choices":[{"index":0,"delta":{"content":"你"}}]})");
+    accumulator.handle("", R"({"choices":[{"index":0,"delta":{"content":"好"}}]})");
+    // tool_calls 的 name 与 arguments 都分片到达，必须按 index 累积
+    accumulator.handle("", R"({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"run_command","arguments":"{\"cmd\":"}}]}}]})");
+    accumulator.handle("", R"({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls\"}"}}]},"finish_reason":"tool_calls"}]})");
+    accumulator.handle("", R"({"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","function":{"name":"read_file","arguments":"{}"}}]}}]})");
+    accumulator.handle("", R"({"usage":{"prompt_tokens":10,"completion_tokens":5},"choices":[]})");
+    accumulator.handle("", "[DONE]");
+    CHECK(accumulator.done());
+
+    const ai::ChatResult result = accumulator.take();
+    CHECK_EQ(result.content, std::string("你好"));
+    CHECK_EQ(result.reasoning, std::string("想"));
+    CHECK_EQ(result.finishReason, std::string("tool_calls"));
+    CHECK_EQ(result.promptTokens, 10);
+    CHECK_EQ(result.completionTokens, 5);
+    CHECK_EQ(result.toolCalls.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(result.toolCalls[0].id, std::string("call_1"));
+    CHECK_EQ(result.toolCalls[0].name, std::string("run_command"));
+    CHECK_EQ(result.toolCalls[0].arguments, std::string(R"({"cmd":"ls"})"));
+    CHECK_EQ(result.toolCalls[1].name, std::string("read_file"));
+    CHECK(deltas >= 2);
+    CHECK(!result.cancelled);
+
+    // 取走后状态清空，可以复用
+    const ai::ChatResult again = accumulator.take();
+    CHECK(again.toolCalls.empty());
+    CHECK(again.content.empty());
+
+    // 流内的 error 对象要能被捕获
+    ai::ChatStreamAccumulator failed;
+    failed.handle("", R"({"error":{"message":"invalid api key"}})");
+    CHECK_EQ(failed.take().error, std::string("invalid api key"));
+
+    // 坏块跳过，不影响后续内容
+    ai::ChatStreamAccumulator tolerant;
+    tolerant.handle("", "{not json");
+    tolerant.handle("", R"({"choices":[{"index":0,"delta":{"content":"ok"}}]})");
+    CHECK_EQ(tolerant.take().content, std::string("ok"));
+}
+
+// 假的工具后端：内存文件系统 + 命令回显
+class FakeToolBackend : public ai::ToolBackend {
+public:
+    std::map<std::string, std::string> files;
+    std::vector<std::string> commands;
+    std::string commandOutput = "ok";
+
+    CommandResult runCommand(const std::string& command, int) override {
+        commands.push_back(command);
+        CommandResult result;
+        result.exitCode = 0;
+        result.output = commandOutput;
+        return result;
+    }
+
+    bool readFile(const std::string& path, std::size_t, std::string& out, bool& truncated,
+                  std::string& error) override {
+        const auto it = files.find(path);
+        if (it == files.end()) {
+            error = "no such file: " + path;
+            return false;
+        }
+        out = it->second;
+        truncated = false;
+        return true;
+    }
+
+    bool writeFile(const std::string& path, const std::string& content,
+                   std::string& error) override {
+        (void)error;
+        files[path] = content;
+        return true;
+    }
+
+    bool listDir(const std::string& path, std::vector<ai::DirEntryView>& out,
+                 std::string& error) override {
+        (void)path;
+        (void)error;
+        for (int i = 0; i < 5; ++i) {
+            ai::DirEntryView entry;
+            entry.name = "file" + std::to_string(i);
+            entry.size = 100u * static_cast<std::uint64_t>(i);
+            out.push_back(entry);
+        }
+        return true;
+    }
+};
+
+// 脚本化的对话后端：按顺序吐出预设回复，并记录每次请求
+class FakeChatBackend : public ai::ChatBackend {
+public:
+    struct Reply {
+        std::string text;
+        std::vector<ai::ToolCall> calls;
+    };
+
+    std::vector<Reply> replies;
+    std::vector<std::vector<ai::Message>> requests;
+    std::vector<ai::ToolSpec> lastTools;
+    std::size_t next = 0;
+
+    ai::ChatResult chat(const std::vector<ai::Message>& messages,
+                        const std::vector<ai::ToolSpec>& tools,
+                        ai::ChatStreamAccumulator::Callbacks callbacks,
+                        const std::function<bool()>& shouldCancel) override {
+        requests.push_back(messages);
+        lastTools = tools;
+
+        ai::ChatResult result;
+        if (shouldCancel && shouldCancel()) {
+            result.cancelled = true;
+            return result;
+        }
+        if (next >= replies.size()) {
+            result.content = "（脚本已用尽）";
+            return result;
+        }
+        const Reply& reply = replies[next++];
+        if (!reply.text.empty() && callbacks.onText) callbacks.onText(reply.text);
+        result.content = reply.text;
+        result.toolCalls = reply.calls;
+        result.finishReason = reply.calls.empty() ? "stop" : "tool_calls";
+        return result;
+    }
+};
+
+ai::ToolCall fakeCall(const std::string& id, const std::string& name, const std::string& args) {
+    ai::ToolCall call;
+    call.id = id;
+    call.name = name;
+    call.arguments = args;
+    return call;
+}
+
+void testAiToolPolicy() {
+    const ai::ToolPolicy policy = ai::defaultToolPolicy();
+
+    // 读路径黑名单：家目录私钥、云凭据、系统敏感文件都要挡住
+    CHECK(ai::readPathDenied("~/.ssh/id_rsa", policy.deniedReadPaths));
+    CHECK(ai::readPathDenied("/home/alice/.ssh/id_ed25519", policy.deniedReadPaths));
+    CHECK(ai::readPathDenied("C:\\Users\\alice\\.ssh\\id_rsa", policy.deniedReadPaths));
+    CHECK(ai::readPathDenied("/etc/shadow", policy.deniedReadPaths));
+    CHECK(ai::readPathDenied("/home/alice/.aws/credentials", policy.deniedReadPaths));
+    CHECK(ai::readPathDenied("/root/.rshell/vault.dat", policy.deniedReadPaths));
+    CHECK(!ai::readPathDenied("/var/log/nginx/error.log", policy.deniedReadPaths));
+    CHECK(!ai::readPathDenied("/etc/nginx/nginx.conf", policy.deniedReadPaths));
+
+    // 凭据脱敏
+    std::string text =
+        "aws AKIAABCDEFGHIJKLMNOP done\n"
+        "key=sk-abcdefghijklmnopqrstuvwxyz\n"
+        "password=hunter2\n"
+        "token: abcdefgh\n"
+        "tokenizer=keepme\n"
+        "Authorization: Bearer abcdefghijklmnop\n"
+        "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U\n";
+    const std::size_t redacted = ai::redactSecrets(text);
+    CHECK(redacted >= 6);
+    CHECK(text.find("AKIAABCDEFGHIJKLMNOP") == std::string::npos);
+    CHECK(text.find("sk-abcdefghijklmnopqrstuvwxyz") == std::string::npos);
+    CHECK(text.find("hunter2") == std::string::npos);
+    CHECK(text.find("abcdefgh") == std::string::npos);
+    CHECK(text.find("Bearer abcdefghijklmnop") == std::string::npos);
+    CHECK(text.find("tokenizer=keepme") != std::string::npos);
+    CHECK(text.find("AKIA<redacted>") != std::string::npos);
+
+    // PEM 私钥整段替换
+    std::string pem =
+        "before\n-----BEGIN OPENSSH PRIVATE KEY-----\nAAAABBBBCCCC\n-----END OPENSSH PRIVATE KEY-----\nafter\n";
+    ai::redactSecrets(pem);
+    CHECK(pem.find("AAAABBBBCCCC") == std::string::npos);
+    CHECK(pem.find("before") != std::string::npos);
+    CHECK(pem.find("after") != std::string::npos);
+
+    // UTF-8 边界截断：不能把「中」劈成半个字符
+    bool truncated = false;
+    const std::string chinese = "中文测试";
+    const std::string cut = ai::truncateUtf8(chinese, 4, truncated);
+    CHECK(truncated);
+    CHECK_EQ(cut, std::string("中"));
+    truncated = false;
+    CHECK_EQ(ai::truncateUtf8("abc", 10, truncated), std::string("abc"));
+    CHECK(!truncated);
+}
+
+void testAiToolRegistry() {
+    FakeToolBackend backend;
+    backend.files["/tmp/a.txt"] = "hello";
+
+    ai::ToolPolicy policy = ai::defaultToolPolicy();
+    policy.maxOutputBytes = 32;
+    policy.maxEntries = 3;
+    ai::ToolRegistry registry(backend, policy);
+
+    const std::vector<ai::ToolSpec> specs = registry.specs();
+    CHECK_EQ(specs.size(), static_cast<std::size_t>(4));
+    CHECK(registry.kindOf("run_command") == ai::ToolKind::Write);
+    CHECK(registry.kindOf("write_file") == ai::ToolKind::Write);
+    CHECK(registry.kindOf("read_file") == ai::ToolKind::Read);
+    CHECK(registry.kindOf("list_dir") == ai::ToolKind::Read);
+    CHECK(registry.known("read_file"));
+    CHECK(!registry.known("rm_rf"));
+
+    // 审批卡片摘要
+    const ai::ToolRequestInfo info =
+        registry.describe("run_command", R"({"command":"systemctl status nginx"})");
+    CHECK(info.valid);
+    CHECK(info.kind == ai::ToolKind::Write);
+    CHECK(info.summary.find("systemctl status nginx") != std::string::npos);
+    CHECK(!info.dangerous);
+
+    const ai::ToolRequestInfo danger =
+        registry.describe("run_command", R"({"command":"rm -rf /tmp"})");
+    CHECK(danger.dangerous);
+
+    const ai::ToolRequestInfo bad = registry.describe("run_command", "{oops");
+    CHECK(!bad.valid);
+    CHECK(!bad.problem.empty());
+
+    // 读：黑名单直接拒绝，且不碰后端
+    const ai::ToolResult denied = registry.execute("read_file", R"({"path":"~/.ssh/id_rsa"})");
+    CHECK(!denied.ok);
+    CHECK(denied.denied);
+    CHECK(denied.json.find("安全策略") != std::string::npos);
+
+    // 读：正常文件
+    const ai::ToolResult read = registry.execute("read_file", R"({"path":"/tmp/a.txt"})");
+    CHECK(read.ok);
+    CHECK(read.json.find("hello") != std::string::npos);
+
+    // 读：不存在
+    const ai::ToolResult missing = registry.execute("read_file", R"({"path":"/tmp/none"})");
+    CHECK(!missing.ok);
+    CHECK(missing.json.find("no such file") != std::string::npos);
+
+    // 写：落到后端
+    const ai::ToolResult wrote =
+        registry.execute("write_file", R"({"path":"/tmp/b.txt","content":"hi there"})");
+    CHECK(wrote.ok);
+    CHECK_EQ(backend.files["/tmp/b.txt"], std::string("hi there"));
+    CHECK(wrote.json.find("bytes_written") != std::string::npos);
+
+    // 列目录：超过上限截断
+    const ai::ToolResult listed = registry.execute("list_dir", R"({"path":"/tmp"})");
+    CHECK(listed.ok);
+    CHECK(listed.truncated);
+    CHECK(listed.json.find("file4") == std::string::npos);
+
+    // 命令：输出截断 + 凭据脱敏
+    backend.commandOutput = std::string(200, 'x') + " AKIAABCDEFGHIJKLMNOP";
+    const ai::ToolResult ran =
+        registry.execute("run_command", R"({"command":"cat /tmp/big"})");
+    CHECK(ran.ok);
+    CHECK(ran.truncated);
+    CHECK(ran.json.size() < 400);
+    CHECK(ran.json.find("AKIAABCDEFGHIJKLMNOP") == std::string::npos);
+    CHECK_EQ(backend.commands.size(), static_cast<std::size_t>(1));
+}
+
+void testAiAgentReadsWithoutApproval() {
+    FakeToolBackend backend;
+    backend.files["/tmp/a.txt"] = "hello";
+    ai::ToolRegistry registry(backend);
+    FakeChatBackend chat;
+
+    chat.replies.push_back({"先看一下文件", {fakeCall("call_1", "read_file", R"({"path":"/tmp/a.txt"})")}});
+    chat.replies.push_back({"文件内容是 hello", {}});
+
+    ai::Agent agent(chat, registry);
+    int approvals = 0;
+    agent.setApproval([&approvals](const ai::ApprovalRequest&) {
+        ++approvals;
+        return ai::ApprovalDecision::Allow;
+    });
+
+    agent.addUserMessage("看看 /tmp/a.txt");
+    const ai::AgentTurn turn = agent.run();
+
+    CHECK(turn.finished);
+    CHECK_EQ(turn.content, std::string("文件内容是 hello"));
+    CHECK_EQ(turn.steps, 2);
+    CHECK_EQ(approvals, 0);  // 读操作不审批
+    CHECK_EQ(turn.tools.size(), static_cast<std::size_t>(1));
+    CHECK(turn.tools[0].ok);
+    CHECK(!turn.tools[0].requiredApproval);
+
+    // 请求里带了 system 与全部工具描述
+    CHECK_EQ(chat.requests.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(chat.lastTools.size(), static_cast<std::size_t>(4));
+    CHECK(chat.requests[0][0].role == ai::Message::Role::System);
+    CHECK(chat.requests[0][1].role == ai::Message::Role::User);
+
+    // 第二轮请求里必须有 role=tool 的回复，否则 OpenAI 会 400
+    bool sawToolReply = false;
+    for (const ai::Message& message : chat.requests[1]) {
+        if (message.role == ai::Message::Role::Tool) {
+            sawToolReply = true;
+            CHECK_EQ(message.toolCallId, std::string("call_1"));
+            CHECK(message.content.find("hello") != std::string::npos);
+        }
+    }
+    CHECK(sawToolReply);
+
+    // 历史：user + assistant(tool_calls) + tool + assistant(final)
+    CHECK_EQ(agent.history().size(), static_cast<std::size_t>(4));
+}
+
+void testAiAgentWriteNeedsApproval() {
+    FakeToolBackend backend;
+    ai::ToolRegistry registry(backend);
+    FakeChatBackend chat;
+
+    chat.replies.push_back({"我来写入", {fakeCall("call_1", "write_file",
+                                              R"({"path":"/tmp/x.txt","content":"data"})")}});
+    chat.replies.push_back({"用户拒绝了写入", {}});
+
+    ai::Agent agent(chat, registry);
+    int approvals = 0;
+    bool sawDangerous = true;
+    agent.setApproval([&](const ai::ApprovalRequest& request) {
+        ++approvals;
+        sawDangerous = request.dangerous;
+        CHECK(request.mutating);
+        CHECK_EQ(request.toolName, std::string("write_file"));
+        CHECK(request.detail.find("data") != std::string::npos);
+        return ai::ApprovalDecision::Deny;
+    });
+
+    agent.addUserMessage("写一个文件");
+    const ai::AgentTurn turn = agent.run();
+
+    CHECK_EQ(approvals, 1);
+    CHECK(!sawDangerous);
+    CHECK(turn.finished);
+    CHECK_EQ(turn.tools.size(), static_cast<std::size_t>(1));
+    CHECK(turn.tools[0].denied);
+    CHECK(!turn.tools[0].executed);
+    CHECK(backend.files.find("/tmp/x.txt") == backend.files.end());  // 拒绝后没写
+
+    // 拒绝理由必须回灌给模型
+    bool sawDenial = false;
+    for (const ai::Message& message : chat.requests[1]) {
+        if (message.role == ai::Message::Role::Tool &&
+            message.content.find("用户拒绝") != std::string::npos)
+            sawDenial = true;
+    }
+    CHECK(sawDenial);
+}
+
+void testAiAgentAbortAndDefaults() {
+    {
+        FakeToolBackend backend;
+        ai::ToolRegistry registry(backend);
+        FakeChatBackend chat;
+        chat.replies.push_back({"执行命令", {fakeCall("call_1", "run_command",
+                                                  R"({"command":"systemctl restart nginx"})")}});
+        chat.replies.push_back({"不该走到这里", {}});
+
+        ai::Agent agent(chat, registry);
+        agent.setApproval([](const ai::ApprovalRequest&) { return ai::ApprovalDecision::Abort; });
+        agent.addUserMessage("重启 nginx");
+        const ai::AgentTurn turn = agent.run();
+
+        CHECK(turn.aborted);
+        CHECK(!turn.finished);
+        CHECK_EQ(turn.steps, 1);
+        CHECK(backend.commands.empty());  // 终止后绝不执行
+        CHECK_EQ(chat.requests.size(), static_cast<std::size_t>(1));
+    }
+
+    {
+        // 没有审批回调时必须默认拒绝，不能擅自执行写操作
+        FakeToolBackend backend;
+        ai::ToolRegistry registry(backend);
+        FakeChatBackend chat;
+        chat.replies.push_back({"删除", {fakeCall("call_1", "run_command",
+                                                R"({"command":"rm -rf /tmp/x"})")}});
+        chat.replies.push_back({"好的，已取消", {}});
+
+        ai::Agent agent(chat, registry);
+        agent.addUserMessage("删掉临时目录");
+        const ai::AgentTurn turn = agent.run();
+
+        CHECK(turn.finished);
+        CHECK(backend.commands.empty());
+        CHECK(turn.tools[0].denied);
+        CHECK(turn.tools[0].decision == ai::ApprovalDecision::Deny);
+    }
+
+    {
+        // 步数上限
+        FakeToolBackend backend;
+        ai::ToolRegistry registry(backend);
+        FakeChatBackend chat;
+        for (int i = 0; i < 6; ++i) {
+            chat.replies.push_back({"继续", {fakeCall("call_" + std::to_string(i), "list_dir",
+                                                    R"({"path":"/tmp"})")}});
+        }
+
+        ai::AgentConfig config;
+        config.maxSteps = 2;
+        ai::Agent agent(chat, registry, config);
+        agent.addUserMessage("一直列目录");
+        const ai::AgentTurn turn = agent.run();
+
+        CHECK(turn.stepLimit);
+        CHECK(!turn.finished);
+        CHECK_EQ(turn.steps, 2);
+    }
+}
+
+void testAiAgentHistoryTrim() {
+    FakeToolBackend backend;
+    ai::ToolRegistry registry(backend);
+
+    const std::size_t base = ai::defaultSystemPrompt().size();
+    const std::string first(300, 'a');
+    const std::string second(300, 'b');
+
+    {
+        // 预算只够 system + 最后一条用户消息：第一轮必须被丢掉
+        FakeChatBackend chat;
+        chat.replies.push_back({"第一次", {}});
+        chat.replies.push_back({"第二次", {}});
+
+        ai::AgentConfig config;
+        config.historyBytes = base + 400;
+        ai::Agent agent(chat, registry, config);
+
+        agent.addUserMessage(first);
+        agent.run();
+        agent.addUserMessage(second);
+        const ai::AgentTurn turn = agent.run();
+
+        CHECK(turn.finished);
+        CHECK_EQ(turn.content, std::string("第二次"));
+        const std::vector<ai::Message>& request = chat.requests.back();
+        CHECK_EQ(request.size(), static_cast<std::size_t>(2));
+        CHECK(request[0].role == ai::Message::Role::System);
+        CHECK_EQ(request[1].content, second);
+    }
+
+    {
+        // 预算充足时不裁：system + 第一轮(user/assistant) + 当前 user
+        FakeChatBackend chat;
+        chat.replies.push_back({"第一次", {}});
+        chat.replies.push_back({"第二次", {}});
+
+        ai::AgentConfig config;
+        config.historyBytes = base + 4000;
+        ai::Agent agent(chat, registry, config);
+
+        agent.addUserMessage(first);
+        agent.run();
+        agent.addUserMessage(second);
+        agent.run();
+
+        const std::vector<ai::Message>& request = chat.requests.back();
+        CHECK_EQ(request.size(), static_cast<std::size_t>(4));
+        CHECK(request[0].role == ai::Message::Role::System);
+        CHECK_EQ(request[1].content, first);
+        CHECK(request[2].role == ai::Message::Role::Assistant);
+        CHECK_EQ(request[3].content, second);
+    }
+}
+
+void testAiSettings() {
+    const fs::path dir =
+        fs::temp_directory_path() / ("rshell-ai-settings-" + std::to_string(::GetCurrentProcessId()));
+    const fs::path file = dir / "nested" / "ai.ini";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+
+    // 文件不存在：全部用默认值，不抛异常
+    const ai::AiSettings defaults = ai::loadAiSettings(file.string());
+    CHECK_EQ(defaults.baseUrl, std::string("https://api.openai.com/v1"));
+    CHECK(!defaults.model.empty());
+    CHECK(defaults.redactSecrets);
+    CHECK_EQ(defaults.maxSteps, 16);
+
+    // 写入会顺带建目录
+    ai::AiSettings settings;
+    settings.baseUrl = "https://api.deepseek.com/v1";
+    settings.model = "deepseek-chat";
+    settings.redactSecrets = false;
+    settings.maxSteps = 8;
+    std::string error;
+    CHECK(ai::saveAiSettings(settings, &error, file.string()));
+    CHECK(error.empty());
+    CHECK(fs::exists(file));
+
+    // 关键：API Key 不能出现在配置文件里
+    {
+        std::ifstream in(file, std::ios::binary);
+        std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        CHECK(content.find("api_key") == std::string::npos);
+        CHECK(content.find("sk-") == std::string::npos);
+        CHECK(content.find("deepseek-chat") != std::string::npos);
+    }
+
+    const ai::AiSettings loaded = ai::loadAiSettings(file.string());
+    CHECK_EQ(loaded.baseUrl, std::string("https://api.deepseek.com/v1"));
+    CHECK_EQ(loaded.model, std::string("deepseek-chat"));
+    CHECK(!loaded.redactSecrets);
+    CHECK_EQ(loaded.maxSteps, 8);
+
+    // 手工写的配置：注释、CRLF、未知键、非法数字都要能容忍
+    {
+        std::ofstream out(file, std::ios::binary | std::ios::trunc);
+        out << "# comment\r\n";
+        out << "; another\r\n";
+        out << "  MODEL = gpt-4o-mini  \r\n";
+        out << "max_steps=abc\r\n";
+        out << "unknown_key=whatever\r\n";
+        out << "base_url=http://127.0.0.1:11434/v1\r\n";
+    }
+    const ai::AiSettings manual = ai::loadAiSettings(file.string());
+    CHECK_EQ(manual.model, std::string("gpt-4o-mini"));
+    CHECK_EQ(manual.baseUrl, std::string("http://127.0.0.1:11434/v1"));
+    CHECK_EQ(manual.maxSteps, 16);  // 非法值回退默认
+    CHECK(manual.redactSecrets);    // 缺失字段保持默认
+
+    fs::remove_all(dir, ec);
+}
+#endif  // _WIN32
+
 }  // namespace
 
 int main() {
@@ -1660,6 +2312,16 @@ int main() {
 #ifdef _WIN32
     testWindowsCompatibility();
     testVirtualFileDrag();
+    testAiJson();
+    testAiSse();
+    testAiStreamAccumulator();
+    testAiToolPolicy();
+    testAiToolRegistry();
+    testAiAgentReadsWithoutApproval();
+    testAiAgentWriteNeedsApproval();
+    testAiAgentAbortAndDefaults();
+    testAiAgentHistoryTrim();
+    testAiSettings();
 #endif
 
     std::cout << (g_failed == 0 ? "PASS" : "FAIL") << ": " << (g_checks - g_failed) << "/"

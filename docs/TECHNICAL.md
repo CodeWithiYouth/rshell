@@ -519,6 +519,82 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
   `dash` 之类的纯 POSIX shell 没有提示符钩子；跟随期间目录如果进不去（权限、已删除），
   面板只在列表区域和状态栏提示原因，不弹模态框打断输入。
 
+## AI 助手
+
+桌面版独有的功能（`rshell.exe` 不包含，CLI 体积保持 0 增量）。设计目标是"能真正动手，但每一步都可控"。
+
+### 分层
+
+| 模块 | 职责 |
+| --- | --- |
+| `ai_json` | 极简 JSON 解析 / 序列化，不引入第三方库 |
+| `ai_client` | WinHTTP + SSE 流式解析，OpenAI 兼容协议 |
+| `ai_tools` | 工具定义、读写分级、路径黑名单、凭据脱敏、输出截断 |
+| `ai_agent` | 对话循环、工具调用、历史裁剪、审批状态机 |
+| `ai_ssh_backend` | 把 `RemoteFs` 适配成工具后端 |
+| `ai_panel` | GDI 自绘面板（消息、审批卡、输入框、滚动） |
+| `ai_tab` | 会话内的停靠/全屏窗口、工作线程、审批桥接、设置视图 |
+| `ai_settings` | `~/.rshell/ai.ini` + 保险库条目 `ai.apiKey` |
+
+### 线程模型
+
+界面线程只碰面板；AI 工作线程负责请求与工具调用；`RemoteFs` 的文件线程负责 libssh2。
+审批时工作线程阻塞在条件变量上，界面点「允许/拒绝」后唤醒——不会阻塞终端，也不会并发压两条 SSH 会话。
+
+### 网络
+
+- 只用系统 `winhttp.dll`，TLS 由 SChannel 提供，不打包 OpenSSL/curl
+- Win7 回退：`AUTOMATIC_PROXY` 失败退 `DEFAULT_PROXY`；TLS 1.3 标志被拒时退 TLS 1.2
+- 请求头固定 `Accept-Encoding: identity`（`WINHTTP_OPTION_DECOMPRESSION` 需要 Win8.1+）
+- 明文 HTTP 只允许本机地址（Ollama / vLLM）
+- Win7 仍需系统已启用 TLS 1.2 并更新根证书，否则会在握手阶段失败
+
+### 工具与上限
+
+| 工具 | 分级 | 上限 |
+| --- | --- | --- |
+| `run_command` | 写，必审 | 超时 5~300 秒；缓冲 256 KB，回灌 32 KB |
+| `write_file` | 写，必审 | 单次 256 KB，整文件覆盖，权限 0644 |
+| `read_file` | 读，免审 | 96 KB，超限标记截断 |
+| `list_dir` | 读，免审 | 200 项 |
+
+命令走独立 exec 通道：没有 PTY，`cd` 不跨调用保留；超时只关闭通道，不给远端进程发信号。
+
+### 安全
+
+- 读路径黑名单：`~/.ssh/id_*`、`*.pem`、`~/.aws/credentials`、`~/.kube/config`、`~/.netrc`、`~/.git-credentials`、`/etc/shadow`、`~/.rshell/*` 等
+- 回灌模型前做凭据脱敏：PEM 私钥块、`AKIA…`、`sk-…`、`ghp_…`、JWT、`password=`、`Authorization: Bearer …`
+- 请求体固定 `parallel_tool_calls: false`，一次只可能有一张审批卡
+- 没有注册审批回调时，写操作默认拒绝（安全默认，不是放行）
+- 被拒绝的调用会作为工具结果回灌给模型，让它换方案；「终止任务」会中断整轮
+
+### 配置
+
+```ini
+# ~/.rshell/ai.ini（可用 RSHELL_AI_CONFIG 覆盖路径）
+base_url=https://api.openai.com/v1
+model=gpt-4o-mini
+redact_secrets=1
+max_steps=16
+```
+
+API Key 只存在保险库条目 `ai.apiKey`，配置文件里不出现明文；每次启动需解锁保险库。
+
+### 体积
+
+`rshell.exe` 不变（AI 代码只编进 GUI 目标）；`rshell-gui.exe` 增加约 300 KB。
+
+### 回归
+
+```powershell
+.\build.ps1 -Test                                  # 单元测试 + GUI 状态回归
+python tests/sftp_test_server.py --root build_tmp/airoot --port 2299 --user tester --password testpass
+build\modern\rshell_ai_probe.exe 127.0.0.1 2299 tester testpass   # 真实 SSH/SFTP 工具链
+rshell-gui.exe --ai-preview out.bmp    # 离屏渲染演示对话
+rshell-gui.exe --ai-paths out.bmp      # 长路径压力测试
+rshell-gui.exe --ai-welcome out.bmp    # 空状态
+```
+
 ## 命令行速览
 
 ```powershell

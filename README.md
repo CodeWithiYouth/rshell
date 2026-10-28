@@ -1,6 +1,6 @@
 # rshell
 
-rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远程主机后，可以在终端执行命令、用 SFTP 浏览和传输文件。
+rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远程主机后，可以在终端执行命令、用 SFTP 浏览和传输文件；桌面版还内置了可以执行运维操作的 AI 助手。
 
 它不需要注册账号，也不依赖浏览器或额外的图形界面运行库。SSH 账号、私钥和本机保存的密码均由你在本机管理。
 
@@ -8,10 +8,10 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 **Windows 10/11，64 位，按需下载：**
 
-- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.1.2/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
-- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.1.2/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.0/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.0/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
 
-两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.1.2 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.1.2)。
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.2.0 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.2.0)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -32,8 +32,29 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 - **远端路径：** 点 SFTP 面板顶部的路径框，输入路径并回车；Ctrl+L 也可打开路径输入。
 - **搜索终端输出：** Ctrl+Shift+F，然后按 Enter / Shift+Enter 浏览匹配项。
 - **断线重连：** Ctrl+Shift+R。
+- **AI 助手：** Ctrl+J 或菜单 →「AI 助手」，在当前会话右侧展开；面板内可切换到全屏。
 - **终端字号：** Ctrl++ 放大、Ctrl+- 缩小、Ctrl+0 重置。
 - **复制与粘贴：** 选中终端文本自动复制；Ctrl+V 粘贴。没有选中文本时，Ctrl+C 会向远端发送中断信号。
+
+## AI 助手
+
+桌面版内置了 AI 助手（命令行版不包含），可以让你用自然语言排查服务器问题。它连接的是**当前会话的主机**，走左侧文件面板那条独立 SSH 连接，不会打断终端。
+
+1. 先连上一台主机（文件面板就绪）。
+2. 按 **Ctrl+J** 或菜单 →「AI 助手」打开面板。
+3. 点「设置」填写 API 地址、模型名称和 API Key。地址需要兼容 OpenAI 的 `/chat/completions`，例如：
+   - OpenAI：`https://api.openai.com/v1`
+   - DeepSeek：`https://api.deepseek.com/v1`
+   - 本地 Ollama：`http://127.0.0.1:11434/v1`（仅本机允许明文 HTTP）
+4. 直接提问，例如「磁盘怎么满了」「看看 nginx 为什么返回 502」。
+
+**权限模型：**
+
+- **读操作**（列目录、读文件）直接执行，结果会做凭据脱敏；私钥、云凭据、密码库等路径会被直接拒绝。
+- **写操作**（执行命令、写文件）必须先在面板里确认，卡片会显示完整命令或文件内容，点「允许」后才执行。
+- 一次只会有一个待确认操作；生成过程中点「停止」会终止整轮任务。
+
+API Key 保存在本机主密码保险库，不会写进配置文件；每次启动需要解锁保险库后才能使用。
 
 ## 密码与隐私
 

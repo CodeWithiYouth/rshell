@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(rshell VERSION 1.1.2 LANGUAGES CXX)
+project(rshell VERSION 1.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -211,15 +211,29 @@ endif()
 # GUI 可执行文件（Win32 原生窗口 + 内置终端）
 # ---------------------------------------------------------------------------
 if(WIN32)
+    # AI 功能只编进 GUI：CLI 不接入，体积保持 0 增量。
+    # winhttp 也只挂在 rshell_gui 上，rshell_core 不感知 HTTP。
+    set(RSHELL_AI_SOURCES
+        src/ai_json.cpp
+        src/ai_client.cpp
+        src/ai_tools.cpp
+        src/ai_agent.cpp
+        src/ai_settings.cpp
+    )
+
     add_executable(rshell_gui WIN32
         src/gui_main.cpp
         src/terminal.cpp
         src/ssh_shell.cpp
         src/session_store.cpp
         src/remote_fs.cpp
+        ${RSHELL_AI_SOURCES}
+        src/ai_ssh_backend.cpp   # 依赖 RemoteFs，只编进 GUI
+        src/ai_panel.cpp         # GDI 自绘面板，只编进 GUI
+        src/ai_tab.cpp           # AI 标签页：子窗口 + 工作线程
         src/rshell.rc
     )
-    target_link_libraries(rshell_gui PRIVATE rshell_core comdlg32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32)
+    target_link_libraries(rshell_gui PRIVATE rshell_core comdlg32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp)
     set_target_properties(rshell_gui PROPERTIES OUTPUT_NAME "rshell-gui")
 endif()
 
@@ -256,16 +270,28 @@ endif()
 if(RSHELL_BUILD_TESTS)
     enable_testing()
     add_executable(rshell_tests tests/test_main.cpp src/terminal.cpp src/session_store.cpp)
-    target_link_libraries(rshell_tests PRIVATE rshell_core)
+    if(WIN32)
+        # AI 的 JSON / SSE 解析是纯逻辑，放进单元测试；CLI 仍不包含
+        target_sources(rshell_tests PRIVATE ${RSHELL_AI_SOURCES})
+        target_link_libraries(rshell_tests PRIVATE rshell_core winhttp)
+    else()
+        target_link_libraries(rshell_tests PRIVATE rshell_core)
+    endif()
     add_test(NAME rshell_tests COMMAND rshell_tests)
 
     if(WIN32)
         # 隐藏窗口回归：直接调用 GUI 的标签、事件分发及连接清理路径。
         add_executable(rshell_gui_tabs_probe tests/gui_tabs_probe.cpp
-            src/terminal.cpp src/ssh_shell.cpp src/session_store.cpp src/remote_fs.cpp)
+            src/terminal.cpp src/ssh_shell.cpp src/session_store.cpp src/remote_fs.cpp
+            src/ai_panel.cpp src/ai_tab.cpp src/ai_ssh_backend.cpp ${RSHELL_AI_SOURCES})
         target_link_libraries(rshell_gui_tabs_probe PRIVATE rshell_core
-            comdlg32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32)
+            comdlg32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp)
         add_test(NAME rshell_gui_tabs COMMAND rshell_gui_tabs_probe)
+
+        # AI 工具链对真实 SSH/SFTP 的冒烟测试（需先启动 tests/sftp_test_server.py）
+        add_executable(rshell_ai_probe tests/ai_tools_probe.cpp
+            src/remote_fs.cpp src/ai_ssh_backend.cpp ${RSHELL_AI_SOURCES})
+        target_link_libraries(rshell_ai_probe PRIVATE rshell_core winhttp)
     endif()
 
     # 无 GUI 的交互式 shell 冒烟测试（配合 tests/sftp_test_server.py 使用）

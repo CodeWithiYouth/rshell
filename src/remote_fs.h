@@ -152,6 +152,22 @@ public:
     // 打开一个远端文件准备按需读；失败返回 nullptr 并写入 error
     std::shared_ptr<Reader> openReader(const std::string& remotePath, std::string* error);
 
+    // ---- AI 工具用的同步接口 ----
+    // 全部排进文件线程执行并等待结果；失败时 error 非空。
+    // 这些方法可能从 AI 工作线程调用，与面板操作共用同一条连接。
+    struct ExecOutcome {
+        bool ok = false;  // 命令是否跑完（不代表退出码为 0）
+        int exitCode = -1;
+        std::string output;
+        bool truncated = false;
+        std::string error;
+    };
+    ExecOutcome execSync(const std::string& command, int timeoutMs, std::size_t maxOutputBytes);
+    bool readFileSync(const std::string& path, std::size_t maxBytes, std::string& out,
+                      bool& truncated, std::string& error);
+    bool writeFileSync(const std::string& path, const std::string& content, std::string& error);
+    bool listDirSync(const std::string& path, std::vector<RemoteEntry>& out, std::string& error);
+
 private:
     using Task = std::function<void()>;
 
@@ -161,7 +177,9 @@ private:
     void workerLoop();
     void runSample();
     // 在自有连接上执行命令并抓取 stdout（不碰进程的 stdout）
-    bool execCapture(const std::string& command, std::string& out, int timeoutMs, int* latencyMs);
+    bool execCapture(const std::string& command, std::string& out, int timeoutMs, int* latencyMs,
+                     int* exitCode = nullptr, std::size_t maxOutputBytes = 0,
+                     bool* truncated = nullptr);
 
     RemoteFsCallbacks callbacks_;
     std::thread worker_;

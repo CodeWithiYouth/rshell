@@ -381,6 +381,19 @@ void SftpClient::closeReadHandle(LIBSSH2_SFTP_HANDLE* handle) {
     if (handle) libssh2_sftp_close(handle);
 }
 
+void SftpClient::writeFileContent(const std::string& path, const std::string& content) {
+    LIBSSH2_SFTP_HANDLE* handle = openFile(
+        path, LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC, 0644);
+    std::uint64_t written = 0;
+    try {
+        writeAll(handle, content.data(), content.size(), written);
+    } catch (...) {
+        libssh2_sftp_close(handle);
+        throw;
+    }
+    libssh2_sftp_close(handle);
+}
+
 // ---------------------------------------------------------------- 上传
 TransferResult SftpClient::upload(const std::string& localPath,
                                   const std::string& remotePath,

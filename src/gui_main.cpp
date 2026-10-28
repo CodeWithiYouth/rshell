@@ -271,6 +271,10 @@ struct App : SessionState {
     int hoverTitleBtn = -1;  // 0=菜单 1=最小化 2=最大化 3=关闭
     int pressTitleBtn = -1;
     RECT titleButtons[4]{};  // 供 WM_NCHITTEST 排除
+    // AI 助手开关（菜单按钮左侧），同样要在 WM_NCHITTEST 里独立排除
+    RECT titleAi{};
+    bool hoverTitleAi = false;
+    bool pressTitleAi = false;
 
     // ---- 终端卡片 ----
     int termPadX = 0;
@@ -7088,6 +7092,12 @@ int hitTitleButton(POINT pt) {
     return -1;
 }
 
+bool hitAiButton(POINT pt) {
+    const RECT& r = g_app.titleAi;
+    return r.right > r.left && pt.x >= r.left && pt.x < r.right && pt.y >= r.top &&
+           pt.y < r.bottom;
+}
+
 // 标题栏按钮的矢量图标：不依赖任何字体，缺字风险为零
 void drawTitleGlyph(HDC dc, int kind, const RECT& rc, std::uint32_t color, bool maximized) {
     const int cx = (rc.left + rc.right) / 2;
@@ -7129,6 +7139,26 @@ void drawTitleGlyph(HDC dc, int kind, const RECT& rc, std::uint32_t color, bool 
     DeleteObject(pen);
 }
 
+// AI 助手的图标：四角星芒（内凹的腰 + 一颗小星）。纯矢量，不依赖任何字体。
+// 只画形状不画文字，因为图标按钮在窄标题栏里根本没有放文字的位置。
+void drawSparkle(HDC dc, int cx, int cy, int radius, std::uint32_t color) {
+    if (radius <= 0) return;
+    const float r = static_cast<float>(radius);
+    const float waist = r * 0.30f;  // 腰离中心越近，星芒越尖
+    const float axisX[4] = {0.0f, 1.0f, 0.0f, -1.0f};  // 上 右 下 左
+    const float axisY[4] = {-1.0f, 0.0f, 1.0f, 0.0f};
+    std::vector<Gdiplus::PointF> pts;
+    pts.reserve(8);
+    for (int i = 0; i < 4; ++i) {
+        const int next = (i + 1) % 4;
+        pts.emplace_back(static_cast<float>(cx) + axisX[i] * r,
+                         static_cast<float>(cy) + axisY[i] * r);
+        pts.emplace_back(static_cast<float>(cx) + (axisX[i] + axisX[next]) * waist,
+                         static_cast<float>(cy) + (axisY[i] + axisY[next]) * waist);
+    }
+    fillPoints(dc, pts, color);
+}
+
 // 标题栏：logo + 应用名 + 当前会话 + 连接状态药丸 + 菜单/最小化/最大化/关闭
 void paintTitleBar(HDC dc, const RECT& rc) {
     const int h = g_app.titleH;
@@ -7153,6 +7183,38 @@ void paintTitleBar(HDC dc, const RECT& rc) {
         }
         std::uint32_t glyph = (i == 3 && hovered) ? 0xFFFFFF : (hovered ? ui::text : ui::textDim);
         drawTitleGlyph(dc, i, g_app.titleButtons[i], glyph, maximized);
+    }
+
+    // AI 助手开关：紧挨菜单按钮左侧。图标按钮比文字按钮更省位置，
+    // 打开面板时整块高亮，这样不用看右侧面板也知道当前状态。
+    const int aiCellW = dp(46);
+    const int aiGap = dp(4);
+    g_app.titleAi = RECT{g_app.titleButtons[0].left - aiGap - aiCellW, 0,
+                         g_app.titleButtons[0].left - aiGap, h};
+    {
+        const RECT chip{g_app.titleAi.left + dp(7), dp(9), g_app.titleAi.right - dp(7),
+                        h - dp(9)};
+        const bool hovered = g_app.hoverTitleAi;
+        const bool pressed = hovered && g_app.pressTitleAi;
+        std::uint32_t chipBg = ui::bgCard;
+        std::uint32_t chipBorder = ui::borderSoft;
+        std::uint32_t glyph = ui::accent;
+        if (g_app.aiOpen) {
+            chipBg = ui::mix(ui::action, ui::bgPanel, 0.5);
+            chipBorder = ui::mix(ui::accent, ui::bgPanel, 0.4);
+            glyph = 0xFFFFFF;
+        }
+        if (hovered) {
+            chipBg = g_app.aiOpen ? ui::mix(ui::action, ui::bgPanel, 0.22) : ui::bgHover;
+            chipBorder = ui::mix(ui::accent, ui::bgPanel, 0.45);
+            if (!g_app.aiOpen) glyph = ui::mix(ui::accent, 0xFFFFFF, 0.3);
+        }
+        if (pressed) chipBg = ui::mix(chipBg, 0x000000, 0.18);
+        fillRoundRect(dc, chip, dp(8), chipBg, chipBorder);
+        const int cx = (chip.left + chip.right) / 2;
+        const int cy = (chip.top + chip.bottom) / 2;
+        drawSparkle(dc, cx - dp(1), cy + dp(1), dp(7), glyph);
+        drawSparkle(dc, cx + dp(6), cy - dp(6), dp(3), glyph);
     }
 
     // logo
@@ -7180,7 +7242,7 @@ void paintTitleBar(HDC dc, const RECT& rc) {
         pillColor = ui::success;
     }
     const int pillW = textWidth(dc, pillLabel, g_app.tinyFont) + dp(28);
-    const int pillRight = g_app.titleButtons[0].left - dp(8);
+    const int pillRight = g_app.titleAi.left - dp(8);
     const int pillLeft = pillRight - pillW;
 
     // 当前会话名（放不下就省略号）
@@ -8423,7 +8485,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ScreenToClient(hwnd, &client);
 
             // 自绘按钮区域交回客户区处理
-            if (hitTitleButton(client) >= 0 || hitButton(client) >= 0) return HTCLIENT;
+            if (hitTitleButton(client) >= 0 || hitAiButton(client) || hitButton(client) >= 0) return HTCLIENT;
 
             // 去掉非客户区后，缩放边缘要自己判定
             if (!IsZoomed(hwnd)) {
@@ -8464,18 +8526,21 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                     (PtInRect(&status.dismiss, pt) ? 2 : 0);
             const int button = hitButton(pt);
             const int titleButton = hitTitleButton(pt);
+            const bool aiHover = hitAiButton(pt);
             // 下载胶囊 / 列表里的悬停状态
             const DownloadHit downloadHit = hitDownloadUi(hwnd, pt);
             const bool chipHover = downloadHit.chip;
             const int cancelHover = downloadHit.cancelIndex;
             const bool pathHover = g_app.fsReady && PtInRect(&g_app.fsPathRect, pt) != FALSE;
             if (button != g_app.hoverButton || titleButton != g_app.hoverTitleBtn ||
+                aiHover != g_app.hoverTitleAi ||
                 chipHover != g_app.hoverDownloadChip ||
                 cancelHover != g_app.hoverDownloadCancel || pathHover != g_app.hoverPathRect ||
                 statusAction != g_app.hoverStatusAction) {
                 g_app.hoverStatusAction = statusAction;
                 g_app.hoverButton = button;
                 g_app.hoverTitleBtn = titleButton;
+                g_app.hoverTitleAi = aiHover;
                 g_app.hoverDownloadChip = chipHover;
                 g_app.hoverDownloadCancel = cancelHover;
                 g_app.hoverPathRect = pathHover;
@@ -8506,11 +8571,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.hoverStatusAction = 0;
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
-            if (g_app.hoverButton != -1 || g_app.hoverTitleBtn != -1 ||
+            if (g_app.hoverButton != -1 || g_app.hoverTitleBtn != -1 || g_app.hoverTitleAi ||
                 g_app.hoverDownloadChip || g_app.hoverDownloadCancel != -1 ||
                 g_app.hoverPathRect) {
                 g_app.hoverButton = -1;
                 g_app.hoverTitleBtn = -1;
+                g_app.hoverTitleAi = false;
                 g_app.hoverDownloadChip = false;
                 g_app.hoverDownloadCancel = -1;
                 g_app.hoverPathRect = false;
@@ -8571,6 +8637,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
 
+            if (hitAiButton(pt)) {
+                g_app.pressTitleAi = true;
+                SetCapture(hwnd);
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             const int titleButton = hitTitleButton(pt);
             if (titleButton >= 0) {
                 g_app.pressTitleBtn = titleButton;
@@ -8591,6 +8663,13 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_LBUTTONUP: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (g_app.pressTitleAi) {
+                g_app.pressTitleAi = false;
+                ReleaseCapture();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                if (hitAiButton(pt)) toggleAiPanel();
+                return 0;
+            }
             if (g_app.pressTitleBtn >= 0) {
                 const int pressed = g_app.pressTitleBtn;
                 g_app.pressTitleBtn = -1;
@@ -8620,7 +8699,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RECT client;
                 GetClientRect(hwnd, &client);
                 const StatusLayout status = statusGeometry(client);
-                if (hitButton(pt) >= 0 || hitTitleButton(pt) >= 0 || downloadHit.chip ||
+                if (hitButton(pt) >= 0 || hitTitleButton(pt) >= 0 || hitAiButton(pt) || downloadHit.chip ||
                     downloadHit.close || downloadHit.clear || downloadHit.cancelIndex >= 0 ||
                     PtInRect(&status.reconnect, pt) || PtInRect(&status.dismiss, pt) ||
                     PtInRect(&g_app.tabsRect, pt) || (g_app.fsReady && PtInRect(&g_app.fsPathRect, pt))) {

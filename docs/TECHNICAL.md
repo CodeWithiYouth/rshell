@@ -537,6 +537,16 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
 | `ai_tab` | 会话内的停靠/全屏窗口、工作线程、审批桥接、设置视图 |
 | `ai_settings` | `~/.rshell/ai.ini` + 保险库条目 `ai.apiKey` |
 
+### 入口
+
+三个入口共用 `toggleAiPanel()`：
+
+- 标题栏菜单按钮左侧的星芒按钮（`g_app.titleAi`）：四角星是纯矢量（`drawSparkle`，8 点多边形），
+  不依赖字体，任何系统上都不会缺字；面板打开时整块高亮成主色，等于状态指示。
+  它在 `WM_NCHITTEST` 里和窗口按钮一样单独排除，否则会落进 `HTCAPTION` 被当成拖动窗口。
+- `Ctrl+J`
+- 菜单 →「AI 助手」（`IDM_AI_PANEL`）
+
 ### 线程模型
 
 界面线程只碰面板；AI 工作线程负责请求与工具调用；`RemoteFs` 的文件线程负责 libssh2。

@@ -406,6 +406,35 @@ void aiTabRegression() {    auto visible = [](HWND window) {
     closeSessionTab(g_activeTab);
     check(g_app.aiTab == nullptr, "closing the session destroys its AI panel");
 }
+
+// 标题栏的 AI 按钮：位置、尺寸和点击行为
+void titleAiButtonRegression() {
+    RECT client{}; GetClientRect(g_app.main, &client);
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    paintTitleBar(dc, RECT{0, 0, client.right, g_app.titleH});
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+
+    const RECT& ai = g_app.titleAi;
+    check(ai.right > ai.left, "title bar has an AI button");
+    check(ai.right <= g_app.titleButtons[0].left, "AI button sits left of the menu button");
+    check(ai.left > 0 && ai.right < client.right, "AI button stays inside the title bar");
+    check(ai.bottom - ai.top == g_app.titleH, "AI button fills the title bar height");
+    check(g_app.titleButtons[0].left - ai.right <= dp(8), "AI button keeps a tight gap to the menu");
+
+    const POINT center{(ai.left + ai.right) / 2, (ai.top + ai.bottom) / 2};
+    const bool before = g_app.aiOpen;
+    SendMessageW(g_app.main, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(center.x, center.y));
+    SendMessageW(g_app.main, WM_LBUTTONUP, 0, MAKELPARAM(center.x, center.y));
+    check(g_app.aiOpen != before, "clicking the AI button toggles the panel");
+    SendMessageW(g_app.main, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(center.x, center.y));
+    SendMessageW(g_app.main, WM_LBUTTONUP, 0, MAKELPARAM(center.x, center.y));
+    check(g_app.aiOpen == before, "clicking the AI button again restores the state");
+    check(hitAiButton(center), "AI button hit test matches its rectangle");
+    check(!hitAiButton(POINT{g_app.titleButtons[0].left + dp(4), center.y}),
+          "AI hit test does not swallow the menu button");
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -436,6 +465,7 @@ int main(int argc, char** argv) {
         panelScrollRegression();
         sessionMgrLayoutRegression();
         aiTabRegression();
+        titleAiButtonRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);
         DestroyWindow(window); window = nullptr;
         stopGdiplus(); g_app.runtime.reset();

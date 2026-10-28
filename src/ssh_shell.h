@@ -65,6 +65,7 @@ private:
     std::atomic<bool> stop_{false};
     std::atomic<bool> connected_{false};
     ShellCallbacks callbacks_;
+    int keepAliveSec_ = 0;
     std::string fingerprint_;
     std::string kex_;
     std::string banner_;

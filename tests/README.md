@@ -10,6 +10,7 @@
 | 慢连接目录跟随 | `python tests/gui_tabs_e2e.py --exe build\modern\rshell_gui_tabs_probe.exe --cwd-hooks --cwd-delay 1.8` | Python 3.9+、`paramiko` | 延迟回显、逐字节确认帧、初始化输入暂存及 `stty` 回显清理 |
 | Bash 历史隔离 | `python tests/cwd_history_test.py --exe build\modern\rshell_gui_tabs_probe.exe` | Python 3.9+、Bash（默认 Git Bash，可用 `--bash` 指定） | 真实交互式 Bash 的默认、忽略空格、过滤、时间戳、自动追加及关闭历史等配置；不读写用户实际历史 |
 | 端到端测试 | `python tests/e2e_test.py` | Python 3.9+、`paramiko` | 真实 SSH/SFTP 会话上的全部子命令 |
+| 代理连通性 | `python tests/proxy_test.py --exe build\modern\rshell.exe` | Python 3.9+、`paramiko` | 本地 SSH + 要求认证的 SOCKS5 / HTTP CONNECT；验证经代理登录、代理不可用时拒绝连接、认证错误被拒 |
 | GUI shell 冒烟测试 | `rshell_shell_probe.exe <host> <port> <user> <password>` | 测试服务器 | PTY 申请、shell 通道读写、resize、通道关闭 |
 
 Bash 历史回归应分别使用 Bash 4.4 与新版 Bash 运行（通过 `--bash` 指定对应程序）；

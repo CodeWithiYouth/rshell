@@ -78,12 +78,44 @@ jobs:
           $checksums = @('dist/rshell-gui.exe', 'dist/rshell.exe') | ForEach-Object {
             "$( (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant() )  $([IO.Path]::GetFileName($_))"
           }
-          $notes = @('## SHA-256', '', '```text') + $checksums + @('```')
+
+          # 从 CHANGELOG.md 取当前 tag 的段落；取不到就退回自动生成的提交说明
+          $version = $env:GITHUB_REF_NAME
+          $changelog = @()
+          if (Test-Path -LiteralPath 'CHANGELOG.md') {
+            $lines = Get-Content -LiteralPath 'CHANGELOG.md'
+            $start = -1
+            for ($i = 0; $i -lt $lines.Count; $i++) {
+              if ($lines[$i] -match ('^##\s+\*{0,2}\[?' + [Regex]::Escape($version) + '\]?\*{0,2}\b')) {
+                $start = $i
+                break
+              }
+            }
+            if ($start -ge 0) {
+              for ($i = $start + 1; $i -lt $lines.Count; $i++) {
+                if ($lines[$i] -match '^##\s') { break }
+                $changelog += $lines[$i]
+              }
+              # 去掉尾部空行
+              while ($changelog.Count -gt 0 -and $changelog[-1].Trim() -eq '') {
+                if ($changelog.Count -eq 1) { $changelog = @(); break }
+                $changelog = $changelog[0..($changelog.Count - 2)]
+              }
+            }
+          }
+
+          $notes = @()
+          if ($changelog.Count -gt 0) {
+            $notes += $changelog
+            $notes += ''
+          }
+          $notes += @('## SHA-256', '', '```text') + $checksums + @('```')
           [IO.File]::WriteAllLines((Join-Path $PWD 'release-notes.md'), $notes, [Text.UTF8Encoding]::new($false))
+
           $ghReleaseArgs = @(
             'release', 'create', $env:GITHUB_REF_NAME,
             'dist/rshell-gui.exe', 'dist/rshell.exe',
-            '--verify-tag', '--generate-notes', '--notes-file', 'release-notes.md'
+            '--verify-tag', '--notes-file', 'release-notes.md'
           )
           gh @ghReleaseArgs
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

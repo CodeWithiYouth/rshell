@@ -88,6 +88,10 @@ void parseCommandLine(int argc, char** argv, Options& opt) {
                 opt.keyPath = nextValue(i, argc, argv, arg);
             } else if (arg == "--password") {
                 opt.password = nextValue(i, argc, argv, arg);
+            } else if (arg == "--keepalive") {
+                opt.keepAliveSec = parsePositive(nextValue(i, argc, argv, arg), "保活间隔");
+            } else if (arg == "--proxy") {
+                opt.proxyUrl = nextValue(i, argc, argv, arg);
             } else if (arg == "-F" || arg == "--config") {
                 opt.configPath = nextValue(i, argc, argv, arg);
             } else if (arg == "--timeout") {
@@ -160,6 +164,8 @@ void printUsageText(bool full) {
         << "  -i, --identity <私钥>    私钥文件\n"
         << "      --password <口令>    登录密码（不推荐，会留在历史记录里）\n"
         << "  -F, --config <文件>      指定 ssh_config\n"
+        << "      --keepalive <秒>      空闲时发送 SSH 保活消息（0 关闭）\n"
+        << "      --proxy <URL>        经代理连接：socks5://[用户:口令@]主机:端口 或 http://...\n"
         << "      --timeout <秒>       连接超时（默认 20）\n"
         << "      --strict-host-key    未知主机直接拒绝\n"
         << "      --insecure           跳过 known_hosts 校验（不安全）\n\n"
@@ -209,6 +215,15 @@ ResolvedConnection resolveConnection(const Options& opt) {
 
     ResolvedConnection resolved;
     ConnectionOptions& conn = resolved.options;
+
+    if (opt.keepAliveSec > 0) {
+        conn.keepAliveSec = std::clamp(opt.keepAliveSec, 5, 3600);
+    }
+    if (!opt.proxyUrl.empty()) {
+        std::string proxyError;
+        if (!parseProxyUrl(opt.proxyUrl, conn.proxy, proxyError))
+            throw Error("代理参数无效：" + proxyError);
+    }
 
     // 主机名：ssh_config 的 HostName 优先，否则用用户输入（可能是 IP）
     if (matched && !hostConfig.hostName.empty()) {

@@ -203,6 +203,21 @@ void SshSession::fail(const std::string& what) const {
 
 // ---------------------------------------------------------------- TCP
 void SshSession::openTcp() {
+    // 配了代理就先经代理拿到一个已连接的 socket，后面握手逻辑完全不变
+    if (options_.proxy.enabled()) {
+        std::string error;
+        const std::intptr_t raw = connectThroughProxy(options_.proxy, options_.host, options_.port,
+                                                      options_.timeoutSec, error);
+        if (raw < 0) {
+            throw Error("通过代理连接 " + options_.host + ":" + std::to_string(options_.port) +
+                        " 失败：" + error);
+        }
+        sock_ = static_cast<libssh2_socket_t>(raw);
+        log().debug("经代理 " + proxyToUrl(options_.proxy) + " 连接 " + options_.host + ":" +
+                    std::to_string(options_.port));
+        return;
+    }
+
     addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;

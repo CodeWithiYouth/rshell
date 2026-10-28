@@ -33,6 +33,8 @@
 #include "ai_json.h"
 #include "ai_settings.h"
 #include "ai_tools.h"
+#include "md.h"
+#include "proxy.h"
 #include "dnd_virtual_file.h"
 #include "win_compat.h"
 #endif
@@ -2222,6 +2224,119 @@ void testAiAgentHistoryTrim() {
     }
 }
 
+void testProxyUrl() {
+    rshell::ProxyConfig proxy;
+    std::string error;
+
+    CHECK(rshell::parseProxyUrl("socks5://127.0.0.1:1080", proxy, error));
+    CHECK(proxy.kind == rshell::ProxyConfig::Kind::Socks5);
+    CHECK_EQ(proxy.host, std::string("127.0.0.1"));
+    CHECK_EQ(proxy.port, 1080);
+    CHECK(proxy.user.empty() && proxy.password.empty());
+
+    CHECK(rshell::parseProxyUrl("socks5h://alice:secret@proxy.lan:1080", proxy, error));
+    CHECK_EQ(proxy.user, std::string("alice"));
+    CHECK_EQ(proxy.password, std::string("secret"));
+    CHECK_EQ(proxy.host, std::string("proxy.lan"));
+
+    CHECK(rshell::parseProxyUrl("http://bob:pw@proxy.lan:8080", proxy, error));
+    CHECK(proxy.kind == rshell::ProxyConfig::Kind::HttpConnect);
+    CHECK_EQ(proxy.port, 8080);
+
+    // 裸 host:port 默认按 SOCKS5
+    CHECK(rshell::parseProxyUrl("proxy.lan:1080", proxy, error));
+    CHECK(proxy.kind == rshell::ProxyConfig::Kind::Socks5);
+
+    // 空串表示不使用代理
+    CHECK(rshell::parseProxyUrl("   ", proxy, error));
+    CHECK(proxy.kind == rshell::ProxyConfig::Kind::None);
+
+    // 非法输入要报错，不能静默变成直连
+    CHECK(!rshell::parseProxyUrl("socks5://proxy.lan", proxy, error));
+    CHECK(!error.empty());
+    CHECK(!rshell::parseProxyUrl("https://proxy.lan:443", proxy, error));
+    CHECK(!rshell::parseProxyUrl("proxy.lan:abc", proxy, error));
+    CHECK(!rshell::parseProxyUrl("proxy.lan:70000", proxy, error));
+
+    // 回写不含密码
+    rshell::ProxyConfig out;
+    CHECK(rshell::parseProxyUrl("socks5://u:p@proxy.lan:1080", out, error));
+    CHECK_EQ(rshell::proxyToUrl(out), std::string("socks5://proxy.lan:1080"));
+    CHECK_EQ(rshell::proxyToUrl(rshell::ProxyConfig()), std::string());
+}
+
+void testMarkdownParse() {
+    using namespace rshell::md;
+
+    // 行内：粗体 / 行内代码 / 斜体
+    const std::vector<Run> runs = parseInline(L"a **b** `c` *d*");
+    bool bold = false, code = false, italic = false;
+    for (const Run& run : runs) {
+        if (run.bold && run.text == L"b") bold = true;
+        if (run.code && run.text == L"c") code = true;
+        if (run.italic && run.text == L"d") italic = true;
+    }
+    CHECK(bold);
+    CHECK(code);
+    CHECK(italic);
+
+    const std::wstring doc =
+        L"# H1\n\n## H2\n\n### H3\n\n"
+        L"- a\n- b\n\n"
+        L"1. one\n2. two\n\n"
+        L"> quote\n\n"
+        L"---\n\n"
+        L"```bash\necho hi\necho bye\n```\n\n"
+        L"| a | b | c |\n| --- | :---: | ---: |\n| 1 | 2 | 3 |\n| 4 | 5 | 6 |\n";
+    const std::vector<Block> blocks = parse(doc);
+
+    int headings = 0, bullets = 0, ordered = 0, quotes = 0, rules = 0, codes = 0;
+    const Block* table = nullptr;
+    const Block* codeBlock = nullptr;
+    for (const Block& block : blocks) {
+        switch (block.kind) {
+            case BlockKind::Heading: ++headings; break;
+            case BlockKind::Bullet: ++bullets; break;
+            case BlockKind::Ordered: ++ordered; break;
+            case BlockKind::Quote: ++quotes; break;
+            case BlockKind::Rule: ++rules; break;
+            case BlockKind::Code: ++codes; codeBlock = &block; break;
+            case BlockKind::Table: table = &block; break;
+            default: break;
+        }
+    }
+    CHECK_EQ(headings, 3);
+    CHECK_EQ(bullets, 2);
+    CHECK_EQ(ordered, 2);
+    CHECK_EQ(quotes, 1);
+    CHECK_EQ(rules, 1);
+    CHECK_EQ(codes, 1);
+
+    CHECK(codeBlock != nullptr);
+    CHECK(codeBlock->language == L"bash");
+    CHECK(codeBlock->text == L"echo hi\necho bye");
+
+    CHECK(table != nullptr);
+    CHECK(table->table.hasHeader);
+    CHECK_EQ(table->table.rows.size(), static_cast<std::size_t>(3));  // 表头 + 2 行
+    CHECK_EQ(table->table.rows[0].size(), static_cast<std::size_t>(3));
+    CHECK(table->table.aligns.size() == static_cast<std::size_t>(3));
+    CHECK(table->table.aligns[0] == Align::Left);
+    CHECK(table->table.aligns[1] == Align::Center);
+    CHECK(table->table.aligns[2] == Align::Right);
+    CHECK(table->table.rows[0][0].runs.front().text == L"a");
+    CHECK(table->table.rows[2][2].runs.front().text == L"6");
+
+    // 表格缺列时补空单元格
+    const std::vector<Block> shortRow = parse(L"| a | b |\n| --- | --- |\n| 1 |\n");
+    CHECK_EQ(shortRow.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(shortRow[0].table.rows[1].size(), static_cast<std::size_t>(2));
+
+    // 未闭合的代码块 / 空输入 不崩
+    CHECK(!parse(L"```\nabc").empty());
+    CHECK(parse(L"").empty());
+    CHECK(!parse(L"| a | b |\n| 不是分隔行 |\n").empty());
+}
 void testAiSettings() {
     const fs::path dir =
         fs::temp_directory_path() / ("rshell-ai-settings-" + std::to_string(::GetCurrentProcessId()));
@@ -2322,6 +2437,8 @@ int main() {
     testAiAgentAbortAndDefaults();
     testAiAgentHistoryTrim();
     testAiSettings();
+    testMarkdownParse();
+    testProxyUrl();
 #endif
 
     std::cout << (g_failed == 0 ? "PASS" : "FAIL") << ": " << (g_checks - g_failed) << "/"

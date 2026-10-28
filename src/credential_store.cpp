@@ -12,6 +12,10 @@ std::string credentialTarget(const std::string& sessionName) {
     return "rshell/" + sessionName;
 }
 
+std::string proxyPasswordTarget(const std::string& sessionName) {
+    return "rshell/" + sessionName + "/proxy-password";
+}
+
 std::string keyPassphraseTarget(const std::string& sessionName) {
     // 和登录密码分开存，避免同一会话在密码/私钥认证之间切换时互相覆盖
     return credentialTarget(sessionName) + "/key-passphrase";

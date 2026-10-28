@@ -390,8 +390,13 @@ int hitSessionTab(POINT pt, bool* close = nullptr);
 bool handleSessionTabClick(POINT pt);
 void ensureActiveTabVisible(int width);
 
+// 把会话里的代理配置套到连接参数上；返回 false 表示配置无法解析。
+// 代理解析失败时调用方必须中止连接，绝不能悄悄退回直连。
+bool applySessionProxy(ConnectionOptions& options, const Session& session, std::string& error);
+
 void connectToSession(const Session& session, const std::wstring& password,
                       const std::wstring& keyPassphrase);
+void messageWarn(const std::wstring& title, const std::wstring& text);
 void stopRemoteFs();
 void startRemoteFs(const Session& session, const std::wstring& password,
                    const std::wstring& keyPassphrase);
@@ -2378,6 +2383,24 @@ void disconnectSession() {
     updateButtons();
 }
 
+// 把会话里的代理配置套到连接参数上；返回 false 表示配置无法解析。
+// 代理解析失败时调用方必须中止连接，绝不能悄悄退回直连。
+bool applySessionProxy(ConnectionOptions& options, const Session& session, std::string& error) {
+    if (session.proxyUrl.empty()) return true;
+    ProxyConfig proxy;
+    if (!parseProxyUrl(session.proxyUrl, proxy, error)) return false;
+    proxy.user = session.proxyUser;
+    if (session.saveProxyPassword) {
+        std::string stored;
+        if (loadCredential(proxyPasswordTarget(session.name), stored)) {
+            proxy.password = stored;
+            wipeString(stored);
+        }
+    }
+    options.proxy = proxy;
+    return true;
+}
+
 void connectToSession(const Session& session, const std::wstring& password,
                       const std::wstring& keyPassphrase) {
     if (g_app.connecting) return;
@@ -2404,6 +2427,17 @@ void connectToSession(const Session& session, const std::wstring& password,
     wipeString(utf8KeyPassphrase);
     options.timeoutSec = 20;
     options.allowDefaultKeys = true;
+
+    if (session.keepAliveSec > 0)
+        options.keepAliveSec = std::clamp(session.keepAliveSec, 5, 3600);
+
+    std::string proxyError;
+    if (!applySessionProxy(options, session, proxyError)) {
+        messageWarn(L"代理配置无效",
+                    L"会话 “" + toWide(session.name) + L"” 的代理地址无法解析：" + toWide(proxyError));
+        setStatus(L"代理配置无效", true);
+        return;
+    }
 
     if (options.user.empty()) {
         if (const char* env = std::getenv("USERNAME")) options.user = env;
@@ -3564,6 +3598,11 @@ struct SessionMgrState {
     HWND user = nullptr;
     HWND key = nullptr;
     HWND note = nullptr;
+    HWND proxyUrl = nullptr;
+    HWND proxyUser = nullptr;
+    HWND proxyPass = nullptr;
+    HWND keepAliveSec = nullptr;
+    bool keepAliveOn = false;
     HWND pwdClear = nullptr;
     int selected = -1;
     int hover = -1;
@@ -3571,6 +3610,47 @@ struct SessionMgrState {
     bool connectAfterClose = false;
     std::string connectName;
 };
+
+constexpr wchar_t kProxyCueUrl[] = L"socks5://主机:端口 或 http://主机:端口";
+constexpr wchar_t kProxyCueUser[] = L"代理用户名，可留空";
+constexpr wchar_t kProxyCuePass[] = L"留空=用已保存的";
+
+// 空输入框上画提示文字；深色主题下系统 cue banner 不可见，所以自己画
+LRESULT CALLBACK proxyCueProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id,
+                              DWORD_PTR ref) {
+    switch (msg) {
+        case WM_PAINT: {
+            const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+            if (GetWindowTextLengthW(hwnd) == 0 && GetFocus() != hwnd) {
+                HDC dc = GetDC(hwnd);
+                RECT rc{};
+                GetClientRect(hwnd, &rc);
+                rc.left += 6;
+                rc.right -= 6;
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, toColorRef(ui::textFaint));
+                HGDIOBJ oldFont =
+                    SelectObject(dc, reinterpret_cast<HFONT>(SendMessageW(hwnd, WM_GETFONT, 0, 0)));
+                DrawTextW(dc, reinterpret_cast<const wchar_t*>(ref), -1, &rc,
+                          DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+                SelectObject(dc, oldFont);
+                ReleaseDC(hwnd, dc);
+            }
+            return result;
+        }
+        case WM_SETFOCUS:
+        case WM_KILLFOCUS: {
+            const LRESULT result = DefSubclassProc(hwnd, msg, wp, lp);
+            InvalidateRect(hwnd, nullptr, TRUE);
+            return result;
+        }
+        case WM_NCDESTROY:
+            RemoveWindowSubclass(hwnd, proxyCueProc, id);
+            break;
+        default: break;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
 
 SessionMgrState g_mgr;
 
@@ -3580,6 +3660,10 @@ constexpr int ID_MGR_PORT = 3212;
 constexpr int ID_MGR_USER = 3213;
 constexpr int ID_MGR_KEY = 3214;
 constexpr int ID_MGR_NOTE = 3215;
+constexpr int ID_MGR_PROXY_URL = 3216;
+constexpr int ID_MGR_PROXY_USER = 3217;
+constexpr int ID_MGR_PROXY_PASS = 3218;
+constexpr int ID_MGR_KEEPALIVE = 3219;
 constexpr int ID_MGR_BROWSE = 3220;
 constexpr int ID_MGR_NEW = 3230;
 constexpr int ID_MGR_SAVE = 3231;
@@ -3588,8 +3672,46 @@ constexpr int ID_MGR_CLOSE = 3233;
 constexpr int ID_MGR_CONNECT = 3234;
 constexpr int ID_MGR_CLEAR_PWD = 3235;
 
-int mgrWidth() { return dp(820); }
-int mgrHeight() { return dp(560); }
+RECT dialogWorkArea() {
+    RECT work{};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0) || work.right <= work.left ||
+        work.bottom <= work.top) {
+        work = RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    }
+    return work;
+}
+
+// 对话框不能超出工作区：小屏 + 高缩放下 820x620 换算成物理像素会大于屏幕
+int mgrWidth() {
+    const RECT work = dialogWorkArea();
+    const int limit = (work.right - work.left) - dp(24);
+    return std::max(dp(700), std::min(dp(820), limit));
+}
+
+int mgrHeight() {
+    const RECT work = dialogWorkArea();
+    const int limit = (work.bottom - work.top) - dp(24);
+    return std::max(dp(480), std::min(dp(620), limit));
+}
+
+// 屏幕矮的时候按比例压缩行高，而不是把窗口撑出屏幕
+int mgrFieldHeight() {
+    const RECT work = dialogWorkArea();
+    const int available = (work.bottom - work.top) - dp(24);
+    const int natural = dp(620);
+    if (available >= natural) return dp(30);
+    const double scale = std::clamp(static_cast<double>(available) / natural, 0.65, 1.0);
+    return std::max(dp(20), static_cast<int>(dp(30) * scale));
+}
+
+int mgrFieldGap() {
+    const RECT work = dialogWorkArea();
+    const int available = (work.bottom - work.top) - dp(24);
+    const int natural = dp(620);
+    if (available >= natural) return dp(10);
+    const double scale = std::clamp(static_cast<double>(available) / natural, 0.65, 1.0);
+    return std::max(dp(4), static_cast<int>(dp(10) * scale));
+}
 int mgrPad() { return dp(20); }
 int mgrListW() { return dp(262); }
 int mgrListTop() { return dp(96); }
@@ -3604,6 +3726,14 @@ struct MgrLayout {
     RECT user;
     RECT key;
     RECT note;
+    RECT proxyUrl;
+    RECT proxyUser;
+    RECT proxyPass;
+    RECT keepAliveBox;
+    RECT keepAliveSec;
+    RECT hint;
+    int keepAliveLabelX = 0;
+    int keepAliveUnitX = 0;
     RECT browse;
     RECT pwdState;
     RECT pwdClear;
@@ -3616,13 +3746,14 @@ struct MgrLayout {
     int left = 0;
     int labelW = 0;
     int userLabelX = 0;
+    int proxyPassLabelX = 0;
     int listBottom = 0;
 };
 
 MgrLayout mgrLayout() {
     MgrLayout l;
     const int pad = mgrPad();
-    const int fieldH = dp(30);
+    const int fieldH = mgrFieldHeight();
     l.labelW = dp(52);
     l.left = pad + mgrListW() + dp(26);
     const int fieldX = l.left + l.labelW;
@@ -3630,25 +3761,43 @@ MgrLayout mgrLayout() {
 
     int y = mgrListTop();
     l.name = RECT{fieldX, y, fieldRight, y + fieldH};
-    y += fieldH + dp(10);
+    y += fieldH + mgrFieldGap();
     l.host = RECT{fieldX, y, fieldRight, y + fieldH};
-    y += fieldH + dp(10);
+    y += fieldH + mgrFieldGap();
     l.port = RECT{fieldX, y, fieldX + dp(72), y + fieldH};
     l.userLabelX = l.port.right + dp(16);
     l.user = RECT{l.userLabelX + dp(38), y, fieldRight, y + fieldH};
-    y += fieldH + dp(10);
+    y += fieldH + mgrFieldGap();
     l.key = RECT{fieldX, y, fieldRight - dp(88), y + fieldH};
     l.browse = RECT{fieldRight - dp(80), y, fieldRight, y + fieldH};
-    y += fieldH + dp(10);
+    y += fieldH + mgrFieldGap();
     l.note = RECT{fieldX, y, fieldRight, y + fieldH};
+    y += fieldH + mgrFieldGap();
+
+    // 代理：一个 URL 字段（socks5://host:port 或 http://host:port），
+    // 用户名单独存，密码进保险库
+    l.proxyUrl = RECT{fieldX, y, fieldRight, y + fieldH};
+    y += fieldH + mgrFieldGap();
+    l.proxyUser = RECT{fieldX, y, fieldX + dp(150), y + fieldH};
+    l.proxyPassLabelX = l.proxyUser.right + dp(14);
+    l.proxyPass = RECT{l.proxyPassLabelX + dp(38), y, fieldRight, y + fieldH};
+    y += fieldH + mgrFieldGap();
+
+    // 保活：勾选框 + 间隔（秒）
+    const int boxSize = dp(16);
+    l.keepAliveBox = RECT{fieldX, y + (fieldH - boxSize) / 2, fieldX + boxSize,
+                          y + (fieldH - boxSize) / 2 + boxSize};
+    l.keepAliveLabelX = l.keepAliveBox.right + dp(8);
+    l.keepAliveSec = RECT{fieldX + dp(210), y, fieldX + dp(270), y + fieldH};
+    l.keepAliveUnitX = l.keepAliveSec.right + dp(8);
+    y += fieldH + mgrFieldGap();
+    l.hint = RECT{fieldX, y, fieldRight, y + dp(36)};
 
     // 密码状态行：左边两行说明，右边「清除密码」只在真的存过密码时可用
-    l.pwdClear = RECT{fieldRight - dp(112), l.note.bottom + dp(52), fieldRight,
-                      l.note.bottom + dp(80)};
-    l.pwdState = RECT{l.left, l.note.bottom + dp(52), l.pwdClear.left - dp(12),
-                      l.note.bottom + dp(84)};
+    l.pwdClear = RECT{fieldRight - dp(112), y + dp(42), fieldRight, y + dp(70)};
+    l.pwdState = RECT{l.left, y + dp(42), l.pwdClear.left - dp(12), y + dp(74)};
 
-    const int actionY = l.note.bottom + dp(94);
+    const int actionY = y + dp(84);
     l.save = RECT{fieldRight - dp(84), actionY, fieldRight, actionY + dp(32)};
     l.remove = RECT{l.save.left - dp(10) - dp(88), actionY, l.save.left - dp(10),
                     actionY + dp(32)};
@@ -3712,6 +3861,16 @@ void mgrLoadSession(const Session& s) {
     if (g_mgr.user) SetWindowTextW(g_mgr.user, toWide(s.user).c_str());
     if (g_mgr.key) SetWindowTextW(g_mgr.key, toWide(s.keyPath).c_str());
     if (g_mgr.note) SetWindowTextW(g_mgr.note, toWide(s.note).c_str());
+    if (g_mgr.proxyUrl) SetWindowTextW(g_mgr.proxyUrl, toWide(s.proxyUrl).c_str());
+    if (g_mgr.proxyUser) SetWindowTextW(g_mgr.proxyUser, toWide(s.proxyUser).c_str());
+    // 密码永远不回填：要改就重新输入，留空表示沿用保险库里的
+    if (g_mgr.proxyPass) SetWindowTextW(g_mgr.proxyPass, L"");
+    g_mgr.keepAliveOn = s.keepAliveSec > 0;
+    if (g_mgr.keepAliveSec) {
+        const int seconds = s.keepAliveSec > 0 ? s.keepAliveSec : 30;
+        SetWindowTextW(g_mgr.keepAliveSec, std::to_wstring(seconds).c_str());
+        EnableWindow(g_mgr.keepAliveSec, g_mgr.keepAliveOn ? TRUE : FALSE);
+    }
     if (g_mgr.pwdClear) {
         SetWindowTextW(g_mgr.pwdClear,
                        s.keyPath.empty() ? L"清除密码" : L"清除私钥口令");
@@ -3727,6 +3886,14 @@ Session mgrFormSession() {
     s.user = trim(toUtf8(textOf(g_mgr.user)));
     s.keyPath = trim(toUtf8(textOf(g_mgr.key)));
     s.note = toUtf8(textOf(g_mgr.note));
+    s.proxyUrl = trim(toUtf8(textOf(g_mgr.proxyUrl)));
+    s.proxyUser = trim(toUtf8(textOf(g_mgr.proxyUser)));
+    if (g_mgr.keepAliveOn) {
+        const int seconds = _wtoi(textOf(g_mgr.keepAliveSec).c_str());
+        s.keepAliveSec = std::clamp(seconds > 0 ? seconds : 30, 5, 3600);
+    } else {
+        s.keepAliveSec = 0;
+    }
     s.port = _wtoi(textOf(g_mgr.port).c_str());
     return s;
 }
@@ -3741,7 +3908,10 @@ bool mgrDirty() {
     if (g_mgr.selected >= 0 && g_mgr.selected < static_cast<int>(sessions.size()))
         stored = sessions[static_cast<std::size_t>(g_mgr.selected)];
     return form.name != stored.name || form.host != stored.host || form.port != stored.port ||
-           form.user != stored.user || form.keyPath != stored.keyPath || form.note != stored.note;
+           form.user != stored.user || form.keyPath != stored.keyPath || form.note != stored.note ||
+           form.proxyUrl != stored.proxyUrl || form.proxyUser != stored.proxyUser ||
+           (g_mgr.proxyPass && GetWindowTextLengthW(g_mgr.proxyPass) > 0) ||
+           form.keepAliveSec != stored.keepAliveSec;
 }
 
 bool mgrConfirmDiscard() {
@@ -3817,6 +3987,9 @@ void paintSessionMgr(HDC dc, HWND hwnd) {
     label(L"用户", l.userLabelX, l.port.top);
     label(L"私钥", l.left, l.key.top);
     label(L"备注", l.left, l.note.top);
+    label(L"代理", l.left, l.proxyUrl.top);
+    label(L"用户", l.left, l.proxyUser.top);
+    label(L"密码", l.proxyPassLabelX, l.proxyPass.top);
 
     paintEditFrame(dc, hwnd, g_mgr.name);
     paintEditFrame(dc, hwnd, g_mgr.host);
@@ -3824,10 +3997,29 @@ void paintSessionMgr(HDC dc, HWND hwnd) {
     paintEditFrame(dc, hwnd, g_mgr.user);
     paintEditFrame(dc, hwnd, g_mgr.key);
     paintEditFrame(dc, hwnd, g_mgr.note);
+    paintEditFrame(dc, hwnd, g_mgr.proxyUrl);
+    paintEditFrame(dc, hwnd, g_mgr.proxyUser);
+    paintEditFrame(dc, hwnd, g_mgr.proxyPass);
 
-    RECT hint{l.left, l.note.bottom + dp(8), mgrWidth() - mgrPad(), l.note.bottom + dp(42)};
-    drawText(dc, L"私钥可留空：会尝试 ~/.ssh 下的默认密钥；私钥带口令时连接前会弹框，"
-                 L"也可以勾选记住并存进密码保险库。", hint,
+    // 保活行：勾选框 + 间隔（秒）
+    label(L"保活", l.left, l.keepAliveSec.top);
+    fillRoundRect(dc, l.keepAliveBox, dp(3), g_mgr.keepAliveOn ? ui::action : dlg::bgInput,
+                  g_mgr.keepAliveOn ? ui::action : ui::border);
+    if (g_mgr.keepAliveOn)
+        drawText(dc, L"✓", l.keepAliveBox, 0xFFFFFF, g_app.tinyFont,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    drawText(dc, L"保持活动状态",
+             RECT{l.keepAliveLabelX, l.keepAliveSec.top, l.keepAliveSec.left - dp(10),
+                  l.keepAliveSec.bottom},
+             ui::text, g_app.uiFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    drawText(dc, L"秒",
+             RECT{l.keepAliveUnitX, l.keepAliveSec.top, l.keepAliveUnitX + dp(30),
+                  l.keepAliveSec.bottom},
+             ui::textDim, g_app.uiFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    paintEditFrame(dc, hwnd, g_mgr.keepAliveSec);
+
+    const RECT& hint = l.hint;
+    drawText(dc, L"私钥可留空（会尝试 ~/.ssh 默认密钥）；代理留空表示直连。", hint,
              ui::textFaint, g_app.tinyFont, DT_LEFT | DT_TOP | DT_WORDBREAK);
 
     // 口令本体在密码保险库里，sessions.ini 只有 savepassword/savekeypassphrase 标记
@@ -3924,6 +4116,22 @@ bool mgrSave(HWND hwnd) {
         SetFocus(g_mgr.port);
         return false;
     }
+
+    // 代理地址：先校验再规范化，避免把密码写进 sessions.ini
+    std::string proxyPasswordFromUrl;
+    if (!s.proxyUrl.empty()) {
+        ProxyConfig proxy;
+        std::string error;
+        if (!parseProxyUrl(s.proxyUrl, proxy, error)) {
+            messageWarn(L"代理地址无效",
+                        toWide(error) + L"\n\n示例：socks5://127.0.0.1:1080 或 http://proxy:8080");
+            SetFocus(g_mgr.proxyUrl);
+            return false;
+        }
+        if (!proxy.user.empty()) s.proxyUser = proxy.user;
+        proxyPasswordFromUrl = proxy.password;
+        s.proxyUrl = proxyToUrl(proxy);  // 去掉 URL 里的凭据，只留 scheme://host:port
+    }
     if (!s.keyPath.empty()) s.keyPath = expandPath(s.keyPath);
 
     if (g_mgr.selected < 0 && g_app.store.find(s.name)) {
@@ -3934,6 +4142,7 @@ bool mgrSave(HWND hwnd) {
     const auto& sessions = g_app.store.sessions();
     bool passwordDropped = false;
     std::string renamedFrom;
+    bool proxyPasswordDropped = false;
     if (g_mgr.selected >= 0 && g_mgr.selected < static_cast<int>(sessions.size())) {
         const Session old = sessions[static_cast<std::size_t>(g_mgr.selected)];
         // 改名要把口令搬到新条目名下；保险库锁着时先请用户解锁，
@@ -3976,7 +4185,53 @@ bool mgrSave(HWND hwnd) {
             }
         }
         if (old.name != s.name) { renamedFrom = old.name; g_app.store.remove(old.name); }
+
+        // 代理密码：改了代理地址或用户名就作废旧口令；改名则迁移条目
+        if (old.saveProxyPassword) {
+            const bool proxyChanged =
+                old.proxyUrl != s.proxyUrl || old.proxyUser != s.proxyUser || s.proxyUrl.empty();
+            if (proxyChanged) {
+                deleteCredential(proxyPasswordTarget(old.name));
+                proxyPasswordDropped = true;
+                s.saveProxyPassword = false;
+            } else if (old.name != s.name) {
+                std::string stored;
+                std::string error;
+                if (loadCredential(proxyPasswordTarget(old.name), stored, &error) &&
+                    saveCredential(proxyPasswordTarget(s.name), stored, &error)) {
+                    deleteCredential(proxyPasswordTarget(old.name));
+                    s.saveProxyPassword = true;
+                } else {
+                    guiLog("迁移已保存的代理密码失败：" + error);
+                    s.saveProxyPassword = false;
+                    proxyPasswordDropped = true;
+                }
+                wipeString(stored);
+            } else {
+                s.saveProxyPassword = true;
+            }
+        }
     }
+
+    // 新输入的代理密码（含 URL 里带的）存进保险库；新会话也走这里
+    if (!s.proxyUrl.empty()) {
+        std::wstring typed = g_mgr.proxyPass ? textOf(g_mgr.proxyPass) : std::wstring();
+        std::string proxyPassword = typed.empty() ? proxyPasswordFromUrl : toUtf8(typed);
+        if (!proxyPassword.empty()) {
+            if (g_app.vault.unlocked()) {
+                std::string error;
+                if (saveCredential(proxyPasswordTarget(s.name), proxyPassword, &error)) {
+                    s.saveProxyPassword = true;
+                } else {
+                    guiLog("保存代理密码失败：" + error);
+                }
+            } else {
+                guiLog("保险库未解锁，代理密码本次不保存");
+            }
+        }
+        wipeString(proxyPassword);
+    }
+
     g_app.store.upsert(s);
     g_app.store.save();
     if (!renamedFrom.empty()) renameSessionTabs(renamedFrom, s.name);
@@ -4022,6 +4277,7 @@ void mgrDelete(HWND hwnd) {
     // 会话没了，口令也没有归属了：一并清掉，别在保险库里留孤儿
     if (removed.savePassword) deleteCredential(credentialTarget(name));
     if (removed.saveKeyPassphrase) deleteCredential(keyPassphraseTarget(name));
+    if (removed.saveProxyPassword) deleteCredential(proxyPasswordTarget(name));
     g_app.store.remove(name);
     g_app.store.save();
 
@@ -4122,6 +4378,23 @@ LRESULT CALLBACK sessionMgrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                 l.key.right - l.key.left, l.key.bottom - l.key.top);
             g_mgr.note = addEdit(hwnd, ID_MGR_NOTE, L"", l.note.left, l.note.top,
                                  l.note.right - l.note.left, l.note.bottom - l.note.top);
+            g_mgr.proxyUrl = addEdit(hwnd, ID_MGR_PROXY_URL, L"", l.proxyUrl.left,
+                                     l.proxyUrl.top, l.proxyUrl.right - l.proxyUrl.left,
+                                     l.proxyUrl.bottom - l.proxyUrl.top);
+            g_mgr.proxyUser = addEdit(hwnd, ID_MGR_PROXY_USER, L"", l.proxyUser.left,
+                                      l.proxyUser.top, l.proxyUser.right - l.proxyUser.left,
+                                      l.proxyUser.bottom - l.proxyUser.top);
+            g_mgr.proxyPass = addEdit(hwnd, ID_MGR_PROXY_PASS, L"", l.proxyPass.left,
+                                      l.proxyPass.top, l.proxyPass.right - l.proxyPass.left,
+                                      l.proxyPass.bottom - l.proxyPass.top, ES_PASSWORD);
+            g_mgr.keepAliveSec = addEdit(hwnd, ID_MGR_KEEPALIVE, L"30", l.keepAliveSec.left,
+                                         l.keepAliveSec.top,
+                                         l.keepAliveSec.right - l.keepAliveSec.left,
+                                         l.keepAliveSec.bottom - l.keepAliveSec.top, ES_NUMBER);
+            // 深色主题下 EM_SETCUEBANNER 不渲染，自己画占位文字
+            if (g_mgr.proxyUrl) SetWindowSubclass(g_mgr.proxyUrl, proxyCueProc, 1, reinterpret_cast<DWORD_PTR>(kProxyCueUrl));
+            if (g_mgr.proxyUser) SetWindowSubclass(g_mgr.proxyUser, proxyCueProc, 2, reinterpret_cast<DWORD_PTR>(kProxyCueUser));
+            if (g_mgr.proxyPass) SetWindowSubclass(g_mgr.proxyPass, proxyCueProc, 3, reinterpret_cast<DWORD_PTR>(kProxyCuePass));
             auto button = [&](int id, const wchar_t* text, const RECT& rc, bool primary = false) {
                 return addButton(hwnd, id, text, rc.left, rc.top, rc.right - rc.left,
                                  rc.bottom - rc.top, primary);
@@ -4173,6 +4446,17 @@ LRESULT CALLBACK sessionMgrProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (index >= 0) {
                 mgrSelect(hwnd, index);
                 return 0;
+            }
+            // 保活勾选框
+            {
+                const MgrLayout layout = mgrLayout();
+                if (PtInRect(&layout.keepAliveBox, pt)) {
+                    g_mgr.keepAliveOn = !g_mgr.keepAliveOn;
+                    if (g_mgr.keepAliveSec)
+                        EnableWindow(g_mgr.keepAliveSec, g_mgr.keepAliveOn ? TRUE : FALSE);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
             }
             focusEditAt(hwnd, pt);
             return 0;
@@ -6175,6 +6459,12 @@ ConnectionOptions makeRemoteOptions(const Session& session, const std::wstring& 
     wipeString(utf8KeyPassphrase);
     options.timeoutSec = 15;
     options.allowDefaultKeys = true;
+
+    if (!session.proxyUrl.empty()) {
+        std::string proxyError;
+        if (!applySessionProxy(options, session, proxyError))
+            guiLog("文件通道的代理配置无效：" + proxyError);
+    }
     if (options.user.empty()) {
         if (const char* env = std::getenv("USERNAME")) options.user = env;
     }

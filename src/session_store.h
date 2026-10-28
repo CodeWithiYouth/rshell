@@ -18,6 +18,13 @@ struct Session {
     bool savePassword = false;
     // 私钥口令同理：sessions.ini 只记标记，口令本体在密码保险库。
     bool saveKeyPassphrase = false;
+    // 代理：URL 里不带密码（socks5://host:port 或 http://host:port），
+    // 用户名可明文存；密码和 SSH 密码一样只放保险库
+    std::string proxyUrl;
+    std::string proxyUser;
+    bool saveProxyPassword = false;
+    // SSH 层保活间隔（秒），0 表示关闭；默认开启 30 秒
+    int keepAliveSec = 30;
 };
 
 class SessionStore {

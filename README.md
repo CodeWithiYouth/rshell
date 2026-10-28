@@ -8,10 +8,10 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 **Windows 10/11，64 位，按需下载：**
 
-- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.1/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
-- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.1/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.2/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.2/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
 
-两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.2.1 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.2.1)。
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.2.2 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.2.2)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -32,6 +32,7 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 - **远端路径：** 点 SFTP 面板顶部的路径框，输入路径并回车；Ctrl+L 也可打开路径输入。
 - **搜索终端输出：** Ctrl+Shift+F，然后按 Enter / Shift+Enter 浏览匹配项。
 - **断线重连：** Ctrl+Shift+R。
+- **保持活动状态：** 会话管理里勾选「保活」并填间隔（默认 30 秒），空闲时定时发送 SSH 保活消息，避免 NAT/防火墙把连接断开。
 - **AI 助手：** Ctrl+J 或菜单 →「AI 助手」，在当前会话右侧展开；面板内可切换到全屏。
 - **终端字号：** Ctrl++ 放大、Ctrl+- 缩小、Ctrl+0 重置。
 - **复制与粘贴：** 选中终端文本自动复制；Ctrl+V 粘贴。没有选中文本时，Ctrl+C 会向远端发送中断信号。
@@ -48,6 +49,8 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
    - 本地 Ollama：`http://127.0.0.1:11434/v1`（仅本机允许明文 HTTP）
    - OpenCode Go：`https://opencode.ai/inference/go/openai/v1`，模型填 `kimi-k3` / `deepseek-v4.1-flash` 这类不带前缀的 ID
 4. 直接提问，例如「磁盘怎么满了」「看看 nginx 为什么返回 502」。
+
+回答支持基础的 Markdown 渲染：标题、列表、引用、代码块和表格都会按格式显示。
 
 **权限模型：**
 
@@ -72,13 +75,15 @@ rshell 不会把连接密码写进会话列表。若选择记住密码，密码�
 .\rshell.exe ls -l user@host:/var/log
 .\rshell.exe put .\report.txt user@host:/tmp/
 .\rshell.exe get user@host:/var/log/syslog .\logs\
+.\rshell.exe --proxy socks5://127.0.0.1:1080 exec user@host "uname -a"
 .\rshell.exe sftp user@host
 ```
 
-完整参数运行 `.\rshell.exe --help`。
+完整参数运行 `.\rshell.exe --help`。--keepalive <秒> 可开启保活；`--proxy` 支持 `socks5://[用户:口令@]主机:端口` 和 `http://...`（HTTP CONNECT）。
 
 ## 帮助与反馈
 
+- [更新日志](CHANGELOG.md)
 - [高级功能、构建与安全说明](docs/TECHNICAL.md)
 - [测试指南](tests/README.md)
 - [报告问题或提出建议](https://github.com/CodeWithiYouth/rshell/issues)

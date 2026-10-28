@@ -16,7 +16,9 @@ struct Options {
     int port = 0;
     std::string keyPath;
     std::string password;
-    std::string configPath;    // 备用 ssh config 路径
+    std::string configPath;    // 指定 ssh config 路径
+    std::string proxyUrl;
+    int keepAliveSec = 0;     // 0 = 关闭      // socks5://host:port 或 http://host:port
     int timeoutSec = 0;
     bool strictHostKey = false;
     bool skipHostKeyCheck = false;

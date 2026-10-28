@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(rshell VERSION 1.2.1 LANGUAGES CXX)
+project(rshell VERSION 1.2.2 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -172,6 +172,7 @@ add_library(rshell_core STATIC
     src/protected_secret.cpp
     src/vault.cpp
     src/ssh_session.cpp
+    src/proxy.cpp
     src/sftp_client.cpp
 )
 
@@ -219,6 +220,7 @@ if(WIN32)
         src/ai_tools.cpp
         src/ai_agent.cpp
         src/ai_settings.cpp
+        src/md.cpp
     )
 
     add_executable(rshell_gui WIN32
@@ -231,9 +233,10 @@ if(WIN32)
         src/ai_ssh_backend.cpp   # 依赖 RemoteFs，只编进 GUI
         src/ai_panel.cpp         # GDI 自绘面板，只编进 GUI
         src/ai_tab.cpp           # AI 标签页：子窗口 + 工作线程
+        src/md_render.cpp        # Markdown 的 GDI 排版
         src/rshell.rc
     )
-    target_link_libraries(rshell_gui PRIVATE rshell_core comdlg32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp)
+    target_link_libraries(rshell_gui PRIVATE rshell_core comdlg32 comctl32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp)
     set_target_properties(rshell_gui PROPERTIES OUTPUT_NAME "rshell-gui")
 endif()
 
@@ -257,6 +260,17 @@ endif()
 # 端到端测试（需要 Python 3 + paramiko；本地拉起临时 SFTP 服务器）
 # ---------------------------------------------------------------------------
 find_package(Python3 COMPONENTS Interpreter QUIET)
+if(RSHELL_BUILD_TESTS AND Python3_Interpreter_FOUND)
+    # 代理连通性：本地 SSH + SOCKS5 / HTTP CONNECT（都要求认证）
+    add_custom_target(rshell_proxy_e2e
+        COMMAND  /tests/proxy_test.py
+                --exe $<TARGET_FILE:rshell>
+        WORKING_DIRECTORY 
+        DEPENDS rshell
+        COMMENT "运行 SOCKS5 / HTTP CONNECT 代理连通性测试"
+        USES_TERMINAL)
+endif()
+
 if(RSHELL_BUILD_TESTS AND Python3_Interpreter_FOUND)
     add_custom_target(rshell_e2e
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/e2e_test.py
@@ -283,9 +297,9 @@ if(RSHELL_BUILD_TESTS)
         # 隐藏窗口回归：直接调用 GUI 的标签、事件分发及连接清理路径。
         add_executable(rshell_gui_tabs_probe tests/gui_tabs_probe.cpp
             src/terminal.cpp src/ssh_shell.cpp src/session_store.cpp src/remote_fs.cpp
-            src/ai_panel.cpp src/ai_tab.cpp src/ai_ssh_backend.cpp ${RSHELL_AI_SOURCES})
+            src/ai_panel.cpp src/ai_tab.cpp src/ai_ssh_backend.cpp src/md_render.cpp ${RSHELL_AI_SOURCES})
         target_link_libraries(rshell_gui_tabs_probe PRIVATE rshell_core
-            comdlg32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp)
+            comdlg32 comctl32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp)
         add_test(NAME rshell_gui_tabs COMMAND rshell_gui_tabs_probe)
 
         # AI 工具链对真实 SSH/SFTP 的冒烟测试（需先启动 tests/sftp_test_server.py）

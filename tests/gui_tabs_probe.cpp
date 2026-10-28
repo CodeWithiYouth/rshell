@@ -265,6 +265,44 @@ void networkRegression(int port, const std::string& upload, const std::string& d
     check(g_app.shell->running(), "active connection survives closing a pending connection");
 }
 
+void sessionMgrLayoutRegression() {
+    const MgrLayout l = mgrLayout();
+    const int width = mgrWidth();
+    const int height = mgrHeight();
+
+    auto inside = [&](const RECT& r, const char* what) {
+        check(r.left >= 0 && r.top >= 0 && r.right <= width && r.bottom <= height, what);
+        check(r.right > r.left && r.bottom > r.top, what);
+    };
+    inside(l.name, "name field inside dialog");
+    inside(l.proxyUrl, "proxy url field inside dialog");
+    inside(l.proxyUser, "proxy user field inside dialog");
+    inside(l.proxyPass, "proxy password field inside dialog");
+    inside(l.keepAliveBox, "keepalive checkbox inside dialog");
+    inside(l.keepAliveSec, "keepalive interval inside dialog");
+    inside(l.hint, "hint block inside dialog");
+    inside(l.pwdState, "password state inside dialog");
+    inside(l.pwdClear, "clear password button inside dialog");
+    inside(l.save, "save button inside dialog");
+    inside(l.remove, "delete button inside dialog");
+    inside(l.btnNew, "new button inside dialog");
+    inside(l.btnClose, "close button inside dialog");
+    inside(l.btnConnect, "connect button inside dialog");
+
+    // 纵向顺序：代理两行在备注之后，状态/按钮在代理之后
+    check(l.proxyUrl.top >= l.note.bottom, "proxy row sits below note");
+    check(l.proxyUser.top >= l.proxyUrl.bottom, "proxy credentials below proxy url");
+    check(l.proxyPass.top == l.proxyUser.top, "proxy user and password share a row");
+    check(l.proxyUser.right < l.proxyPass.left, "proxy user and password do not overlap");
+    check(l.keepAliveSec.top >= l.proxyPass.bottom, "keepalive row below proxy fields");
+    check(l.hint.top >= l.keepAliveSec.bottom, "hint sits below keepalive row");
+    check(l.pwdState.top >= l.hint.bottom, "password state below hint");
+    check(l.save.top >= l.pwdState.bottom, "action buttons below password state");
+    check(l.btnNew.top >= l.save.bottom, "bottom buttons below actions");
+    check(l.proxyPassLabelX > l.proxyUser.right && l.proxyPassLabelX < l.proxyPass.left,
+          "proxy password label sits between the two fields");
+}
+
 void panelScrollRegression() {
     ai::ChatPanel panel;
     ai::PanelFonts fonts;
@@ -396,6 +434,7 @@ int main(int argc, char** argv) {
         check(window != nullptr,"create hidden GUI window");
         stateRegression();
         panelScrollRegression();
+        sessionMgrLayoutRegression();
         aiTabRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);
         DestroyWindow(window); window = nullptr;

@@ -3,6 +3,8 @@
 
 #include <libssh2.h>
 
+#include "proxy.h"
+
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -20,6 +22,10 @@ struct ConnectionOptions {
     bool verifyHostKey = true;     // 使用 known_hosts 校验
     bool strictHostKey = false;    // 未知主机直接拒绝（不询问）
     int timeoutSec = 20;
+    // SSH 层保活间隔（秒），0 表示不发；只对交互终端会话生效
+    int keepAliveSec = 0;
+    // 为空表示直连；配置后会先连代理再交给 libssh2
+    ProxyConfig proxy;
 
     // 未知主机时由宿主程序（如 GUI）询问用户；返回 true 表示信任并写入 known_hosts。
     // 未设置时沿用终端交互逻辑（仅 stdin 是 tty 才询问）。

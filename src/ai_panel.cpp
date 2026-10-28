@@ -9,6 +9,7 @@
 #include <ole2.h>
 #include <gdiplus.h>
 
+#include "md_render.h"
 #include "ui_theme.h"
 
 namespace rshell::ai {
@@ -203,11 +204,71 @@ int ChatPanel::dp(int value) const {
     return value;
 }
 
+namespace {
+HFONT cloneScaledFont(HFONT base, double factor) {
+    if (!base) return nullptr;
+    LOGFONTW info{};
+    if (!GetObjectW(base, sizeof(info), &info)) return nullptr;
+    info.lfHeight = static_cast<LONG>(static_cast<double>(info.lfHeight) * factor);
+    info.lfWeight = FW_BOLD;
+    return CreateFontIndirectW(&info);
+}
+HFONT cloneItalicFont(HFONT base) {
+    if (!base) return nullptr;
+    LOGFONTW info{};
+    if (!GetObjectW(base, sizeof(info), &info)) return nullptr;
+    info.lfItalic = TRUE;
+    return CreateFontIndirectW(&info);
+}
+}  // namespace
+
+ChatPanel::~ChatPanel() {
+    for (HFONT font : headingFonts_) {
+        if (font) DeleteObject(font);
+    }
+    if (italicFont_) DeleteObject(italicFont_);
+}
+
+void ChatPanel::rebuildDerivedFonts() {
+    for (HFONT& font : headingFonts_) {
+        if (font) {
+            DeleteObject(font);
+            font = nullptr;
+        }
+    }
+    if (italicFont_) {
+        DeleteObject(italicFont_);
+        italicFont_ = nullptr;
+    }
+    headingFonts_[0] = cloneScaledFont(fonts_.ui, 1.45);
+    headingFonts_[1] = cloneScaledFont(fonts_.ui, 1.24);
+    headingFonts_[2] = cloneScaledFont(fonts_.ui, 1.10);
+    italicFont_ = cloneItalicFont(fonts_.ui);
+}
+
 void ChatPanel::setFonts(PanelFonts fonts) {
     fonts_ = fonts;
     if (!fonts_.caption) fonts_.caption = fonts_.ui;
     if (!fonts_.bold) fonts_.bold = fonts_.ui;
     if (!fonts_.mono) fonts_.mono = fonts_.ui;
+    rebuildDerivedFonts();
+}
+
+md::Style ChatPanel::markdownStyle(HDC dc) const {
+    md::Style style;
+    style.normal = fonts_.ui;
+    style.bold = fonts_.bold;
+    style.italic = italicFont_ ? italicFont_ : fonts_.ui;
+    style.mono = fonts_.mono;
+    for (int i = 0; i < 3; ++i) style.heading[i] = headingFonts_[i];
+    style.text = toColorRef(ui::text);
+    style.dim = toColorRef(ui::textDim);
+    style.accent = toColorRef(ui::accent);
+    style.codeFg = toColorRef(0xBED7C3);
+    style.codeBg = toColorRef(0x121A16);
+    style.border = toColorRef(ui::borderSoft);
+    style.bodyHeight = lineHeight(dc, fonts_.ui);
+    return style;
 }
 
 void ChatPanel::setCallbacks(PanelActions actions) { actions_ = std::move(actions); }
@@ -385,7 +446,7 @@ int ChatPanel::itemHeight(HDC dc, const ChatItem& item, int width) const {
             return labelFont + 4 + wrappedHeight(dc, item.body, fonts_.ui, width - 20) + 16;
 
         case ItemKind::Assistant: {
-            const int body = wrappedHeight(dc, item.body, fonts_.ui, width);
+            const int body = md::layout(dc, 0, 0, width, item.body, markdownStyle(dc), false);
             return labelFont + 4 + std::max(body, bodyFont) + 8;
         }
 
@@ -683,8 +744,8 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
                          accent, fonts_.caption, DT_LEFT | DT_TOP | DT_SINGLELINE);
             }
             RECT bodyRect{textLeft, rc.top + cap + 4, rc.right, rc.bottom};
-            drawText(dc, item.body, bodyRect, item.ok ? text : danger, fonts_.ui,
-                     DT_LEFT | DT_TOP | DT_WORDBREAK | DT_EDITCONTROL);
+            md::layout(dc, bodyRect.left, bodyRect.top, bodyRect.right - bodyRect.left,
+                        item.body, markdownStyle(dc), true);
             return;
         }
 
@@ -1062,6 +1123,33 @@ bool renderPreview(const wchar_t* bmpPath, int width, int height, int mode) {
     panel.setModelName(L"deepseek-chat");
     panel.setHostLabel(L"8.148.6.178", true);
     panel.setStatus(L"就绪");
+
+    if (mode == 3) {
+        // Markdown 压力测试：标题、行内样式、列表、引用、代码块、表格
+        panel.addUser(L"帮我总结一下磁盘占用");
+        const std::size_t index = panel.beginAssistant();
+        panel.appendAssistant(
+            index,
+            L"## 结论\n\n根分区 **已用 92%**，主要是 `/var/lib/docker`。\n\n"
+            L"### 建议\n\n1. 先清理悬空镜像\n2. 再压缩日志\n\n"
+            L"- `docker system prune -af`\n- 压缩 `/var/log/*.gz`\n\n"
+            L"> 删除前建议先 `docker images` 确认。\n\n"
+            L"```bash\ndocker system df\njournalctl --vacuum-time=7d\n```\n\n"
+            L"| 路径 | 占用 | 建议 |\n| --- | ---: | :---: |\n"
+            L"| /var/lib/docker | 61 GB | 清理 |\n| /var/log | 8 GB | 轮转 |\n"
+            L"| /home | 3 GB | 保留 |\n\n---\n\n处理完预计可释放 **约 40 GB**。");
+        panel.finishAssistant(index, true);
+        panel.paint(mem);
+        const bool okMd = writeBmp(bmpPath, bits, width, height);
+        SelectObject(mem, oldBmp);
+        DeleteObject(dib);
+        DeleteDC(mem);
+        DeleteObject(fonts.ui);
+        DeleteObject(fonts.bold);
+        DeleteObject(fonts.mono);
+        DeleteObject(fonts.caption);
+        return okMd;
+    }
 
     if (mode == 2) {
         // 长路径压力测试：单行标题、消息正文、审批卡各放一条超长无空格路径

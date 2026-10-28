@@ -71,6 +71,15 @@ SessionStore SessionStore::load(const std::string& path) {
         } else if (key == "savepassword" || key == "save-password") {
             current.savePassword = (value == "1" || iequals(value, "true") ||
                                     iequals(value, "yes") || iequals(value, "on"));
+        } else if (key == "keepalive" || key == "keep-alive") {
+            current.keepAliveSec = std::atoi(value.c_str());
+        } else if (key == "proxy") {
+            current.proxyUrl = value;
+        } else if (key == "proxyuser" || key == "proxy-user") {
+            current.proxyUser = value;
+        } else if (key == "saveproxypassword" || key == "save-proxy-password") {
+            current.saveProxyPassword = (value == "1" || iequals(value, "true") ||
+                                         iequals(value, "yes") || iequals(value, "on"));
         } else if (key == "savekeypassphrase" || key == "save-key-passphrase") {
             current.saveKeyPassphrase = (value == "1" || iequals(value, "true") ||
                                          iequals(value, "yes") || iequals(value, "on"));
@@ -102,6 +111,13 @@ bool SessionStore::save() const {
         // 只记标记：密码/私钥口令在密码保险库里，条目名 rshell/<会话名>
         if (s.savePassword) out << "savepassword=1\n";
         if (s.saveKeyPassphrase) out << "savekeypassphrase=1\n";
+        // 总是写：0 表示用户明确关掉了，不能靠"缺省即开启"覆盖掉它
+        out << "keepalive=" << (s.keepAliveSec > 0 ? s.keepAliveSec : 0) << "\n";
+        if (!s.proxyUrl.empty()) {
+            out << "proxy=" << s.proxyUrl << "\n";
+            if (!s.proxyUser.empty()) out << "proxyuser=" << s.proxyUser << "\n";
+            if (s.saveProxyPassword) out << "saveproxypassword=1\n";
+        }
     }
 
     std::ofstream file(p, std::ios::binary | std::ios::trunc);

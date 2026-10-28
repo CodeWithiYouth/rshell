@@ -21,6 +21,9 @@ std::string credentialTarget(const std::string& sessionName);
 // 会话私钥口令的条目名：rshell/<sessionName>/key-passphrase
 std::string keyPassphraseTarget(const std::string& sessionName);
 
+// 代理密码的条目名：rshell/<sessionName>/proxy-password
+std::string proxyPasswordTarget(const std::string& sessionName);
+
 // 保存（或覆盖）一条口令。保险库未解锁时返回 false，error（可空）给出原因。
 bool saveCredential(const std::string& target, const std::string& password,
                     std::string* error = nullptr);

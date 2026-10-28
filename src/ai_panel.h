@@ -15,7 +15,12 @@
 #include <windows.h>
 #endif
 
+namespace rshell {
+namespace md { struct Style; }
+}  // namespace rshell
+
 namespace rshell::ai {
+
 
 enum class ItemKind {
     User,
@@ -65,6 +70,7 @@ struct PanelActions {
 
 class ChatPanel {
 public:
+    ~ChatPanel();
     void setFonts(PanelFonts fonts);
     void setCallbacks(PanelActions actions);
     void setBounds(const RECT& bounds);
@@ -139,6 +145,8 @@ private:
     void drawButton(HDC dc, const RECT& rc, const std::wstring& label, std::uint32_t fill,
                     std::uint32_t textColor, bool hovered);
     int itemHeight(HDC dc, const ChatItem& item, int contentWidth) const;
+    void rebuildDerivedFonts();
+    md::Style markdownStyle(HDC dc) const;
     void pushHistory(const ChatItem& item);
     void scrollToBottom();
     void clampScroll(int viewportHeight, int contentHeight);
@@ -150,6 +158,8 @@ private:
     bool layoutDirty_ = true;
     bool lastItemDirty_ = false;
     PanelFonts fonts_;
+    HFONT headingFonts_[3]{};
+    HFONT italicFont_ = nullptr;
     PanelActions actions_;
     RECT bounds_{0, 0, 420, 700};
     int scrollBack_ = 0;  // 距离底部的像素数，0 表示贴底

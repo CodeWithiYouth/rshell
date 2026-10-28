@@ -532,6 +532,7 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
 | `ai_tools` | 工具定义、读写分级、路径黑名单、凭据脱敏、输出截断 |
 | `ai_agent` | 对话循环、工具调用、历史裁剪、审批状态机 |
 | `ai_ssh_backend` | 把 `RemoteFs` 适配成工具后端 |
+| `md` / `md_render` | 基础 Markdown 解析（含表格）与 GDI 混排；解析层不依赖 GDI，可单测 |
 | `ai_panel` | GDI 自绘面板（消息、审批卡、输入框、滚动） |
 | `ai_tab` | 会话内的停靠/全屏窗口、工作线程、审批桥接、设置视图 |
 | `ai_settings` | `~/.rshell/ai.ini` + 保险库条目 `ai.apiKey` |
@@ -595,6 +596,31 @@ build\modern\rshell_ai_probe.exe 127.0.0.1 2299 tester testpass   # 真实 SSH/S
 rshell-gui.exe --ai-preview out.bmp    # 离屏渲染演示对话
 rshell-gui.exe --ai-paths out.bmp      # 长路径压力测试
 rshell-gui.exe --ai-welcome out.bmp    # 空状态
+```
+
+### 保活
+
+会话可以单独开「保持活动状态」：勾选后按间隔（默认 30 秒，钳在 5~3600）发送 SSH 层的
+`keepalive@openssh.com`（`libssh2_keepalive_config` + `libssh2_keepalive_send`，want_reply=1）。
+
+- 只作用于交互终端会话（`SshShell` 的读线程空闲分支里发送）；文件/AI 通道本来就有 5 秒一次的状态采样。
+- 用途：穿过 NAT/防火墙的空闲超时，并尽早发现半开连接（want_reply 拿不到回应会暴露断链）。
+- CLI 对应 `--keepalive <秒>`；会话配置存在 `sessions.ini` 的 `keepalive=`。
+## 代理连接
+
+SSH 可以经 SOCKS5 或 HTTP CONNECT 代理连出，终端、SFTP 面板和 AI 工具都生效（它们共用 `SshSession`）。
+
+- **接入点只有一处**：`SshSession::openTcp()` 在交给 libssh2 之前把 socket 换成「经代理连出去」的那个；握手、KEX、认证逻辑完全不变。
+- **协议**：SOCKS5（含用户名/密码认证，目标主机名交给代理解析，便于远端 DNS）、HTTP CONNECT（含 Basic 认证）。
+- **配置**：GUI 在「会话管理 → 代理」填 `socks5://主机:端口` 或 `http://主机:端口`；CLI 用 `--proxy`。
+- **凭据**：URL 里的 `用户:口令@` 会在保存前剥离；用户名明文存 `sessions.ini`，密码进密码保险库（条目 `rshell/<会话>/proxy-password`）。
+- **失败不静默**：代理解析失败或连不上时直接报错，不会退回直连。
+- **Win7**：纯 Winsock 2.2，无新增依赖。
+
+连通性测试（本地 SSH + 两个要求认证的代理）：
+
+```powershell
+python tests/proxy_test.py --exe build\modern\rshell.exe
 ```
 
 ## 命令行速览

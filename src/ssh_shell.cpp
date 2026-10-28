@@ -42,6 +42,13 @@ void SshShell::start(const ConnectionOptions& options, const std::string& term, 
     if (libssh2_channel_shell(channel_) != 0) throw Error("远端拒绝启动 shell");
 
     libssh2_session_set_blocking(raw, 0);
+
+    // SSH 层保活：按间隔发 keepalive@openssh.com（want_reply=1），
+    // 用来穿过 NAT/防火墙的空闲超时，并尽早发现半开连接
+    keepAliveSec_ = options.keepAliveSec > 0 ? options.keepAliveSec : 0;
+    if (keepAliveSec_ > 0)
+        libssh2_keepalive_config(raw, 1, static_cast<unsigned int>(keepAliveSec_));
+
     connected_ = true;
     running_ = true;
     stop_ = false;
@@ -122,6 +129,13 @@ void SshShell::readerLoop() {
             break;
         }
         if (!active) {
+            if (keepAliveSec_ > 0 && session_) {
+                LIBSSH2_SESSION* raw = session_->raw();
+                if (raw) {
+                    int secondsToNext = 0;
+                    libssh2_keepalive_send(raw, &secondsToNext);  // 未到间隔时是空操作
+                }
+            }
             std::unique_lock<std::mutex> lock(mutex_);
             wake_.wait_for(lock, std::chrono::milliseconds(8), [&]() {
                 return stop_.load() || (pending.empty() && cols == 0 &&

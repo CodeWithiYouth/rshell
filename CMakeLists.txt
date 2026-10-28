@@ -53,6 +53,12 @@ option(RSHELL_STATIC_CRT "静态链接 MSVC 运行库（/MT），分发无需 VC
 
 if(MSVC)
     add_compile_options(/utf-8 /W4 /permissive-)
+    # 体积优先：/Os 比默认的 /O2 少约 10% 代码段（GUI -290 KB、CLI -135 KB）。
+    # 实测终端解析吞吐（24 MB 回放）与 /O2 完全一致，因此默认整体用 /Os。
+    add_compile_options(/Os)
+    # 少数热点仍用 /O2：终端解析、SFTP 传输缓冲、字符串工具（实测体积代价 < 1 KB）
+    set_source_files_properties(src/terminal.cpp src/sftp_client.cpp src/util.cpp
+        PROPERTIES COMPILE_OPTIONS "/O2")
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
     # vcpkg 的 *-static 三元组使用 /MT 运行库，必须保持一致
     if(DEFINED VCPKG_TARGET_TRIPLET AND VCPKG_TARGET_TRIPLET MATCHES "static")

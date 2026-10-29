@@ -11,6 +11,7 @@
 
 #include <windows.h>
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -26,13 +27,18 @@ namespace ai {
 
 // 一个可选的目标主机。backend 是 RemoteFs*，为空表示该会话还没建立文件连接。
 struct AiHostInfo {
+    // tabId：面板是全局的，靠它把「当前标签 / 一轮对话的目标」对应回具体会话。
+    // 用 id 而不是下标，标签增减时不会张冠李戴。
+    std::uintptr_t id = 0;
     std::wstring label;
-    void* backend = nullptr;
+    void* backend = nullptr;  // RemoteFs*，为空表示该标签还没连上
 };
 
 struct AiTabContext {
     // 每次需要时重新枚举，避免持有过期指针
     std::function<std::vector<AiHostInfo>()> hosts;
+    // 当前激活标签的 id（面板空闲时按它选目标主机）
+    std::function<std::uintptr_t()> activeHostId;
     Vault* vault = nullptr;
     // 保险库未解锁时由宿主弹出解锁框；返回 true 表示已解锁
     std::function<bool()> ensureVaultUnlocked;
@@ -58,6 +64,10 @@ public:
     void show(bool visible);
     void focus();
     void setFullScreen(bool full);
+    // 换标签后刷新标题上的主机名
+    void refreshHost();
+    // 当前目标主机的名字（回归测试用）
+    std::wstring hostLabel() const { return currentHostLabel(); }
     // 打开设置视图；unlockOnly=true 表示从空状态「解锁」进来
     // （解锁成功且已经读到 Key 就直接返回，不弹表单）
     void startSettings(bool unlockOnly = false);
@@ -112,7 +122,11 @@ private:
 
     std::wstring currentHostLabel() const;
     void* currentBackend() const;
-    void cycleHost();
+    // 一轮对话内锁定发问时的那台主机，避免中途切标签把命令打到别的机器上
+    void* turnBackend() const;
+    std::uintptr_t activeHostId() const;
+    std::wstring hostLabelById(std::uintptr_t id) const;
+    void* hostBackendById(std::uintptr_t id) const;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;   // 隐藏 Client/Agent/工具链，避免头文件依赖
@@ -121,7 +135,8 @@ private:
     ChatPanel panel_;
     AiTabContext context_;
     std::vector<std::size_t> hostHits_;
-    int hostIndex_ = 0;
+    // 一轮对话里锁定的目标标签；0 表示还没开始新的一轮
+    std::uintptr_t turnHostId = 0;
     bool settingsOpen_ = false;
 };
 

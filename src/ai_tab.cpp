@@ -196,7 +196,7 @@ struct ApprovalSlot {
 
 struct AiTab::Impl {
     explicit Impl(AiTab* owner) : registry(backend), agent(client, registry) {
-        backend.resolve = [owner]() { return owner->currentBackend(); };
+        backend.resolve = [owner]() { return owner->turnBackend(); };
     }
 
     RoutedBackend backend;
@@ -322,7 +322,8 @@ void AiTab::initialize(HWND) {
         impl_->assistantIndex = static_cast<std::size_t>(-1);
         updateWelcome();
     };
-    actions.onHost = [this]() { cycleHost(); };
+    // 面板是全局的，换主机 = 换标签，标题上的主机名只做展示
+    actions.onHost = []() {};
     actions.onToggleFullScreen = [this]() {
         if (context_.onToggleFullScreen) context_.onToggleFullScreen();
     };
@@ -388,37 +389,45 @@ void AiTab::focus() {
 // ---------------------------------------------------------------- 主机
 
 void AiTab::updateHostLabel() {
-    const auto hosts = context_.hosts ? context_.hosts() : std::vector<AiHostInfo>();
-    const bool clickable = hosts.size() > 1;
-    panel_.setHostLabel(currentHostLabel(), clickable);
+    // 面板是全局的：标题上显示「当前标签」对应的主机，多个标签时点一下也没得切，
+    // 换主机就是换标签，所以这里不再做成可点击。
+    panel_.setHostLabel(currentHostLabel(), false);
 }
 
-std::wstring AiTab::currentHostLabel() const {
-    if (!context_.hosts) return std::wstring();
-    const auto hosts = context_.hosts();
-    if (hosts.empty()) return L"未连接主机";
-    const int index = std::clamp(hostIndex_, 0, static_cast<int>(hosts.size()) - 1);
-    return hosts[static_cast<std::size_t>(index)].label;
-}
-
-void* AiTab::currentBackend() const {
-    if (!context_.hosts) return nullptr;
-    const auto hosts = context_.hosts();
-    if (hosts.empty()) return nullptr;
-    const int index = std::clamp(hostIndex_, 0, static_cast<int>(hosts.size()) - 1);
-    return hosts[static_cast<std::size_t>(index)].backend;
-}
-
-void AiTab::cycleHost() {
-    if (!context_.hosts) return;
-    const auto hosts = context_.hosts();
-    if (hosts.size() < 2) return;
-    hostIndex_ = (hostIndex_ + 1) % static_cast<int>(hosts.size());
+void AiTab::refreshHost() {
     updateHostLabel();
-    panel_.addNotice(L"目标主机已切换到 " + currentHostLabel());
-    InvalidateRect(window_, nullptr, FALSE);
+    if (window_) InvalidateRect(window_, nullptr, FALSE);
 }
 
+// 当前标签对应的主机（面板空闲时用它）
+std::uintptr_t AiTab::activeHostId() const {
+    return context_.activeHostId ? context_.activeHostId() : 0;
+}
+
+// 注意：context_.hosts() 每次返回一个临时 vector，不能把里面的地址带出去
+std::wstring AiTab::hostLabelById(std::uintptr_t id) const {
+    if (!context_.hosts) return L"未连接主机";
+    for (const auto& host : context_.hosts())
+        if (host.id == id) return host.label;
+    return L"未连接主机";
+}
+
+void* AiTab::hostBackendById(std::uintptr_t id) const {
+    if (!context_.hosts) return nullptr;
+    for (const auto& host : context_.hosts())
+        if (host.id == id) return host.backend;
+    return nullptr;
+}
+
+std::wstring AiTab::currentHostLabel() const { return hostLabelById(activeHostId()); }
+
+void* AiTab::currentBackend() const { return hostBackendById(activeHostId()); }
+
+// 一轮对话内使用发问时锁定的主机，避免中途切标签把命令打到别的机器上
+void* AiTab::turnBackend() const {
+    if (turnHostId != 0) return hostBackendById(turnHostId);  // 目标标签关了就返回空
+    return currentBackend();
+}
 // ---------------------------------------------------------------- 发送 / 取消
 
 void AiTab::updateKeyNotice() {
@@ -472,6 +481,9 @@ void AiTab::sendMessage(const std::wstring& text) {
                          true);
         return;
     }
+
+    // 锁定这一轮的目标标签：中途切标签也不会把命令打到别的机器上
+    turnHostId = activeHostId();
 
     panel_.addUser(text);
     impl_->agent.addUserMessage(toUtf8Text(text));
@@ -663,6 +675,7 @@ void AiTab::handleEvent(Event& event) {
                 impl_->assistantIndex = none;
             }
             impl_->busy = false;
+            turnHostId = 0;  // 这一轮结束，下次重新按当前标签取主机
             panel_.setBusy(false);
             panel_.setStatus(event.a);
             if (!event.ok && !event.a.empty()) panel_.addNotice(event.a, true);

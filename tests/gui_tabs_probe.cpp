@@ -193,6 +193,7 @@ void networkRegression(int port, const std::string& upload, const std::string& d
     const UINT_PTR alphaConnection=g_app.connectionId;
     connectStoredSession(beta.name);
     check(g_tabs.size()==2 && g_activeTab==1, "opening another saved session preserves a connecting tab");
+
     const UINT_PTR betaConnection=g_app.connectionId;
     auto state = [](UINT_PTR id) { return findSessionState(id,true); };
     const bool testHooks=std::getenv("RSHELL_TEST_CWD_HOOKS")!=nullptr;
@@ -210,6 +211,19 @@ void networkRegression(int port, const std::string& upload, const std::string& d
             (!testHooks || (queuedAlpha && queuedBeta));
     }, "two real SSH and SFTP connections establish concurrently");
     check(state(alphaConnection)->shell->running() && state(betaConnection)->shell->running(), "both real shells stay connected");
+
+    // 全局 AI 面板：换标签要跟着换目标主机，不能串台（以前两个标签的 host 会反过来）
+    {
+        const bool wasOpen = g_app.aiOpen;
+        if (!wasOpen) toggleAiPanel();
+        switchSessionTab(0);
+        check(g_app.aiTab != nullptr && g_app.aiTab->hostLabel() == L"alpha-ssh",
+              "the AI panel targets the first tab's host");
+        switchSessionTab(1);
+        check(g_app.aiTab->hostLabel() == L"beta-ssh",
+              "the AI panel targets the second tab's host");
+        if (!wasOpen) toggleAiPanel();
+    }
     if (testHooks) {
         check(queuedAlpha && queuedBeta, "each tab accepts queued input during its own integration phase");
         waitUntil([&] { return !state(alphaConnection)->cwdHookPhase && !state(betaConnection)->cwdHookPhase &&
@@ -456,26 +470,30 @@ void aiTabRegression() {    auto visible = [](HWND window) {
     setAiPanelFull(false);
     check(!g_app.aiFull, "back to docked mode");
 
+    // 面板是全局的一份：新开标签不会新建面板，也不会把它藏起来
     newSessionTab();
-    check(g_app.aiTab == nullptr, "a new session starts without an AI panel");
-    check(!visible(docked->window()), "inactive session's panel is hidden");
+    check(g_app.aiTab == docked, "a new session keeps the same global AI panel");
+    check(visible(docked->window()), "the panel stays visible on the new tab");
+    check(g_app.aiTab->hostLabel() != L"", "the panel has a host label for the new tab");
 
     for (std::size_t i = 0; i < g_tabs.size(); ++i) {
-        if (g_tabs[i] && g_tabs[i]->aiTab == docked) {
-            switchSessionTab(i);
-            break;
-        }
+        if (g_tabs[i] && g_tabs[i]->tabId == g_app.tabId) continue;
+        switchSessionTab(i);
+        break;
     }
     check(g_app.aiTab == docked && visible(docked->window()),
-          "the panel comes back with its own session");
+          "switching tabs keeps the single panel");
 
     toggleAiPanel();
     check(!g_app.aiOpen && !visible(docked->window()), "Ctrl+J hides the docked panel");
     toggleAiPanel();
     check(g_app.aiOpen && visible(docked->window()), "Ctrl+J reopens it");
 
-    closeSessionTab(g_activeTab);
-    check(g_app.aiTab == nullptr, "closing the session destroys its AI panel");
+    // 关掉一个标签也不会把面板一起销毁
+    const std::size_t closedTab = g_activeTab;
+    closeSessionTab(closedTab);
+    check(g_app.aiTab == docked, "closing a session keeps the global AI panel");
+    if (g_app.aiOpen) toggleAiPanel();  // 留下干净状态给后面的用例
 }
 
 // 停靠 AI 面板会把终端压窄：必须折行（不是截断），收起后要能并回原样

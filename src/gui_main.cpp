@@ -126,9 +126,6 @@ enum : int {
 
 struct SessionState {
     UINT_PTR tabId = 0;
-    bool aiOpen = false;   // 右侧 AI 面板是否展开
-    bool aiFull = false;   // 展开时是否全屏
-    ai::AiTab* aiTab = nullptr;  // 每个会话各有一份对话
     bool unread = false;
     enum class DownloadState { Active, Done, Failed, Cancelled };
     struct DownloadTask {
@@ -206,6 +203,10 @@ struct SessionState {
 
 struct App : SessionState {
     HINSTANCE inst = nullptr;
+    // AI 面板是全局的一份：所有标签共用一个对话，工具调用的目标主机跟着当前标签走
+    ai::AiTab* aiTab = nullptr;
+    bool aiOpen = false;   // 右侧 AI 面板是否展开
+    bool aiFull = false;   // 展开时是否全屏
     HWND main = nullptr;
     HWND list = nullptr;
     HWND fsPathEdit = nullptr;
@@ -6892,7 +6893,7 @@ void layoutMain(HWND hwnd) {
     const int contentBottom = rc.bottom - statusH - panelH - pad;
     if (contentBottom - contentTop < dp(110)) return;
 
-    // AI 面板：停靠在内容区右侧，或全屏占据内容区
+    // AI 面板：全局只有一份，停靠在内容区右侧，或全屏占据内容区
     // 全屏只在「面板确实开着」时生效——aiFull 万一残留（面板已关），
     // 也不能让终端和文件面板被永久隐藏。
     const bool aiFullScreen = g_app.aiOpen && g_app.aiFull && g_app.aiTab != nullptr;
@@ -6904,11 +6905,6 @@ void layoutMain(HWND hwnd) {
         aiRect = aiFullScreen
                      ? RECT{pad, contentTop, rc.right - pad, rc.bottom}
                      : RECT{rc.right - pad - aiWidth, contentTop, rc.right - pad, contentBottom};
-    }
-    // 只显示当前会话的 AI 窗口，其余隐藏（每个会话各有一份对话）
-    for (auto& other : g_tabs) {
-        if (other && other->aiTab)
-            other->aiTab->show(false);
     }
     if (g_app.aiTab) {
         g_app.aiTab->setBounds(aiRect);
@@ -8407,6 +8403,8 @@ void switchSessionTab(std::size_t index) {
     g_tabs[index].reset();
     g_activeTab = index;
     g_selectedTabId = g_app.tabId;
+    // 面板是全局的：换了标签就把它对准新标签的主机（正在跑的一轮仍用发问时锁定的那台）
+    if (g_app.aiTab) g_app.aiTab->refreshHost();
     restoreSessionUi();
 }
 
@@ -8428,6 +8426,7 @@ std::vector<ai::AiHostInfo> aiHostList() {
     auto add = [&hosts](SessionState& state) {
         if (!state.shell->running() && !state.fs->ready()) return;
         ai::AiHostInfo info;
+        info.id = state.tabId;  // 用 tabId 对应，标签增减时不会串台
         info.label = state.currentSession.empty() ? L"未命名会话" : toWide(state.currentSession);
         if (state.fs->ready()) info.backend = state.fs.get();
         hosts.push_back(std::move(info));
@@ -8438,11 +8437,13 @@ std::vector<ai::AiHostInfo> aiHostList() {
     return hosts;
 }
 
-ai::AiTab* ensureAiPanel(SessionState& state) {
-    if (state.aiTab || !g_app.main) return state.aiTab;
+ai::AiTab* ensureAiPanel() {
+    if (g_app.aiTab || !g_app.main) return g_app.aiTab;
 
     ai::AiTabContext context;
     context.hosts = aiHostList;
+    context.activeHostId = []() { return g_app.tabId; };
+    context.activeHostId = []() { return g_app.tabId; };
     context.vault = &g_app.vault;
     context.ensureVaultUnlocked = []() { return ensureVaultUnlocked(); };
     context.vaultPresent = []() { return vaultFilePresent(); };
@@ -8454,9 +8455,9 @@ ai::AiTab* ensureAiPanel(SessionState& state) {
     context.onToggleFullScreen = []() { setAiPanelFull(!g_app.aiFull); };
     context.onClose = []() { toggleAiPanel(); };
 
-    state.aiTab = ai::AiTab::create(g_app.main, std::move(context));
-    if (state.aiTab) state.aiTab->setFullScreen(state.aiFull);
-    return state.aiTab;
+    g_app.aiTab = ai::AiTab::create(g_app.main, std::move(context));
+    if (g_app.aiTab) g_app.aiTab->setFullScreen(g_app.aiFull);
+    return g_app.aiTab;
 }
 
 void toggleAiPanel() {
@@ -8470,15 +8471,16 @@ void toggleAiPanel() {
         }
         if (g_app.aiTab) g_app.aiTab->show(false);
     } else {
-        if (!ensureAiPanel(g_app)) return;
+        if (!ensureAiPanel()) return;
         g_app.aiOpen = true;
+        // 面板是全局的，每次打开都对到当前标签
+        g_app.aiTab->refreshHost();
         g_app.aiTab->show(true);
         g_app.aiTab->focus();
     }
     layoutMain(g_app.main);
     InvalidateRect(g_app.main, nullptr, TRUE);
 }
-
 void setAiPanelFull(bool full) {
     if (!g_app.aiOpen) return;
     g_app.aiFull = full;
@@ -8490,11 +8492,6 @@ void setAiPanelFull(bool full) {
 void disposeSessionState(SessionState& state) {
     for (UINT_PTR timer = kCwdHookTimer1; timer <= kCwdHookTimer4; ++timer)
         KillTimer(g_app.main, state.tabId * 8 + timer);
-    if (state.aiTab) {
-        // 关掉会话 = 结束这路对话并停掉工作线程
-        ai::AiTab::destroy(state.aiTab);
-        state.aiTab = nullptr;
-    }
     state.connectionId = g_nextConnectionId++;
     for (auto& task : state.downloads) if (task.cancel) task.cancel->store(true);
     state.fs->stop();
@@ -9330,6 +9327,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY:
             KillTimer(hwnd, 1);
             g_applicationClosing.store(true);
+            if (g_app.aiTab) {  // 全局 AI 面板：停掉工作线程再退出
+                ai::AiTab::destroy(g_app.aiTab);
+                g_app.aiTab = nullptr;
+            }
             for (auto& state : g_tabs) if (state) disposeSessionState(*state);
             disposeSessionState(g_app);
             g_tabs.clear();

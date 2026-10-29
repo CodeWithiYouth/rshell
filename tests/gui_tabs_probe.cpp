@@ -442,7 +442,32 @@ void aiTabRegression() {    auto visible = [](HWND window) {
     check(g_app.aiTab == nullptr, "closing the session destroys its AI panel");
 }
 
-// 标题栏的 AI 按钮：位置、尺寸和点击行为
+// 停靠 AI 面板会把终端压窄：必须折行（不是截断），收起后要能并回原样
+void terminalDockReflowRegression() {
+    std::string original;
+    for (int i = 0; i < 120; ++i) original.push_back(static_cast<char>('a' + i % 26));
+    g_app.termData.reset();
+    g_app.termData.feed(original);
+    const int colsWide = g_app.termData.cols();
+    check(colsWide > 0, "terminal reports a column count");
+
+    toggleAiPanel();
+    check(g_app.aiOpen, "AI panel is docked for the reflow check");
+    const int colsDocked = g_app.termData.cols();
+    check(colsDocked > 0 && colsDocked < colsWide, "docking the AI panel narrows the terminal");
+    check(g_app.termData.cols() == colsDocked, "terminal keeps the docked width while the panel is open");
+
+    toggleAiPanel();
+    check(!g_app.aiOpen, "panel closed again");
+    check(g_app.termData.cols() == colsWide, "terminal width returns after closing the panel");
+
+    std::string joined;
+    for (std::size_t i = 0; i < g_app.termData.lineCount(); ++i)
+        joined += g_app.termData.plainLine(i);
+    check(joined.compare(0, original.size(), original) == 0,
+          "terminal text survives narrowing and widening");
+}
+
 void titleAiButtonRegression() {
     RECT client{}; GetClientRect(g_app.main, &client);
     HDC screen = GetDC(nullptr);
@@ -501,6 +526,7 @@ int main(int argc, char** argv) {
         sessionMgrLayoutRegression();
         aiTabRegression();
         titleAiButtonRegression();
+        terminalDockReflowRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);
         DestroyWindow(window); window = nullptr;
         stopGdiplus(); g_app.runtime.reset();

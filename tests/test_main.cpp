@@ -884,6 +884,44 @@ void testTerminalResizeKeepsContent() {
     Terminal blank(10, 8);
     blank.resize(10, 4);
     CHECK_EQ(blank.scrollbackCount(), static_cast<std::size_t>(0));
+
+    // 列宽变化（AI 面板停靠 / 取消停靠）不能把已有文本截断：
+    // 变窄时软换行，变宽时再并回原来的折行位置
+    Terminal reflow(20, 12);
+    reflow.feed("0123456789abcdefghijTAIL\r\nsecond line\r\n");
+    CHECK_EQ(reflow.plainLine(0), std::string("0123456789abcdefghij"));
+    CHECK_EQ(reflow.plainLine(1), std::string("TAIL"));
+    reflow.resize(8, 12);
+    CHECK_EQ(reflow.plainLine(0), std::string("01234567"));
+    CHECK_EQ(reflow.plainLine(1), std::string("89abcdef"));
+    CHECK_EQ(reflow.plainLine(2), std::string("ghijTAIL"));
+    CHECK_EQ(reflow.plainLine(3), std::string("second l"));
+    reflow.resize(20, 12);
+    CHECK_EQ(reflow.plainLine(0), std::string("0123456789abcdefghij"));
+    CHECK_EQ(reflow.plainLine(1), std::string("TAIL"));
+    CHECK_EQ(reflow.plainLine(2), std::string("second line"));
+    CHECK_EQ(reflow.scrollbackCount(), static_cast<std::size_t>(0));
+
+    // 反复停靠/取消停靠也不能把折行标记丢掉（丢了下一次就并不回来）
+    for (int round = 0; round < 3; ++round) {
+        reflow.resize(8, 12);
+        reflow.resize(20, 12);
+        CHECK_EQ(reflow.plainLine(0), std::string("0123456789abcdefghij"));
+        CHECK_EQ(reflow.plainLine(1), std::string("TAIL"));
+        CHECK_EQ(reflow.plainLine(2), std::string("second line"));
+    }
+
+    // 行数不够时折出来的行进历史，但一个字都不能丢
+    Terminal squeeze(20, 5);
+    squeeze.feed("0123456789abcdefghijTAIL\r\nsecond line\r\n");
+    squeeze.resize(8, 5);
+    std::string all;
+    for (std::size_t i = 0; i < squeeze.lineCount(); ++i) all += squeeze.plainLine(i) + "\n";
+    CHECK(all.find("01234567") != std::string::npos);
+    CHECK(all.find("89abcdef") != std::string::npos);
+    CHECK(all.find("ghijTAIL") != std::string::npos);
+    CHECK(all.find("second l") != std::string::npos);
+    CHECK(all.find("ine") != std::string::npos);
 }
 
 void testTerminalAltScreenAndMisc() {

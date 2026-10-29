@@ -38,6 +38,13 @@ bool isBlankLine(const std::vector<Cell>& line, const TerminalTheme& theme) {
     return true;
 }
 
+// 单个格是否「什么都没画」（重排时用来丢掉折行处的行尾空白）。
+// 带底色/反色的空格要保留：TUI 常用整行反色当状态栏。
+bool isBlankCell(const Cell& c, const TerminalTheme& theme) {
+    const char32_t ch = c.ch == 0 ? U' ' : c.ch;
+    return ch == U' ' && (c.flags & kFlagReverse) == 0 && c.fg == theme.fg && c.bg == theme.bg;
+}
+
 struct Csi {
     char prefix = 0;
     std::string inter;
@@ -174,6 +181,7 @@ void Terminal::blankLine(std::vector<Cell>& line) const {
 
 void Terminal::ensureScreen() {
     screen_.resize(static_cast<std::size_t>(rows_));
+    cont_.resize(screen_.size(), 0);
     for (auto& line : screen_) {
         line.resize(static_cast<std::size_t>(cols_), blankCell());
     }
@@ -181,7 +189,9 @@ void Terminal::ensureScreen() {
 
 void Terminal::reset() {
     screen_.clear();
+    cont_.clear();
     history_.clear();
+    histCont_.clear();
     altSaved_.clear();
     altScreen_ = false;
     curRow_ = 0;
@@ -242,10 +252,21 @@ void Terminal::resize(int cols, int rows) {
     rows = std::max(1, rows);
     if (cols == cols_ && rows == rows_) return;
 
+    // 列宽变化（AI 面板停靠、窗口拉宽/收窄、字号变化）要重新折行，
+    // 不能像以前那样把每行截到新宽度——那会把已有输出永久吃掉。
+    // 备用屏（TUI）不重排：全屏程序会自己重画，硬折行反而会把画面弄乱。
+    if (cols != cols_ && !altScreen_) {
+        reflowResize(cols, rows);
+        return;
+    }
+
     // 屏幕行从底部对齐保留，被顶出的行进入历史
     std::vector<std::vector<Cell>> old = std::move(screen_);
     screen_.clear();
     const int oldRows = static_cast<int>(old.size());
+    if (cont_.size() != old.size()) cont_.resize(old.size(), 0);
+    std::vector<char> oldCont = std::move(cont_);
+    cont_.clear();
     if (rows < oldRows) {
         const int drop = oldRows - rows;
         // 先吃掉光标下方的空白行，再考虑把顶部行推进历史：
@@ -261,21 +282,31 @@ void Terminal::resize(int cols, int rows) {
         for (int i = 0; i < dropTop; ++i) {
             const std::vector<Cell>& line = old[static_cast<std::size_t>(i)];
             // 纯空白行不必进历史，否则滚动条位置完全失真
-            if (!altScreen_ && !isBlankLine(line, theme_)) history_.push_back(line);
+            if (!altScreen_ && !isBlankLine(line, theme_)) {
+                history_.push_back(line);
+                histCont_.push_back(i < static_cast<int>(oldCont.size()) ? oldCont[static_cast<std::size_t>(i)] : 0);
+            }
         }
-        for (int i = dropTop; i < oldRows - dropBottom; ++i)
+        for (int i = dropTop; i < oldRows - dropBottom; ++i) {
             screen_.push_back(old[static_cast<std::size_t>(i)]);
+            cont_.push_back(i < static_cast<int>(oldCont.size()) ? oldCont[static_cast<std::size_t>(i)] : 0);
+        }
         curRow_ = std::max(0, curRow_ - dropTop);
     } else {
         screen_ = std::move(old);
         for (int i = oldRows; i < rows; ++i) screen_.emplace_back();
+        cont_ = std::move(oldCont);
     }
     cols_ = cols;
     rows_ = rows;
     for (auto& line : screen_) {
         line.resize(static_cast<std::size_t>(cols_), blankCell());
     }
-    while (history_.size() > maxScrollback_) history_.pop_front();
+    cont_.resize(screen_.size(), 0);
+    while (history_.size() > maxScrollback_) {
+        history_.pop_front();
+        if (!histCont_.empty()) histCont_.pop_front();
+    }
 
     curRow_ = std::clamp(curRow_, 0, rows_ - 1);
     curCol_ = std::clamp(curCol_, 0, cols_ - 1);
@@ -286,6 +317,143 @@ void Terminal::resize(int cols, int rows) {
     dirty_ = true;
 }
 
+// 列宽变化时的重排：按「逻辑行」（被软换行拆开的行）重新折行。
+// 屏幕和回滚历史一起重排，所以变窄时不会丢字，变宽后能并回原来的一行。
+void Terminal::reflowResize(int cols, int rows) {
+    if (cont_.size() != screen_.size()) cont_.resize(screen_.size(), 0);
+    if (histCont_.size() != history_.size()) histCont_.resize(history_.size(), 0);
+    const int oldCols = cols_;
+
+    // 拖窗口边缘时 WM_SIZE 会连着来，历史全量重排太慢（几千行 × 每列一格）。
+    // 只重排最近的一段历史，更老的保持原样——它们本来也只是显示，不会再回卷。
+    constexpr std::size_t kReflowHistoryRows = 1500;
+    const std::size_t keepHistory =
+        history_.size() > kReflowHistoryRows ? history_.size() - kReflowHistoryRows : 0;
+
+    std::vector<std::vector<Cell>> merged;  // 重排后的连续行（先历史、后屏幕）
+    std::vector<char> mergedCont;
+    std::vector<Cell> line;                 // 正在拼的逻辑行
+    bool inLine = false;
+    int lineStart = 0;
+    bool cursorSeen = false;
+    std::size_t cursorOffset = 0;
+    int cursorNewRow = 0;
+    int cursorNewCol = 0;
+
+    auto flushLine = [&]() {
+        if (!inLine) return;
+        // 逻辑行末尾的默认色空白没有意义，留着会凭空多折出几行
+        while (!line.empty() && isBlankCell(line.back(), theme_)) line.pop_back();
+        const int length = std::max<int>(1, static_cast<int>(line.size()));
+        const int parts = (length + cols - 1) / cols;
+        for (int k = 0; k < parts; ++k) {
+            std::vector<Cell> row(static_cast<std::size_t>(cols), blankCell());
+            for (int c = 0; c < cols; ++c) {
+                const std::size_t index = static_cast<std::size_t>(k) * cols + c;
+                if (index < line.size()) row[static_cast<std::size_t>(c)] = line[index];
+            }
+            merged.push_back(std::move(row));
+            // 约定：标记表示「本行是上一行的续行」，所以只有第一段是 0
+            mergedCont.push_back(k > 0 ? 1 : 0);
+        }
+        if (cursorSeen) {
+            cursorNewRow = lineStart + static_cast<int>(cursorOffset / static_cast<std::size_t>(cols));
+            cursorNewCol = static_cast<int>(cursorOffset % static_cast<std::size_t>(cols));
+            cursorSeen = false;  // 光标只会落在一条逻辑行里
+        }
+        line.clear();
+        inLine = false;
+    };
+
+    auto feedRow = [&](const std::vector<Cell>& src, bool cont, bool cursorRow) {
+        if (!cont || !inLine) {
+            flushLine();
+            inLine = true;
+            lineStart = static_cast<int>(merged.size());
+        } else {
+            // 折行处的行尾空白没有意义，去掉再拼，否则中间会插进一串空格
+            while (!line.empty() && isBlankCell(line.back(), theme_)) line.pop_back();
+        }
+        if (cursorRow) {
+            cursorSeen = true;
+            cursorOffset =
+                line.size() + static_cast<std::size_t>(std::clamp(curCol_, 0, oldCols - 1));
+        }
+        for (int c = 0; c < oldCols; ++c) {
+            line.push_back(c < static_cast<int>(src.size()) ? src[static_cast<std::size_t>(c)]
+                                                           : blankCell());
+        }
+    };
+
+    for (std::size_t i = keepHistory; i < history_.size(); ++i)
+        feedRow(history_[i], i > keepHistory && histCont_[i] != 0, false);
+    for (int r = 0; r < static_cast<int>(screen_.size()); ++r)
+        feedRow(screen_[static_cast<std::size_t>(r)], cont_[static_cast<std::size_t>(r)] != 0,
+                r == curRow_);
+    flushLine();
+
+    const int total = static_cast<int>(merged.size());
+
+    // 光标下面还有空行就先吃掉它们（和行数变化时的处理保持一致），
+    // 否则面板一停靠就会把整屏内容顶进历史，看起来像“跳屏”。
+    int deficit = total - rows;
+    if (deficit > 0) {
+        for (int i = total - 1; i > cursorNewRow && deficit > 0; --i) {
+            if (!isBlankLine(merged[static_cast<std::size_t>(i)], theme_)) continue;
+            merged.erase(merged.begin() + i);
+            mergedCont.erase(mergedCont.begin() + i);
+            --deficit;
+        }
+    }
+    const int screenStart = std::max(0, static_cast<int>(merged.size()) - rows);
+
+    // 顶部多出来的行回到历史里；纯空白行照旧不进历史（否则滚动条完全失真），
+    // 丢掉空白行时顺带清掉下一行的续行标记，避免下次重排误并。
+    std::deque<std::vector<Cell>> keptHistory(history_.begin(),
+                                              history_.begin() + static_cast<std::ptrdiff_t>(keepHistory));
+    std::deque<char> keptHistoryCont(histCont_.begin(),
+                                     histCont_.begin() + static_cast<std::ptrdiff_t>(keepHistory));
+    history_ = std::move(keptHistory);
+    histCont_ = std::move(keptHistoryCont);
+    bool droppedPrevious = keepHistory > 0;  // 分段处当作硬换行
+    for (int i = 0; i < screenStart; ++i) {
+        const bool blank = isBlankLine(merged[static_cast<std::size_t>(i)], theme_);
+        if (blank) {
+            droppedPrevious = true;
+            continue;
+        }
+        history_.push_back(merged[static_cast<std::size_t>(i)]);
+        histCont_.push_back(droppedPrevious ? 0 : mergedCont[static_cast<std::size_t>(i)]);
+        droppedPrevious = false;
+    }
+
+    std::vector<std::vector<Cell>> out;
+    std::vector<char> outCont;
+    for (int i = screenStart; i < static_cast<int>(merged.size()); ++i) {
+        out.push_back(merged[static_cast<std::size_t>(i)]);
+        outCont.push_back(mergedCont[static_cast<std::size_t>(i)]);
+    }
+    while (static_cast<int>(out.size()) < rows) {
+        out.emplace_back(static_cast<std::size_t>(cols), blankCell());
+        outCont.push_back(0);
+    }
+    while (static_cast<int>(history_.size()) > static_cast<int>(maxScrollback_)) {
+        history_.pop_front();
+        if (!histCont_.empty()) histCont_.pop_front();
+    }
+
+    screen_ = std::move(out);
+    cont_ = std::move(outCont);
+    cols_ = cols;
+    rows_ = rows;
+    curRow_ = std::clamp(cursorNewRow - screenStart, 0, rows_ - 1);
+    curCol_ = std::clamp(cursorNewCol, 0, cols_ - 1);
+    scrollTop_ = 0;
+    scrollBottom_ = rows_ - 1;
+    wrapPending_ = false;
+    scrollOffset_ = 0;
+    dirty_ = true;
+}
 const std::vector<Cell>& Terminal::lineAt(std::size_t index) const {
     static const std::vector<Cell> empty;
     if (index < history_.size()) return history_[index];
@@ -712,10 +880,12 @@ void Terminal::putChar(char32_t ch) {
         carriageReturn();
         lineFeed();
         wrapPending_ = false;
+        markContinuation(curRow_);  // 新的一行是上一行折下来的
     }
     if (width == 2 && curCol_ + 1 >= cols_) {
         carriageReturn();
         lineFeed();
+        markContinuation(curRow_);
     }
     if (insertMode_) insertCells(curRow_, curCol_, width);
 
@@ -784,15 +954,19 @@ void Terminal::scrollRegionUp(int top, int bottom, int count) {
     for (int i = 0; i < count; ++i) {
         if (!altScreen_ && top == 0 && bottom == rows_ - 1) {
             history_.push_back(screen_[0]);
+            histCont_.push_back(cont_.empty() ? 0 : cont_[0]);
             if (history_.size() > maxScrollback_) {
                 history_.pop_front();
+                if (!histCont_.empty()) histCont_.pop_front();
                 if (scrollOffset_ > 0) --scrollOffset_;
             }
         }
         for (int r = top; r < bottom; ++r) {
             screen_[static_cast<std::size_t>(r)] = std::move(screen_[static_cast<std::size_t>(r + 1)]);
+            cont_[static_cast<std::size_t>(r)] = cont_[static_cast<std::size_t>(r + 1)];
         }
         blankLine(screen_[static_cast<std::size_t>(bottom)]);
+        cont_[static_cast<std::size_t>(bottom)] = 0;
     }
     dirty_ = true;
 }
@@ -803,8 +977,10 @@ void Terminal::scrollRegionDown(int top, int bottom, int count) {
     for (int i = 0; i < count; ++i) {
         for (int r = bottom; r > top; --r) {
             screen_[static_cast<std::size_t>(r)] = std::move(screen_[static_cast<std::size_t>(r - 1)]);
+            cont_[static_cast<std::size_t>(r)] = cont_[static_cast<std::size_t>(r - 1)];
         }
         blankLine(screen_[static_cast<std::size_t>(top)]);
+        cont_[static_cast<std::size_t>(top)] = 0;
     }
     dirty_ = true;
 }
@@ -850,8 +1026,10 @@ void Terminal::insertLines(int at, int count) {
     for (int i = 0; i < count; ++i) {
         for (int r = scrollBottom_; r > at; --r) {
             screen_[static_cast<std::size_t>(r)] = std::move(screen_[static_cast<std::size_t>(r - 1)]);
+            cont_[static_cast<std::size_t>(r)] = cont_[static_cast<std::size_t>(r - 1)];
         }
         blankLine(screen_[static_cast<std::size_t>(at)]);
+        cont_[static_cast<std::size_t>(at)] = 0;
     }
     curCol_ = 0;
     wrapPending_ = false;
@@ -864,8 +1042,10 @@ void Terminal::deleteLines(int at, int count) {
     for (int i = 0; i < count; ++i) {
         for (int r = at; r < scrollBottom_; ++r) {
             screen_[static_cast<std::size_t>(r)] = std::move(screen_[static_cast<std::size_t>(r + 1)]);
+            cont_[static_cast<std::size_t>(r)] = cont_[static_cast<std::size_t>(r + 1)];
         }
         blankLine(screen_[static_cast<std::size_t>(scrollBottom_)]);
+        cont_[static_cast<std::size_t>(scrollBottom_)] = 0;
     }
     curCol_ = 0;
     wrapPending_ = false;
@@ -908,6 +1088,7 @@ void Terminal::enterAltScreen(bool clear) {
         return;
     }
     altSaved_ = screen_;
+    cont_.assign(screen_.size(), 0);  // 备用屏自己重画，不参与重排
     altScreen_ = true;
     // 切屏后先把光标恢复成可见：TUI 通常会自己再发 ?25h/?25l，
     // 万一它隐藏光标后异常退出，也不会把主屏的光标一起带走。
@@ -933,6 +1114,7 @@ void Terminal::leaveAltScreen(bool restorePos) {
         screen_ = altSaved_;
         altSaved_.clear();
     }
+    cont_.assign(screen_.size(), 0);
     if (restorePos) {
         // ?1049l：DECRC，回到进入前的光标位置，主屏内容与光标都对得上
         restoreCursor();
@@ -1076,8 +1258,10 @@ void Terminal::parseCsi() {
                 eraseCells(curRow_, 0, curCol_ + 1);
             } else if (mode == 2) {
                 for (int r = 0; r < rows_; ++r) eraseCells(r, 0, cols_);
+                cont_.assign(screen_.size(), 0);
             } else if (mode == 3) {
                 history_.clear();
+                histCont_.clear();
             }
             break;
         }

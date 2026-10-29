@@ -136,6 +136,13 @@ private:
     void ensureScreen();
     void blankLine(std::vector<Cell>& line) const;
     Cell blankCell() const;
+    // 列宽变化时按逻辑行重新折行（备用屏不走这条路）
+    void reflowResize(int cols, int rows);
+    // 把某行标成「软换行续行」，列表长度对不上时忽略
+    void markContinuation(int row) {
+        if (row >= 0 && row < static_cast<int>(cont_.size()))
+            cont_[static_cast<std::size_t>(row)] = 1;
+    }
 
     void putChar(char32_t ch);
     char32_t mapCharset(char32_t ch) const;
@@ -180,7 +187,12 @@ private:
     int rows_ = 24;
     std::size_t maxScrollback_ = 5000;
     std::vector<std::vector<Cell>> screen_;
+    // 软换行标记：cont_[i] 非 0 表示第 i 行是被上一行折下来的续行（不是真换行）。
+    // 列宽变化时靠它把逻辑行拼回去，只覆盖当前屏幕，历史行不参与。
+    std::vector<char> cont_;
     std::deque<std::vector<Cell>> history_;
+    // 与 history_ 一一对应的软换行标记（回滚历史也参与重排，变大变窄都能并回）
+    std::deque<char> histCont_;
     std::vector<std::vector<Cell>> altSaved_;
     bool altScreen_ = false;
 

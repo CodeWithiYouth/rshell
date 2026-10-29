@@ -403,6 +403,20 @@ void aiTabRegression() {    auto visible = [](HWND window) {
     check(g_app.aiFull, "full screen flag is set");
     RECT fullRect{}; GetWindowRect(docked->window(), &fullRect);
     check(fullRect.right - fullRect.left > dockWidth, "full screen is wider than docked");
+
+    // 全屏下直接关面板：必须连带退出全屏，否则窗口布局会把会话控件永久隐藏
+    toggleAiPanel();
+    check(!g_app.aiOpen && !g_app.aiFull,
+          "closing while full screen also clears the full screen flag");
+    check(visible(g_app.term) && visible(g_app.list),
+          "terminal and file list come back after closing the full screen panel");
+    toggleAiPanel();
+    check(g_app.aiOpen && !g_app.aiFull, "the panel reopens docked, not full screen");
+    RECT reopened{}; GetWindowRect(docked->window(), &reopened);
+    check(reopened.right - reopened.left <= dockWidth + dp(8),
+          "the reopened panel keeps the docked width");
+
+    setAiPanelFull(true);
     setAiPanelFull(false);
     check(!g_app.aiFull, "back to docked mode");
 

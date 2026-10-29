@@ -6771,16 +6771,17 @@ void layoutMain(HWND hwnd) {
     if (contentBottom - contentTop < dp(110)) return;
 
     // AI 面板：停靠在内容区右侧，或全屏占据内容区
-    const int aiWidth = g_app.aiOpen && !g_app.aiFull
+    // 全屏只在「面板确实开着」时生效——aiFull 万一残留（面板已关），
+    // 也不能让终端和文件面板被永久隐藏。
+    const bool aiFullScreen = g_app.aiOpen && g_app.aiFull && g_app.aiTab != nullptr;
+    const int aiWidth = g_app.aiOpen && !aiFullScreen
                             ? std::clamp<int>(rc.right / 3, dp(360), dp(560))
                             : 0;
     RECT aiRect{};
     if (g_app.aiOpen) {
-        if (g_app.aiFull) {
-            aiRect = RECT{pad, contentTop, rc.right - pad, rc.bottom};
-        } else {
-            aiRect = RECT{rc.right - pad - aiWidth, contentTop, rc.right - pad, contentBottom};
-        }
+        aiRect = aiFullScreen
+                     ? RECT{pad, contentTop, rc.right - pad, rc.bottom}
+                     : RECT{rc.right - pad - aiWidth, contentTop, rc.right - pad, contentBottom};
     }
     // 只显示当前会话的 AI 窗口，其余隐藏（每个会话各有一份对话）
     for (auto& other : g_tabs) {
@@ -6792,7 +6793,7 @@ void layoutMain(HWND hwnd) {
         g_app.aiTab->show(g_app.aiOpen);
     }
 
-    if (g_app.aiFull) {
+    if (aiFullScreen) {
         // 全屏模式：会话控件全部让位
         if (g_app.list) ShowWindow(g_app.list, SW_HIDE);
         if (g_app.term) ShowWindow(g_app.term, SW_HIDE);
@@ -6845,8 +6846,8 @@ void layoutMain(HWND hwnd) {
     if (g_app.term) {
         const int termX = pad * 2 + sidebarW;
         // 停靠模式下右侧让给 AI 面板
-        const int termRight = (g_app.aiOpen && !g_app.aiFull) ? aiRect.left - dp(10)
-                                                              : rc.right - pad;
+        const int termRight = (g_app.aiOpen && !aiFullScreen) ? aiRect.left - dp(10)
+                                                             : rc.right - pad;
         const int termW = std::max(dp(120), termRight - termX);
         g_app.searchBox = RECT{termX + dp(4), contentTop, termRight - dp(170), contentTop + dp(28)};
         g_app.searchPrev = RECT{termRight - dp(88), contentTop, termRight - dp(60), contentTop + dp(28)};
@@ -8338,6 +8339,12 @@ ai::AiTab* ensureAiPanel(SessionState& state) {
 void toggleAiPanel() {
     if (g_app.aiOpen) {
         g_app.aiOpen = false;
+        // 全屏状态下关面板必须连带退出全屏：layoutMain 在全屏分支里会把
+        // 终端、文件面板、状态栏全部 Hide 掉，flag 不复位的话它们就再也回不来。
+        if (g_app.aiFull) {
+            g_app.aiFull = false;
+            if (g_app.aiTab) g_app.aiTab->setFullScreen(false);
+        }
         if (g_app.aiTab) g_app.aiTab->show(false);
     } else {
         if (!ensureAiPanel(g_app)) return;

@@ -222,6 +222,17 @@ void networkRegression(int port, const std::string& upload, const std::string& d
         switchSessionTab(1);
         check(g_app.aiTab->hostLabel() == L"beta-ssh",
               "the AI panel targets the second tab's host");
+
+        // 工具可以按会话名直接操作另一个标签，不用 ssh 跳过去
+        void* current = g_app.aiTab->resolveHostForTest("");
+        check(current == g_app.fs.get(), "empty host means the current tab");
+        SessionState* other = nullptr;
+        for (auto& state : g_tabs)
+            if (state && state->currentSession == "alpha-ssh") other = state.get();
+        check(other != nullptr && g_app.aiTab->resolveHostForTest("alpha-ssh") == other->fs.get(),
+              "a host name routes tools to that tab's connection");
+        check(g_app.aiTab->resolveHostForTest("no-such-host") == nullptr,
+              "an unknown host name resolves to nothing");
         if (!wasOpen) toggleAiPanel();
     }
     if (testHooks) {

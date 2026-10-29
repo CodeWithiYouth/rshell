@@ -68,6 +68,11 @@ public:
     void refreshHost();
     // 当前目标主机的名字（回归测试用）
     std::wstring hostLabel() const { return currentHostLabel(); }
+    // 回归测试用：按会话名解析工具后端，走的是和工具调用完全相同的路径
+    void* resolveHostForTest(const std::string& name) const {
+        std::string error;
+        return backendForName(name, error);
+    }
     // 打开设置视图；unlockOnly=true 表示从空状态「解锁」进来
     // （解锁成功且已经读到 Key 就直接返回，不弹表单）
     void startSettings(bool unlockOnly = false);
@@ -127,6 +132,10 @@ private:
     std::uintptr_t activeHostId() const;
     std::wstring hostLabelById(std::uintptr_t id) const;
     void* hostBackendById(std::uintptr_t id) const;
+    // 工具里的 host 参数：空 = 当前/本轮锁定的主机；否则按会话名找
+    void* backendForName(const std::string& host, std::string& error) const;
+    // 系统提示（含当前主机与其它已打开会话）
+    std::string buildSystemPrompt();
 
     struct Impl;
     std::unique_ptr<Impl> impl_;   // 隐藏 Client/Agent/工具链，避免头文件依赖

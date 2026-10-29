@@ -126,62 +126,76 @@ void drawText(HDC dc, const std::wstring& text, RECT rc, std::uint32_t color, HF
     SelectObject(dc, old);
 }
 
-// 把当前目标主机的工具调用路由到它的 RemoteFs
+// 把工具调用路由到目标主机的 RemoteFs：默认是本轮锁定的那台，
+// 模型也可以给 host 参数指定别的已打开会话（例如 us-vps）。
 class RoutedBackend : public ToolBackend {
 public:
-    std::function<void*()> resolve;
+    // host 为空 → 当前/本轮锁定的主机；否则按会话名找。找不到时写 error。
+    std::function<void*(const std::string& host, std::string& error)> resolve;
 
-    CommandResult runCommand(const std::string& command, int timeoutSec) override {
-        auto* fs = static_cast<RemoteFs*>(resolve ? resolve() : nullptr);
-        if (!fs) return notConnected();
-        SshToolBackend backend(*fs);
-        return backend.runCommand(command, timeoutSec);
+    CommandResult runCommand(const std::string& command, int timeoutSec,
+                             const std::string& host) override {
+        std::string error;
+        void* fs = lookup(host, error);
+        if (!fs) return failed(error);
+        SshToolBackend backend(*static_cast<RemoteFs*>(fs));
+        return backend.runCommand(command, timeoutSec, {});
     }
 
     bool readFile(const std::string& path, std::size_t maxBytes, std::string& out,
-                  bool& truncated, std::string& error) override {
-        auto* fs = static_cast<RemoteFs*>(resolve ? resolve() : nullptr);
+                  bool& truncated, std::string& error, const std::string& host) override {
+        std::string why;
+        void* fs = lookup(host, why);
         if (!fs) {
-            error = kNotConnected;
+            error = why;
             return false;
         }
-        SshToolBackend backend(*fs);
-        return backend.readFile(path, maxBytes, out, truncated, error);
+        SshToolBackend backend(*static_cast<RemoteFs*>(fs));
+        return backend.readFile(path, maxBytes, out, truncated, error, {});
     }
 
     bool writeFile(const std::string& path, const std::string& content,
-                   std::string& error) override {
-        auto* fs = static_cast<RemoteFs*>(resolve ? resolve() : nullptr);
+                   std::string& error, const std::string& host) override {
+        std::string why;
+        void* fs = lookup(host, why);
         if (!fs) {
-            error = kNotConnected;
+            error = why;
             return false;
         }
-        SshToolBackend backend(*fs);
-        return backend.writeFile(path, content, error);
+        SshToolBackend backend(*static_cast<RemoteFs*>(fs));
+        return backend.writeFile(path, content, error, {});
     }
 
     bool listDir(const std::string& path, std::vector<DirEntryView>& out,
-                 std::string& error) override {
-        auto* fs = static_cast<RemoteFs*>(resolve ? resolve() : nullptr);
+                 std::string& error, const std::string& host) override {
+        std::string why;
+        void* fs = lookup(host, why);
         if (!fs) {
-            error = kNotConnected;
+            error = why;
             return false;
         }
-        SshToolBackend backend(*fs);
-        return backend.listDir(path, out, error);
+        SshToolBackend backend(*static_cast<RemoteFs*>(fs));
+        return backend.listDir(path, out, error, {});
     }
 
 private:
     static constexpr const char* kNotConnected = "当前没有可用的主机连接（先在会话标签里连上主机）";
 
-    static CommandResult notConnected() {
+    void* lookup(const std::string& host, std::string& error) {
+        if (!resolve) {
+            error = kNotConnected;
+            return nullptr;
+        }
+        return resolve(host, error);
+    }
+
+    static CommandResult failed(const std::string& why) {
         CommandResult result;
         result.exitCode = -1;
-        result.output = kNotConnected;
+        result.output = why.empty() ? kNotConnected : why;
         return result;
     }
 };
-
 // 工作线程等待界面点击审批
 struct ApprovalSlot {
     std::mutex mutex;
@@ -196,7 +210,9 @@ struct ApprovalSlot {
 
 struct AiTab::Impl {
     explicit Impl(AiTab* owner) : registry(backend), agent(client, registry) {
-        backend.resolve = [owner]() { return owner->turnBackend(); };
+        backend.resolve = [owner](const std::string& host, std::string& error) {
+        return owner->backendForName(host, error);
+    };
     }
 
     RoutedBackend backend;
@@ -428,6 +444,31 @@ void* AiTab::turnBackend() const {
     if (turnHostId != 0) return hostBackendById(turnHostId);  // 目标标签关了就返回空
     return currentBackend();
 }
+
+// 工具里的 host 参数：空 = 当前/本轮锁定的主机；否则按会话名找（模型看到的就是这个名字）
+void* AiTab::backendForName(const std::string& host, std::string& error) const {
+    if (host.empty()) return turnBackend();
+    if (!context_.hosts) {
+        error = "当前没有可用的会话";
+        return nullptr;
+    }
+    const auto hosts = context_.hosts();
+    std::string available;
+    for (const auto& entry : hosts) {
+        const std::string label = toUtf8Text(entry.label);
+        if (label == host) {
+            if (!entry.backend) {
+                error = "会话「" + host + "」还没有建立文件连接，先在它的标签里连上";
+                return nullptr;
+            }
+            return entry.backend;
+        }
+        if (!available.empty()) available += "、";
+        available += label;
+    }
+    error = "没有名为「" + host + "」的会话。可用：" + (available.empty() ? "（无）" : available);
+    return nullptr;
+}
 // ---------------------------------------------------------------- 发送 / 取消
 
 void AiTab::updateKeyNotice() {
@@ -462,6 +503,27 @@ void AiTab::updateWelcome() {
     }
 }
 
+// 系统提示：除了角色规则，还要告诉模型「现在能操作哪几台机器」，
+// 否则它遇到别的标签只会想从当前主机 ssh 过去。
+std::string AiTab::buildSystemPrompt() {
+    std::string prompt = defaultSystemPrompt();
+    prompt += "\n当前目标主机：" + toUtf8Text(currentHostLabel());
+    if (context_.hosts) {
+        const auto hosts = context_.hosts();
+        if (hosts.size() > 1) {
+            prompt += "\nrshell 里已打开的会话（可给工具的 host 参数填这些名字）：";
+            bool first = true;
+            for (const auto& host : hosts) {
+                if (!first) prompt += "、";
+                first = false;
+                prompt += toUtf8Text(host.label);
+                if (host.id == activeHostId()) prompt += "（当前）";
+            }
+        }
+    }
+    return prompt;
+}
+
 void AiTab::sendMessage(const std::wstring& text) {
     if (impl_->busy || text.empty()) return;
     if (impl_->apiKey.empty() && vaultLocked() && context_.ensureVaultUnlocked) {
@@ -487,8 +549,7 @@ void AiTab::sendMessage(const std::wstring& text) {
 
     panel_.addUser(text);
     impl_->agent.addUserMessage(toUtf8Text(text));
-    impl_->agent.setSystemPrompt(defaultSystemPrompt() + "\n当前目标主机：" +
-                                 toUtf8Text(currentHostLabel()));
+    impl_->agent.setSystemPrompt(buildSystemPrompt());
     impl_->agent.setApproval([this](const ApprovalRequest& request) {
         auto slot = std::make_shared<ApprovalSlot>();
         {

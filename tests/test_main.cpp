@@ -1843,9 +1843,11 @@ public:
     std::map<std::string, std::string> files;
     std::vector<std::string> commands;
     std::string commandOutput = "ok";
+    std::string lastHost;  // 最近一次调用带的 host 参数（路由测试用）
 
-    CommandResult runCommand(const std::string& command, int) override {
+    CommandResult runCommand(const std::string& command, int, const std::string& host) override {
         commands.push_back(command);
+        lastHost = host;
         CommandResult result;
         result.exitCode = 0;
         result.output = commandOutput;
@@ -1853,7 +1855,7 @@ public:
     }
 
     bool readFile(const std::string& path, std::size_t, std::string& out, bool& truncated,
-                  std::string& error) override {
+                  std::string& error, const std::string&) override {
         const auto it = files.find(path);
         if (it == files.end()) {
             error = "no such file: " + path;
@@ -1865,14 +1867,14 @@ public:
     }
 
     bool writeFile(const std::string& path, const std::string& content,
-                   std::string& error) override {
+                   std::string& error, const std::string&) override {
         (void)error;
         files[path] = content;
         return true;
     }
 
     bool listDir(const std::string& path, std::vector<ai::DirEntryView>& out,
-                 std::string& error) override {
+                 std::string& error, const std::string&) override {
         (void)path;
         (void)error;
         for (int i = 0; i < 5; ++i) {
@@ -2008,6 +2010,20 @@ void testAiToolRegistry() {
     CHECK(info.summary.find("systemctl status nginx") != std::string::npos);
     CHECK(!info.dangerous);
 
+    // 每个工具都带可选的 host 参数；指定了会话名要出现在摘要里并传给后端
+    for (const auto& spec : specs) {
+        bool hasHost = false;
+        const ai::Json* props = spec.parameters.find("properties");
+        if (props) hasHost = props->find("host") != nullptr;
+        CHECK(hasHost);
+    }
+    const ai::ToolRequestInfo other =
+        registry.describe("run_command", R"({"command":"uptime","host":"us-vps"})");
+    CHECK(other.valid && other.summary.find("us-vps") != std::string::npos);
+    backend.lastHost.clear();
+    registry.execute("run_command", R"({"command":"uptime","host":"us-vps"})");
+    CHECK_EQ(backend.lastHost, std::string("us-vps"));
+
     const ai::ToolRequestInfo danger =
         registry.describe("run_command", R"({"command":"rm -rf /tmp"})");
     CHECK(danger.dangerous);
@@ -2053,7 +2069,7 @@ void testAiToolRegistry() {
     CHECK(ran.truncated);
     CHECK(ran.json.size() < 400);
     CHECK(ran.json.find("AKIAABCDEFGHIJKLMNOP") == std::string::npos);
-    CHECK_EQ(backend.commands.size(), static_cast<std::size_t>(1));
+    CHECK_EQ(backend.commands.size(), static_cast<std::size_t>(2));  // uptime + cat
 }
 
 void testAiAgentReadsWithoutApproval() {

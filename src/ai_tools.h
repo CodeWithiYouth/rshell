@@ -38,16 +38,20 @@ public:
         bool truncated = false;
     };
 
-    virtual CommandResult runCommand(const std::string& command, int timeoutSec) = 0;
+    // host 为空表示「当前目标主机」；非空时按会话名路由到那个标签的连接。
+    // 由工具层把模型给的 host 参数原样传下来，具体能不能路由是后端的事。
+    virtual CommandResult runCommand(const std::string& command, int timeoutSec,
+                                     const std::string& host = {}) = 0;
 
     virtual bool readFile(const std::string& path, std::size_t maxBytes, std::string& out,
-                          bool& truncated, std::string& error) = 0;
+                          bool& truncated, std::string& error,
+                          const std::string& host = {}) = 0;
 
     virtual bool writeFile(const std::string& path, const std::string& content,
-                           std::string& error) = 0;
+                           std::string& error, const std::string& host = {}) = 0;
 
     virtual bool listDir(const std::string& path, std::vector<DirEntryView>& out,
-                         std::string& error) = 0;
+                         std::string& error, const std::string& host = {}) = 0;
 };
 
 struct ToolPolicy {

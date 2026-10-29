@@ -19,13 +19,15 @@ class SshToolBackend : public ToolBackend {
 public:
     explicit SshToolBackend(RemoteFs& fs) : fs_(fs) {}
 
-    CommandResult runCommand(const std::string& command, int timeoutSec) override;
+    // 本类绑定在一条连接上，host 参数忽略（多主机路由在 RoutedBackend 里做）
+    CommandResult runCommand(const std::string& command, int timeoutSec,
+                             const std::string& host) override;
     bool readFile(const std::string& path, std::size_t maxBytes, std::string& out,
-                  bool& truncated, std::string& error) override;
+                  bool& truncated, std::string& error, const std::string& host) override;
     bool writeFile(const std::string& path, const std::string& content,
-                   std::string& error) override;
+                   std::string& error, const std::string& host) override;
     bool listDir(const std::string& path, std::vector<DirEntryView>& out,
-                 std::string& error) override;
+                 std::string& error, const std::string& host) override;
 
 private:
     RemoteFs& fs_;

@@ -13,7 +13,9 @@ namespace {
 constexpr std::size_t kMaxCommandOutput = 256u * 1024u;
 }  // namespace
 
-ToolBackend::CommandResult SshToolBackend::runCommand(const std::string& command, int timeoutSec) {
+ToolBackend::CommandResult SshToolBackend::runCommand(const std::string& command, int timeoutSec,
+                                                          const std::string& host) {
+    (void)host;  // 绑定在单条连接上
     const int timeoutMs = std::clamp(timeoutSec, 1, 300) * 1000;
     const RemoteFs::ExecOutcome outcome = fs_.execSync(command, timeoutMs, kMaxCommandOutput);
 
@@ -30,17 +32,20 @@ ToolBackend::CommandResult SshToolBackend::runCommand(const std::string& command
 }
 
 bool SshToolBackend::readFile(const std::string& path, std::size_t maxBytes, std::string& out,
-                              bool& truncated, std::string& error) {
+                              bool& truncated, std::string& error, const std::string& host) {
+    (void)host;
     return fs_.readFileSync(path, maxBytes, out, truncated, error);
 }
 
 bool SshToolBackend::writeFile(const std::string& path, const std::string& content,
-                               std::string& error) {
+                               std::string& error, const std::string& host) {
+    (void)host;
     return fs_.writeFileSync(path, content, error);
 }
 
 bool SshToolBackend::listDir(const std::string& path, std::vector<DirEntryView>& out,
-                             std::string& error) {
+                             std::string& error, const std::string& host) {
+    (void)host;
     std::vector<RemoteEntry> entries;
     if (!fs_.listDirSync(path, entries, error)) return false;
 

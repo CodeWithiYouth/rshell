@@ -340,6 +340,11 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         properties["timeout_sec"] = Json::object();
         properties["timeout_sec"]["type"] = Json::string("integer");
         properties["timeout_sec"]["description"] = Json::string("超时秒数，默认 60，最大 300");
+        properties["host"] = Json::object();
+        properties["host"]["type"] = Json::string("string");
+        properties["host"]["description"] = Json::string(
+            "可选：目标会话名（rshell 里已打开的其它标签）。留空表示当前标签的主机；"
+            "要操作别的标签时填它的会话名，例如 us-vps。");
         spec.parameters["type"] = Json::string("object");
         spec.parameters["properties"] = std::move(properties);
         spec.parameters["required"].push(Json::string("command"));
@@ -359,6 +364,11 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         properties["max_bytes"] = Json::object();
         properties["max_bytes"]["type"] = Json::string("integer");
         properties["max_bytes"]["description"] = Json::string("最多读取字节数");
+        properties["host"] = Json::object();
+        properties["host"]["type"] = Json::string("string");
+        properties["host"]["description"] = Json::string(
+            "可选：目标会话名（rshell 里已打开的其它标签）。留空表示当前标签的主机；"
+            "要操作别的标签时填它的会话名，例如 us-vps。");
         spec.parameters["type"] = Json::string("object");
         spec.parameters["properties"] = std::move(properties);
         spec.parameters["required"].push(Json::string("path"));
@@ -373,6 +383,11 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         properties["path"] = Json::object();
         properties["path"]["type"] = Json::string("string");
         properties["path"]["description"] = Json::string("目录路径");
+        properties["host"] = Json::object();
+        properties["host"]["type"] = Json::string("string");
+        properties["host"]["description"] = Json::string(
+            "可选：目标会话名（rshell 里已打开的其它标签）。留空表示当前标签的主机；"
+            "要操作别的标签时填它的会话名，例如 us-vps。");
         spec.parameters["type"] = Json::string("object");
         spec.parameters["properties"] = std::move(properties);
         spec.parameters["required"].push(Json::string("path"));
@@ -392,6 +407,11 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         properties["content"] = Json::object();
         properties["content"]["type"] = Json::string("string");
         properties["content"]["description"] = Json::string("完整的新文件内容");
+        properties["host"] = Json::object();
+        properties["host"]["type"] = Json::string("string");
+        properties["host"]["description"] = Json::string(
+            "可选：目标会话名（rshell 里已打开的其它标签）。留空表示当前标签的主机；"
+            "要操作别的标签时填它的会话名，例如 us-vps。");
         spec.parameters["type"] = Json::string("object");
         spec.parameters["properties"] = std::move(properties);
         spec.parameters["required"].push(Json::string("path"));
@@ -411,6 +431,20 @@ bool ToolRegistry::known(const std::string& name) const {
     return name == "run_command" || name == "read_file" || name == "list_dir" ||
            name == "write_file";
 }
+
+namespace {
+// 可选的 host 参数：留空表示「当前目标主机」
+std::string hostArg(const Json& args) {
+    const Json* host = args.find("host");
+    return host && host->isString() ? host->asString() : std::string();
+}
+
+// 审批卡片/摘要的前缀：「在 us-vps 上」；没指定 host 时为空
+std::string targetHostPrefix(const Json& args) {
+    const std::string host = hostArg(args);
+    return host.empty() ? std::string() : ("在 " + host + " 上");
+}
+}  // namespace
 
 ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::string& arguments) const {
     ToolRequestInfo info;
@@ -433,6 +467,8 @@ ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::strin
 
     const Json* path = args.find("path");
     const std::string pathText = path && path->isString() ? path->asString() : std::string();
+    // 指定了别的会话时，审批卡片上要写清楚「在哪台机器上」
+    const std::string onHost = targetHostPrefix(args);
 
     if (name == "run_command") {
         const Json* command = args.find("command");
@@ -442,7 +478,7 @@ ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::strin
             info.problem = "命令为空";
             return info;
         }
-        info.summary = "执行命令：" + firstLine(text, 100);
+        info.summary = onHost + "执行命令：" + firstLine(text, 100);
         info.detail = text;
         info.dangerous = containsCommandPattern(text, policy_.dangerousCommandPatterns);
     } else if (name == "write_file") {
@@ -453,13 +489,13 @@ ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::strin
             info.problem = "缺少目标路径";
             return info;
         }
-        info.summary = "写入 " + pathText + "（" + formatBytes(text.size()) + "）";
+        info.summary = onHost + "写入 " + pathText + "（" + formatBytes(text.size()) + "）";
         info.detail = contentPreview(text, 4096);
     } else if (name == "read_file") {
-        info.summary = "读取 " + pathText;
+        info.summary = onHost + "读取 " + pathText;
         info.detail = pathText;
     } else {  // list_dir
-        info.summary = "列出目录 " + pathText;
+        info.summary = onHost + "列出目录 " + pathText;
         info.detail = pathText;
     }
     return info;
@@ -511,7 +547,7 @@ ToolResult ToolRegistry::runCommand(const Json& args) {
         timeout = std::clamp(value->asInt(), 5, 300);
 
     const std::string text = command->asString();
-    ToolBackend::CommandResult raw = backend_.runCommand(text, timeout);
+    ToolBackend::CommandResult raw = backend_.runCommand(text, timeout, hostArg(args));
 
     bool truncated = raw.truncated;
     std::string output = raw.output;
@@ -571,7 +607,7 @@ ToolResult ToolRegistry::readFile(const Json& args) {
     std::string content;
     bool truncated = false;
     std::string error;
-    if (!backend_.readFile(target, limit, content, truncated, error)) {
+    if (!backend_.readFile(target, limit, content, truncated, error, hostArg(args))) {
         ToolResult result;
         result.ok = false;
         result.json = makeError(error.empty() ? "读取失败" : error).dump();
@@ -620,7 +656,7 @@ ToolResult ToolRegistry::writeFile(const Json& args) {
     }
 
     std::string error;
-    if (!backend_.writeFile(target, text, error)) {
+    if (!backend_.writeFile(target, text, error, hostArg(args))) {
         ToolResult result;
         result.ok = false;
         result.json = makeError(error.empty() ? "写入失败" : error).dump();
@@ -652,7 +688,7 @@ ToolResult ToolRegistry::listDir(const Json& args) {
 
     std::vector<DirEntryView> entries;
     std::string error;
-    if (!backend_.listDir(target, entries, error)) {
+    if (!backend_.listDir(target, entries, error, hostArg(args))) {
         ToolResult result;
         result.ok = false;
         result.json = makeError(error.empty() ? "列目录失败" : error).dump();

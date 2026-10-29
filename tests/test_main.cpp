@@ -2162,6 +2162,103 @@ void testAiAgentWriteNeedsApproval() {
     CHECK(sawDenial);
 }
 
+// 自动审批：低风险写操作直接执行，高风险仍然要用户确认
+void testAiAgentAutoApprove() {
+    {
+        FakeToolBackend backend;
+        ai::ToolPolicy policy = ai::defaultToolPolicy();
+        policy.autoApprove = true;
+        ai::ToolRegistry registry(backend, policy);
+        FakeChatBackend chat;
+        chat.replies.push_back({"写配置", {fakeCall("c1", "write_file",
+                                                R"({"path":"/root/app.conf","content":"x=1"})")}});
+        chat.replies.push_back({"好了", {}});
+
+        ai::Agent agent(chat, registry);
+        int approvals = 0;
+        agent.setApproval([&](const ai::ApprovalRequest&) {
+            ++approvals;
+            return ai::ApprovalDecision::Deny;
+        });
+        agent.addUserMessage("改一下配置");
+        const ai::AgentTurn turn = agent.run();
+        CHECK_EQ(approvals, 0);  // 低风险：没打扰用户
+        CHECK(turn.finished);
+        CHECK_EQ(turn.tools.size(), static_cast<std::size_t>(1));
+        CHECK(turn.tools[0].executed && turn.tools[0].ok);
+        CHECK(turn.tools[0].autoApproved);
+        CHECK(backend.files.find("/root/app.conf") != backend.files.end());
+    }
+    {
+        // 删除命令：自动审批也必须问
+        FakeToolBackend backend;
+        ai::ToolPolicy policy = ai::defaultToolPolicy();
+        policy.autoApprove = true;
+        ai::ToolRegistry registry(backend, policy);
+        FakeChatBackend chat;
+        chat.replies.push_back({"清理日志", {fakeCall("c1", "run_command",
+                                                  R"({"command":"rm -rf /var/log/app/*.log"})")}});
+        chat.replies.push_back({"已取消", {}});
+
+        ai::Agent agent(chat, registry);
+        int approvals = 0;
+        agent.setApproval([&](const ai::ApprovalRequest& request) {
+            ++approvals;
+            CHECK_EQ(request.toolName, std::string("run_command"));
+            return ai::ApprovalDecision::Deny;
+        });
+        agent.addUserMessage("清理日志");
+        const ai::AgentTurn turn = agent.run();
+        CHECK_EQ(approvals, 1);
+        CHECK(turn.tools[0].denied && !turn.tools[0].executed);
+        CHECK(backend.commands.empty());
+    }
+    {
+        // 普通命令（只读类）在自动审批下直接放行
+        FakeToolBackend backend;
+        ai::ToolPolicy policy = ai::defaultToolPolicy();
+        policy.autoApprove = true;
+        ai::ToolRegistry registry(backend, policy);
+        FakeChatBackend chat;
+        chat.replies.push_back({"看看磁盘", {fakeCall("c1", "run_command",
+                                                  R"({"command":"df -h /"})")}});
+        chat.replies.push_back({"完成了", {}});
+        ai::Agent agent(chat, registry);
+        int approvals = 0;
+        agent.setApproval([&](const ai::ApprovalRequest&) {
+            ++approvals;
+            return ai::ApprovalDecision::Allow;
+        });
+        agent.addUserMessage("看下磁盘");
+        agent.run();
+        CHECK_EQ(approvals, 0);
+        CHECK_EQ(backend.commands.size(), static_cast<std::size_t>(1));
+    }
+}
+
+void testAiHighRiskClassification() {
+    FakeToolBackend backend;
+    ai::ToolRegistry registry(backend);
+    const auto risk = [&](const char* tool, const char* args) {
+        return registry.describe(tool, args).highRisk;
+    };
+    // 删除 / 不可逆 / 服务 / 账号
+    CHECK(risk("run_command", R"({"command":"rm -rf /tmp/x"})"));
+    CHECK(risk("run_command", R"({"command":"systemctl stop nginx"})"));
+    CHECK(risk("run_command", R"({"command":"apt purge nginx"})"));
+    CHECK(risk("run_command", R"({"command":"docker rm -f web"})"));
+    // 普通读写不算高风险
+    CHECK(!risk("run_command", R"({"command":"df -h /"})"));
+    CHECK(!risk("run_command", R"({"command":"cat /etc/nginx/nginx.conf"})"));
+    CHECK(!risk("read_file", R"({"path":"/etc/nginx/nginx.conf"})"));
+    // 敏感路径的写入算高风险
+    CHECK(risk("write_file", R"({"path":"/etc/nginx/nginx.conf","content":"x"})"));
+    CHECK(risk("write_file", R"({"path":"/root/.ssh/authorized_keys","content":"x"})"));
+    CHECK(!risk("write_file", R"({"path":"/root/app.conf","content":"x"})"));
+    // 模型自己标 risk=high 也要确认
+    CHECK(risk("run_command", R"({"command":"echo hi","risk":"high"})"));
+}
+
 void testAiAgentAbortAndDefaults() {
     {
         FakeToolBackend backend;
@@ -2420,6 +2517,7 @@ void testAiSettings() {
     CHECK_EQ(defaults.baseUrl, std::string("https://api.openai.com/v1"));
     CHECK(!defaults.model.empty());
     CHECK(defaults.redactSecrets);
+    CHECK(!defaults.autoApprove);  // 自动审批默认关
     CHECK_EQ(defaults.maxSteps, 16);
 
     // 写入会顺带建目录
@@ -2427,6 +2525,7 @@ void testAiSettings() {
     settings.baseUrl = "https://api.deepseek.com/v1";
     settings.model = "deepseek-chat";
     settings.redactSecrets = false;
+    settings.autoApprove = true;
     settings.maxSteps = 8;
     std::string error;
     CHECK(ai::saveAiSettings(settings, &error, file.string()));
@@ -2446,6 +2545,7 @@ void testAiSettings() {
     CHECK_EQ(loaded.baseUrl, std::string("https://api.deepseek.com/v1"));
     CHECK_EQ(loaded.model, std::string("deepseek-chat"));
     CHECK(!loaded.redactSecrets);
+    CHECK(loaded.autoApprove);
     CHECK_EQ(loaded.maxSteps, 8);
 
     // 手工写的配置：注释、CRLF、未知键、非法数字都要能容忍
@@ -2505,6 +2605,8 @@ int main() {
     testAiToolRegistry();
     testAiAgentReadsWithoutApproval();
     testAiAgentWriteNeedsApproval();
+    testAiAgentAutoApprove();
+    testAiHighRiskClassification();
     testAiAgentAbortAndDefaults();
     testAiAgentHistoryTrim();
     testAiSettings();

@@ -81,6 +81,9 @@ AiSettings loadAiSettings(const std::string& path) {
         } else if (key == "redact_secrets" || key == "redact") {
             settings.redactSecrets = !(value == "0" || iequals(value, "false") ||
                                        iequals(value, "no"));
+        } else if (key == "auto_approve" || key == "autoapprove") {
+            settings.autoApprove = !(value == "0" || iequals(value, "false") ||
+                                     iequals(value, "no"));
         } else if (key == "max_steps" || key == "maxsteps") {
             settings.maxSteps = parseInt(value, settings.maxSteps);
         }
@@ -111,6 +114,7 @@ bool saveAiSettings(const AiSettings& settings, std::string* error, const std::s
     out << "base_url=" << settings.baseUrl << "\n";
     out << "model=" << settings.model << "\n";
     out << "redact_secrets=" << (settings.redactSecrets ? "1" : "0") << "\n";
+    out << "auto_approve=" << (settings.autoApprove ? "1" : "0") << "\n";
     out << "max_steps=" << settings.maxSteps << "\n";
     if (!out.good()) {
         if (error) *error = "写入配置文件失败：" + file;

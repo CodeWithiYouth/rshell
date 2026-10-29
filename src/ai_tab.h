@@ -140,6 +140,8 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;   // 隐藏 Client/Agent/工具链，避免头文件依赖
     HWND window_ = nullptr;
+    HFONT bodyFont_ = nullptr;  // 比主界面大一号的正文字体（析构时删）
+    HFONT boldFont_ = nullptr;
     HWND parent_ = nullptr;
     ChatPanel panel_;
     AiTabContext context_;

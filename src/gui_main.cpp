@@ -6917,6 +6917,8 @@ std::string uiIniPath() { return homeDirectory() + "/.rshell/ui.ini"; }
 
 // 宽度按 96dpi 的逻辑像素存，换显示器/缩放比例后不会一下子撑爆
 void loadUiLayout() {
+    // 回归测试里也不读用户真实布局，避免测试结果依赖本机状态
+    if (std::getenv("RSHELL_NO_UI_SAVE")) return;
     std::ifstream in(utf8ToPath(uiIniPath()));
     if (!in) return;
     const double scale = g_app.dpi > 0 ? g_app.dpi / 96.0 : 1.0;
@@ -7058,11 +7060,18 @@ void layoutMain(HWND hwnd) {
 
     g_app.buttons.clear();
     if (g_app.fsCollapsed) {
-        // 折叠成窄栏：整条顶部一个「展开」按钮
+        // 折叠成窄栏：顶部展开按钮 + 文件夹图标 + 一个小的连接/断开按钮
         g_app.buttons.push_back(
             App::UiButton{ID_BTN_FS_TOGGLE,
                           RECT{pad, contentTop, pad + sidebarW, contentTop + dp(30)},
                           false, true});
+        const int iconSize = dp(26);
+        const int iconLeft = pad + (sidebarW - iconSize) / 2;
+        g_app.buttons.push_back(
+            App::UiButton{ID_BTN_ACTION,
+                          RECT{iconLeft, contentTop + dp(66), iconLeft + iconSize,
+                               contentTop + dp(66) + iconSize},
+                          true, false});
     } else {
         // 主按钮：未连接时打开会话列表，连上后是断开（id 不变，文字按连接状态在绘制时决定）
         g_app.buttons.push_back(App::UiButton{
@@ -7567,6 +7576,38 @@ void drawChevronGlyph(HDC dc, const RECT& rc, std::uint32_t color, bool pointRig
     DeleteObject(pen);
 }
 
+// 电源图标：断线用（圆圈缺口 + 顶部竖线）
+void drawPowerGlyph(HDC dc, const RECT& rc, std::uint32_t color) {
+    const int cx = (rc.left + rc.right) / 2;
+    const int cy = (rc.top + rc.bottom) / 2;
+    const int r = std::max(4, dp(5));
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, dp(1)), toColorRef(color));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    // 从左上 45° 顺时针绕过底部到右上，顶部留口
+    Arc(dc, cx - r, cy - r + dp(1), cx + r + 1, cy + r + 1, cx - r, cy, cx + r, cy);
+    MoveToEx(dc, cx, cy - r - dp(2), nullptr);
+    LineTo(dc, cx, cy - dp(1));
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
+// 未连接时的「会话列表」图标：三条横线
+void drawListGlyph(HDC dc, const RECT& rc, std::uint32_t color) {
+    const int cx = (rc.left + rc.right) / 2;
+    const int cy = (rc.top + rc.bottom) / 2;
+    const int half = std::max(4, dp(5));
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, dp(1)), toColorRef(color));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    for (int i = -1; i <= 1; ++i) {
+        MoveToEx(dc, cx - half, cy + i * dp(4), nullptr);
+        LineTo(dc, cx + half, cy + i * dp(4));
+    }
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
 void paintButtons(HDC dc) {
     const bool connected = g_app.shell->running();
     for (const auto& b : g_app.buttons) {
@@ -7624,6 +7665,13 @@ void paintButtons(HDC dc) {
             drawRefreshGlyph(dc, b.rc, fg);
         } else if (b.id == ID_BTN_FS_TOGGLE) {
             drawChevronGlyph(dc, b.rc, fg, g_app.fsCollapsed);
+        } else if (b.id == ID_BTN_ACTION && g_app.fsCollapsed) {
+            // 窄栏里只放图标：连上 = 电源（断开），没连 = 三条线（会话列表）
+            if (g_app.shell->running()) {
+                drawPowerGlyph(dc, b.rc, fg);
+            } else {
+                drawListGlyph(dc, b.rc, fg);
+            }
         } else if (b.id == ID_BTN_FS_UP) {
             drawText(dc, label, b.rc, fg, g_app.uiFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {

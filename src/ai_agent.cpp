@@ -174,7 +174,11 @@ AgentTurn Agent::run(const std::function<bool()>& shouldCancel) {
             ToolRecord record;
             record.name = call.name;
             record.summary = info.summary;
-            record.requiredApproval = info.kind == ToolKind::Write;
+            // 自动审批模式：低风险写操作直接放行，只有高风险（删除/不可逆/敏感路径）
+            // 才弹确认。没开自动审批时保持原来的「写操作一律确认」。
+            const bool autoApprove = tools_.policy().autoApprove && !info.highRisk;
+            record.requiredApproval = info.kind == ToolKind::Write && !autoApprove;
+            if (info.kind == ToolKind::Write && autoApprove) record.autoApproved = true;
 
             if (record.requiredApproval) {
                 ApprovalRequest approval;
@@ -236,6 +240,7 @@ AgentTurn Agent::run(const std::function<bool()>& shouldCancel) {
             record.denied = outcome.denied;
             record.display = outcome.display;
             record.brief = outcome.brief;
+            if (record.autoApproved && record.brief.empty()) record.brief = "自动批准";
             turn.tools.push_back(record);
             if (callbacks_.onToolFinish) callbacks_.onToolFinish(record);
 

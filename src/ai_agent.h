@@ -46,6 +46,7 @@ struct ToolRecord {
     bool executed = false;
     bool ok = false;
     bool denied = false;  // 被策略或用户拒绝
+    bool autoApproved = false;  // 自动审批模式下放行的写操作
     std::string display;  // 完整说明：显示在展开的工具卡片里
     std::string brief;    // 短标记：显示在卡片右上角
 };

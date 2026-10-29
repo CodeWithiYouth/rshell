@@ -281,6 +281,38 @@ ToolPolicy defaultToolPolicy() {
         "truncate -s 0", "> /etc/",
     };
 
+    // 自动审批模式下仍然必须人来点的操作：删除类、不可逆、账号/服务/防火墙、
+    // 包卸载、容器删除。宁可多问一句，也不让模型自己决定「这条 rm 安不安全」。
+    policy.highRiskPatterns = {
+        // 删除 / 覆盖
+        "rm ", "rmdir", "unlink", "shred", "truncate", "-delete",
+        // 磁盘 / 分区
+        "mkfs", "dd if=", "dd of=", "fdisk", "parted", "wipefs", "> /dev/sd", "of=/dev/sd",
+        // 账号 / 权限 / 提权
+        "userdel", "groupdel", "chpasswd", "visudo", "sudoers", "chmod 777", "chown -r",
+        "setfacl", "usermod",
+        // 服务 / 防火墙 / 关机
+        "systemctl stop", "systemctl disable", "systemctl mask", "systemctl restart",
+        "iptables", "nft ", "ufw ", "shutdown", "reboot", "halt", "init 0",
+        "kill -9", "pkill", "killall",
+        // 包管理卸载
+        "apt remove", "apt purge", "apt-get remove", "apt-get purge", "yum remove",
+        "dnf remove", "apk del", "snap remove", "pip uninstall",
+        // 容器 / 编排
+        "docker rm", "docker rmi", "docker prune", "docker volume rm", "docker system prune",
+        "kubectl delete", "helm uninstall",
+        // 版本控制 / 数据库
+        "git clean", "git reset --hard", "drop table", "drop database", "truncate table",
+        // 写系统目录（读不受影响）
+        "> /etc/", ">> /etc/", "tee /etc/", "> /boot/", "tee /boot/",
+    };
+    // write_file 的目标路径命中这些就需要确认（读文件不受限）
+    policy.highRiskWritePaths = {
+        "/etc/*", "/boot/*", "/usr/lib/systemd/*", "/lib/systemd/*", "*/.ssh/*",
+        "*/sudoers", "*/sudoers.d/*", "*/authorized_keys", "*/crontab*", "*/cron.d/*",
+        "*/.bashrc", "*/.profile", "*/.bash_profile",
+    };
+
     return policy;
 }
 
@@ -345,6 +377,11 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         properties["host"]["description"] = Json::string(
             "可选：目标会话名（rshell 里已打开的其它标签）。留空表示当前标签的主机；"
             "要操作别的标签时填它的会话名，例如 us-vps。");
+        properties["risk"] = Json::object();
+        properties["risk"]["type"] = Json::string("string");
+        properties["risk"]["description"] = Json::string(
+            "可选：这次操作会删除数据、不可逆或影响线上服务时填 high，"
+            "强制用户确认；其余情况不用填。");
         spec.parameters["type"] = Json::string("object");
         spec.parameters["properties"] = std::move(properties);
         spec.parameters["required"].push(Json::string("command"));
@@ -369,6 +406,11 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         properties["host"]["description"] = Json::string(
             "可选：目标会话名（rshell 里已打开的其它标签）。留空表示当前标签的主机；"
             "要操作别的标签时填它的会话名，例如 us-vps。");
+        properties["risk"] = Json::object();
+        properties["risk"]["type"] = Json::string("string");
+        properties["risk"]["description"] = Json::string(
+            "可选：这次操作会删除数据、不可逆或影响线上服务时填 high，"
+            "强制用户确认；其余情况不用填。");
         spec.parameters["type"] = Json::string("object");
         spec.parameters["properties"] = std::move(properties);
         spec.parameters["required"].push(Json::string("path"));
@@ -388,6 +430,11 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         properties["host"]["description"] = Json::string(
             "可选：目标会话名（rshell 里已打开的其它标签）。留空表示当前标签的主机；"
             "要操作别的标签时填它的会话名，例如 us-vps。");
+        properties["risk"] = Json::object();
+        properties["risk"]["type"] = Json::string("string");
+        properties["risk"]["description"] = Json::string(
+            "可选：这次操作会删除数据、不可逆或影响线上服务时填 high，"
+            "强制用户确认；其余情况不用填。");
         spec.parameters["type"] = Json::string("object");
         spec.parameters["properties"] = std::move(properties);
         spec.parameters["required"].push(Json::string("path"));
@@ -412,6 +459,11 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         properties["host"]["description"] = Json::string(
             "可选：目标会话名（rshell 里已打开的其它标签）。留空表示当前标签的主机；"
             "要操作别的标签时填它的会话名，例如 us-vps。");
+        properties["risk"] = Json::object();
+        properties["risk"]["type"] = Json::string("string");
+        properties["risk"]["description"] = Json::string(
+            "可选：这次操作会删除数据、不可逆或影响线上服务时填 high，"
+            "强制用户确认；其余情况不用填。");
         spec.parameters["type"] = Json::string("object");
         spec.parameters["properties"] = std::move(properties);
         spec.parameters["required"].push(Json::string("path"));
@@ -469,6 +521,11 @@ ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::strin
     const std::string pathText = path && path->isString() ? path->asString() : std::string();
     // 指定了别的会话时，审批卡片上要写清楚「在哪台机器上」
     const std::string onHost = targetHostPrefix(args);
+    // 模型自己判断这条有风险时，也可以主动要求用户确认（risk=high）
+    if (const Json* risk = args.find("risk");
+        risk && risk->isString() && toLower(risk->asString()) == "high") {
+        info.highRisk = true;
+    }
 
     if (name == "run_command") {
         const Json* command = args.find("command");
@@ -481,6 +538,9 @@ ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::strin
         info.summary = onHost + "执行命令：" + firstLine(text, 100);
         info.detail = text;
         info.dangerous = containsCommandPattern(text, policy_.dangerousCommandPatterns);
+        // 删除、磁盘、账号、服务、包卸载、写系统目录 → 自动审批也要问
+        info.highRisk = info.highRisk || info.dangerous ||
+                        containsCommandPattern(text, policy_.highRiskPatterns);
     } else if (name == "write_file") {
         const Json* content = args.find("content");
         const std::string text = content && content->isString() ? content->asString() : std::string();
@@ -491,6 +551,13 @@ ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::strin
         }
         info.summary = onHost + "写入 " + pathText + "（" + formatBytes(text.size()) + "）";
         info.detail = contentPreview(text, 4096);
+        // 覆盖系统目录/密钥/计划任务属于敏感写入
+        for (const std::string& pattern : policy_.highRiskWritePaths) {
+            if (globMatch(pattern, pathText)) {
+                info.highRisk = true;
+                break;
+            }
+        }
     } else if (name == "read_file") {
         info.summary = onHost + "读取 " + pathText;
         info.detail = pathText;

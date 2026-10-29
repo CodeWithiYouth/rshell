@@ -28,6 +28,18 @@ namespace rshell::ai {
 namespace {
 
 constexpr wchar_t kAiClass[] = L"RshellAiTab";
+
+// 按比例放大字体：面板正文比主界面大一号，长文更好读
+HFONT createScaledFont(HFONT base, double scale, int weight) {
+    if (!base) return nullptr;
+    LOGFONTW lf{};
+    if (!GetObjectW(base, sizeof(lf), &lf)) return nullptr;
+    lf.lfHeight = static_cast<LONG>(lf.lfHeight * scale);
+    if (weight > 0) lf.lfWeight = weight;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    return CreateFontIndirectW(&lf);
+}
+
 constexpr UINT kAiEventMessage = WM_APP + 61;
 constexpr UINT kAiFlushMessage = WM_APP + 62;
 constexpr UINT kAiModelsMessage = WM_APP + 63;
@@ -43,7 +55,10 @@ constexpr int kFieldGap = 66;
 constexpr int kEditOffset = 24;
 constexpr int kEditHeight = 30;
 constexpr int kFetchW = 88;
-constexpr int kButtonTop = kFieldTop + kFieldGap * 3 + 4;
+// 自动审批勾选框放在模型字段和按钮之间
+constexpr int kAutoTop = kFieldTop + kFieldGap * 2 + kEditOffset + kEditHeight + 16;
+constexpr int kAutoH = 26;
+constexpr int kButtonTop = kAutoTop + kAutoH + 14;
 constexpr int kButtonHeight = 34;
 
 struct ModelFetchPayload {
@@ -220,6 +235,14 @@ struct AiTab::Impl {
     Client client{ApiConfig{}};
     Agent agent;
 
+    // 自动审批开关落到工具策略上：低风险写操作放行，高风险仍要人确认
+    void applyAutoApprove() {
+        ToolPolicy policy = defaultToolPolicy();
+        policy.autoApprove = settings.autoApprove;
+        policy.redactSecrets = settings.redactSecrets;
+        registry.setPolicy(std::move(policy));
+    }
+
     std::thread worker;
     std::atomic<bool> cancel{false};
     std::atomic<bool> busy{false};
@@ -263,6 +286,8 @@ struct AiTab::Impl {
     std::string fetchStatus;
     RECT saveRect{};
     RECT cancelRect{};
+    RECT autoRect{};          // 自动审批勾选框
+    bool draftAutoApprove = false;
 };
 
 AiTab* AiTab::create(HWND parent, AiTabContext context) {
@@ -316,9 +341,13 @@ void AiTab::destroy(AiTab* tab) {
 }
 
 void AiTab::initialize(HWND) {
+    // 正文比主界面 UI 字号大一号：AI 面板是拿来读长文的，13px 在深色底上容易糊成一片
+    bodyFont_ = createScaledFont(context_.uiFont, 1.10, FW_NORMAL);
+    boldFont_ = createScaledFont(context_.boldFont ? context_.boldFont : context_.uiFont, 1.10,
+                                 FW_SEMIBOLD);
     PanelFonts fonts;
-    fonts.ui = context_.uiFont;
-    fonts.bold = context_.boldFont;
+    fonts.ui = bodyFont_ ? bodyFont_ : context_.uiFont;
+    fonts.bold = boldFont_ ? boldFont_ : context_.boldFont;
     fonts.mono = context_.monoFont;
     fonts.caption = context_.captionFont;
     panel_.setFonts(fonts);
@@ -349,6 +378,7 @@ void AiTab::initialize(HWND) {
     panel_.setCallbacks(std::move(actions));
 
     impl_->settings = loadAiSettings();
+    impl_->applyAutoApprove();
     impl_->client.setConfig(makeApiConfig(impl_->settings, std::string(), impl_->sessionId));
     panel_.setModelName(toWideText(impl_->settings.model));
 
@@ -508,6 +538,12 @@ void AiTab::updateWelcome() {
 std::string AiTab::buildSystemPrompt() {
     std::string prompt = defaultSystemPrompt();
     prompt += "\n当前目标主机：" + toUtf8Text(currentHostLabel());
+    if (impl_->settings.autoApprove) {
+        prompt +=
+            "\n审批模式：自动审批。低风险命令/写文件会直接执行，不再询问用户；"
+            "但删除、不可逆、影响线上服务、写系统目录这类操作，请把工具的 risk 参数设为 \"high\"，"
+            "并在回复里用一句话说明后果。";
+    }
     if (context_.hosts) {
         const auto hosts = context_.hosts();
         if (hosts.size() > 1) {
@@ -801,6 +837,7 @@ void AiTab::startSettings(bool unlockOnly) {
 
     createSettingsControls();
     impl_->draftProvider = impl_->settings.provider;
+    impl_->draftAutoApprove = impl_->settings.autoApprove;
     impl_->fetchStatus.clear();
     SetWindowTextW(impl_->editBase, toWideText(impl_->settings.baseUrl).c_str());
     SetWindowTextW(impl_->editKey, L"");
@@ -865,6 +902,7 @@ void AiTab::layoutSettings() {
                             comboTop + kEditHeight};
     MoveWindow(impl_->modelCombo, left, comboTop, width - kFetchW - 8, 240, TRUE);
 
+    impl_->autoRect = RECT{left, kAutoTop, left + width, kAutoTop + kAutoH};
     impl_->saveRect = RECT{left, kButtonTop, left + 96, kButtonTop + kButtonHeight};
     impl_->cancelRect = RECT{left + 108, kButtonTop, left + 108 + 96,
                              kButtonTop + kButtonHeight};
@@ -930,6 +968,7 @@ void AiTab::finishSettings(bool save) {
         settings.baseUrl = trim(readText(impl_->editBase));
         settings.provider = impl_->draftProvider;
         settings.model = trim(readText(impl_->modelCombo));
+        settings.autoApprove = impl_->draftAutoApprove;
         if (settings.baseUrl.empty() || settings.model.empty()) {
             panel_.addNotice(L"API 地址和模型都不能为空", true);
             return;
@@ -939,6 +978,8 @@ void AiTab::finishSettings(bool save) {
             panel_.addNotice(toWideText(error), true);
             return;
         }
+        impl_->settings = settings;
+        impl_->applyAutoApprove();
         const std::string key = trim(readText(impl_->editKey));
         if (!key.empty()) {
             if (!context_.vault || !saveApiKey(*context_.vault, key, &error)) {
@@ -1223,6 +1264,11 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                     startModelFetch();
                     return 0;
                 }
+                if (PtInRect(&impl_->autoRect, pt)) {
+                    impl_->draftAutoApprove = !impl_->draftAutoApprove;
+                    InvalidateRect(window_, nullptr, FALSE);
+                    return 0;
+                }
                 if (PtInRect(&impl_->saveRect, pt)) {
                     finishSettings(true);
                     return 0;
@@ -1270,6 +1316,8 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             KillTimer(window_, kRepaintTimer);
             if (impl_ && impl_->backBmp) DeleteObject(impl_->backBmp);
             if (impl_ && impl_->backDc) DeleteDC(impl_->backDc);
+            if (bodyFont_) { DeleteObject(bodyFont_); bodyFont_ = nullptr; }
+            if (boldFont_) { DeleteObject(boldFont_); boldFont_ = nullptr; }
             SetWindowLongPtrW(window_, GWLP_USERDATA, 0);
             delete this;
             return 0;
@@ -1340,6 +1388,29 @@ void AiTab::paint(HDC dc) {
     };
     button(impl_->fetchRect, impl_->fetching ? L"获取中…" : L"获取模型",
            impl_->fetching ? ui::bgCard : ui::bgCard, ui::accent);
+
+    // 自动审批：勾上之后低风险写操作直接执行，高风险（删除/不可逆/敏感路径）仍然要确认
+    {
+        const RECT& row = impl_->autoRect;
+        const int box = 16;
+        RECT check{row.left, row.top + (row.bottom - row.top - box) / 2,
+                   row.left + box, row.top + (row.bottom - row.top - box) / 2 + box};
+        HBRUSH boxBrush = CreateSolidBrush(
+            toColorRef(impl_->draftAutoApprove ? ui::action : ui::bgApp));
+        FillRect(dc, &check, boxBrush);
+        DeleteObject(boxBrush);
+        HBRUSH boxBorder = CreateSolidBrush(
+            toColorRef(impl_->draftAutoApprove ? ui::action : ui::borderSoft));
+        FrameRect(dc, &check, boxBorder);
+        DeleteObject(boxBorder);
+        if (impl_->draftAutoApprove) {
+            drawText(dc, L"✓", check, 0xFFFFFF, context_.captionFont,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+        drawText(dc, L"自动审批：低风险操作直接执行，删除/不可逆/敏感路径仍需确认",
+                 RECT{check.right + 8, row.top, row.right, row.bottom}, ui::text,
+                 context_.captionFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
     button(impl_->saveRect, L"保存", ui::action, 0xFFFFFF);
     button(impl_->cancelRect, L"取消", ui::bgCard, ui::textDim);
 

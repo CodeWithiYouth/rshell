@@ -580,12 +580,26 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
 
 | 工具 | 分级 | 上限 |
 | --- | --- | --- |
-| `run_command` | 写，必审 | 超时 5~300 秒；缓冲 256 KB，回灌 32 KB |
-| `write_file` | 写，必审 | 单次 256 KB，整文件覆盖，权限 0644 |
+| `run_command` | 写，必审（自动审批模式下按风险） | 超时 5~300 秒；缓冲 256 KB，回灌 32 KB |
+| `write_file` | 写，必审（自动审批模式下按风险） | 单次 256 KB，整文件覆盖，权限 0644 |
 | `read_file` | 读，免审 | 96 KB，超限标记截断 |
 | `list_dir` | 读，免审 | 200 项 |
 
 命令走独立 exec 通道：没有 PTY，`cd` 不跨调用保留；超时只关闭通道，不给远端进程发信号。
+
+### 自动审批
+
+`ai.ini` 里 `auto_approve=1`（设置页的勾选框）打开后，写操作不再逐条确认，改成按风险分级：
+
+- **直接执行**：普通命令、普通路径的 `write_file`。
+- **仍然要确认**：命中 `highRiskPatterns` 的命令（`rm`/`rmdir`/`unlink`/`shred`/`truncate`、
+  `mkfs`/`dd`/`fdisk`、账号与权限变更、`systemctl stop|disable|mask|restart`、`iptables`/`nft`/`ufw`、
+  关机重启、`kill -9`/`pkill`、包卸载、`docker rm|rmi|prune`、`kubectl delete`、`git clean`、
+  `drop table` 等），以及写入 `highRiskWritePaths`（`/etc`、`/boot`、systemd 单元、`~/.ssh`、
+  `sudoers`、`crontab`、shell 启动文件）。
+- 模型自己判断有危险时，把工具的 `risk` 参数设成 `high` 也会强制确认；系统提示里会说明这一点。
+- 自动放行的调用在卡片右上角标「自动批准」，事后仍能在对话里查到。
+- 没开自动审批时行为不变：写操作一律确认；没有审批回调时一律拒绝。
 
 ### 多会话（跨标签）
 

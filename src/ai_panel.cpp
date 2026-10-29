@@ -530,6 +530,9 @@ void ChatPanel::paint(HDC dc) {
     RECT view{full.left, header.bottom, full.right, composer.top};
 
     const int contentWidth = width - kPad * 2;
+    // 消息区用更深的底色，正文和气泡才「浮」得起来（以前整块面板一个颜色，
+    // 文字和背景贴在一起看不清层次）
+    fillRect(dc, view, bgApp);
     // 只有结构变化或宽度变化才重新测量全部条目；流式追加时只重量最后一条。
     // 否则每个 token 都会对所有历史消息做一遍 DrawText 计算高度。
     if (layoutDirty_ || measuredWidth_ != contentWidth || heights_.size() != items_.size()) {
@@ -815,11 +818,11 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
         case ItemKind::Reasoning: {
             const std::wstring label =
                 item.expanded ? L"思考过程（点击收起）" : L"思考过程（点击展开）";
-            drawText(dc, label, RECT{rc.left, rc.top, rc.right, rc.top + cap}, textFaint,
+            drawText(dc, label, RECT{rc.left, rc.top, rc.right, rc.top + cap}, textDim,
                      fonts_.caption, DT_LEFT | DT_TOP | DT_SINGLELINE);
             if (item.expanded) {
                 RECT inner{rc.left + 10, rc.top + cap + 2, rc.right - 10, rc.bottom};
-                drawText(dc, item.body, inner, textFaint, fonts_.caption,
+                drawText(dc, item.body, inner, textDim, fonts_.caption,
                          DT_LEFT | DT_TOP | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS);
             }
             hits_.push_back({rc, Hit::Toggle, index});
@@ -827,7 +830,7 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
         }
 
         case ItemKind::Tool: {
-            fillRoundRect(dc, rc, 8, bgPanel, borderSoft);
+            fillRoundRect(dc, rc, 8, bgCard, border);
             RECT inner = rc;
             inner.left += 10;
             inner.right -= 10;

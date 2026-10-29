@@ -60,11 +60,17 @@ struct ToolPolicy {
     std::size_t maxEntries = 200;              // 单次列目录上限
     int commandTimeoutSec = 60;
     bool redactSecrets = true;
+    // 自动审批：低风险写操作直接执行（仍会记在对话里），高风险才弹确认
+    bool autoApprove = false;
     // 读路径黑名单（glob，* 可跨 /）。命中时 read_file 直接拒绝。
     std::vector<std::string> deniedReadPaths;
     // 下发命令一律按写操作处理，因此不需要命令黑名单；
     // 但下面这些模式会在审批卡片上标红，提示用户重点确认。
     std::vector<std::string> dangerousCommandPatterns;
+    // 自动审批模式下也必须人确认的命令/路径特征（删除、磁盘、账号、服务、敏感目录）
+    std::vector<std::string> highRiskPatterns;
+    // write_file 目标路径命中这些也需要确认（读不受影响）
+    std::vector<std::string> highRiskWritePaths;
 };
 
 // 默认策略：内置一份保守的黑名单与危险命令模式
@@ -86,6 +92,9 @@ struct ToolRequestInfo {
     std::string summary;    // 一句话，例如「执行命令：systemctl status nginx」
     std::string detail;     // 原文：完整命令 / 文件内容预览
     bool dangerous = false; // 命中危险命令模式
+    // 高风险：删除、不可逆、敏感路径、或模型主动标了 risk=high。
+    // 自动审批模式下只有高风险才让用户确认。
+    bool highRisk = false;
     bool valid = true;      // 参数是否可解析
     std::string problem;    // valid=false 时的原因
 };
@@ -107,6 +116,7 @@ public:
     ToolResult execute(const std::string& name, const std::string& arguments);
 
     const ToolPolicy& policy() const { return policy_; }
+    void setPolicy(ToolPolicy policy) { policy_ = std::move(policy); }
 
 private:
     ToolResult runCommand(const Json& args);

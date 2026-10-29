@@ -726,6 +726,47 @@ void fsCollapseRegression() {
     check(visible(g_app.list), "file list is back");
 }
 
+// 检查更新：发现新版本时，标题栏出现可点击的提示胶囊
+void updateCheckRegression() {
+    ReleaseInfo newer;
+    newer.ok = true;
+    newer.tag = "v99.9.9";
+    newer.url = "https://example.invalid/rshell";
+    newer.newer = true;
+    g_app.updateCheckManual = false;
+    handleUpdateResult(newer);
+    check(g_app.updateTag == "v99.9.9", "a newer release is remembered");
+    check(g_app.updateUrl == "https://example.invalid/rshell", "its page url is remembered");
+    {
+        // 提示胶囊是在 paintTitleBar 里算出来的，探针窗口不显示，得自己画一次
+        RECT client{};
+        GetClientRect(g_app.main, &client);
+        HDC screen = GetDC(nullptr);
+        HDC dc = CreateCompatibleDC(screen);
+        paintTitleBar(dc, RECT{0, 0, client.right, g_app.titleH});
+        DeleteDC(dc);
+        ReleaseDC(nullptr, screen);
+    }
+    check(!IsRectEmpty(&g_app.updateChip), "the title bar shows an update chip");
+    check(g_app.updateChip.left > 0 && g_app.updateChip.right < g_app.titleAi.left,
+          "the update chip sits left of the AI button");
+
+    // 同版本不提示
+    g_app.updateTag.clear();
+    g_app.updateUrl.clear();
+    ReleaseInfo same;
+    same.ok = true;
+    same.tag = std::string("v") + appVersion();
+    handleUpdateResult(same);
+    check(g_app.updateTag.empty(), "the same version does not raise a chip");
+
+    // 请求失败只在日志里记一笔
+    ReleaseInfo failed;
+    failed.error = "network down";
+    handleUpdateResult(failed);
+    check(g_app.updateTag.empty(), "a failed check keeps the UI quiet");
+}
+
 void titleAiButtonRegression() {
     RECT client{}; GetClientRect(g_app.main, &client);
     HDC screen = GetDC(nullptr);
@@ -790,6 +831,7 @@ int main(int argc, char** argv) {
         fsLoadingRegression();
         splitterRegression();
         fsCollapseRegression();
+        updateCheckRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);

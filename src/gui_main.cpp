@@ -50,6 +50,7 @@
 #include "ssh_session.h"
 #include "ssh_shell.h"
 #include "terminal.h"
+#include "update_check.h"
 #include "ui_theme.h"
 #include "util.h"
 #include "vault.h"
@@ -72,6 +73,7 @@ enum : UINT {
     WM_FS_STATS = WM_APP + 6,     // lParam = RemoteStats*（UI 线程负责释放）
     WM_ASK_HOSTKEY = WM_APP + 7,  // lParam = HostKeyRequest*（工作线程同步等待）
     WM_VAULT_TPM_DONE = WM_APP + 8,  // lParam = std::shared_ptr<TpmAttempt>*（UI 线程释放）
+    WM_UPDATE_AVAILABLE = WM_APP + 9,  // lParam = ReleaseInfo*（UI 线程释放）
 };
 
 // 目录跟随分三步执行，每步由远端私有 OSC 确认；定时器只负责静默等待和超时。
@@ -83,6 +85,7 @@ constexpr UINT_PTR kCwdHookTimer3 = 4;
 constexpr UINT_PTR kCwdHookTimer4 = 5;
 // 定时器 id 与 tabId 一起编码成 tabId*8+id（见 mainProc 的 WM_TIMER 分发）
 constexpr UINT_PTR kReconnectTimer = 6;
+constexpr UINT_PTR kUpdateCheckTimer = 7;
 
 enum : int {
     ID_LIST = 1001,
@@ -108,6 +111,8 @@ ID_BTN_FS_TOGGLE,   // 文件面板：折叠 / 展开
     IDM_SEARCH,
     IDM_RECONNECT,
     IDM_ABOUT,
+    IDM_CHECK_UPDATE,
+    IDM_TOGGLE_UPDATE_CHECK,
     IDM_EXIT,
     IDM_NEW_TAB,
     IDM_CLOSE_TAB,
@@ -214,6 +219,13 @@ struct App : SessionState {
     int sidebarWanted = 0;  // 拖拽后的期望宽度（0 = 自动）
     int aiDockWanted = 0;
     bool fsCollapsed = false;  // 远端文件面板折叠成一条窄栏
+    // 新版本提示：标签栏右侧的小胶囊
+    std::string updateTag;
+    std::string updateUrl;
+    RECT updateChip{};
+    bool hoverUpdateChip = false;
+    bool updateCheckManual = false;
+    bool updateCheckOnStart = true;
     int splitDrag = 0;     // 0=没在拖 1=文件面板 2=AI 面板
     int splitStartX = 0;
     int splitStartW = 0;
@@ -6932,6 +6944,7 @@ void loadUiLayout() {
         if (key == "sidebar") g_app.sidebarWanted = static_cast<int>(value * scale);
         else if (key == "aidock") g_app.aiDockWanted = static_cast<int>(value * scale);
         else if (key == "fscollapsed") g_app.fsCollapsed = value != 0;
+        else if (key == "updatecheck") g_app.updateCheckOnStart = value != 0;
     }
 }
 
@@ -6953,6 +6966,7 @@ void saveUiLayout() {
     out << "sidebar=" << sidebarLogical << "\n";
     out << "aidock=" << aiLogical << "\n";
     out << "fscollapsed=" << (g_app.fsCollapsed ? 1 : 0) << "\n";
+    out << "updatecheck=" << (g_app.updateCheckOnStart ? 1 : 0) << "\n";
 }
 
 // 拖拽中的分隔条：1=文件面板 2=AI 面板 0=没有
@@ -6962,6 +6976,64 @@ int splitterAt(POINT pt) {
         return 2;
     if (g_app.fsSplitter.right > g_app.fsSplitter.left && PtInRect(&g_app.fsSplitter, pt)) return 1;
     return 0;
+}
+
+// ---------------------------------------------------------------- 检查更新
+
+void startUpdateCheck(bool manual) {
+    if (!g_app.main) return;
+    g_app.updateCheckManual = manual;
+    HWND window = g_app.main;
+    std::thread([window]() {
+        ReleaseInfo info = fetchLatestRelease(appVersion());
+        if (g_applicationClosing.load()) return;
+        auto* payload = new ReleaseInfo(std::move(info));
+        if (!PostMessageW(window, WM_UPDATE_AVAILABLE, 0, reinterpret_cast<LPARAM>(payload)))
+            delete payload;
+    }).detach();
+}
+
+// 收到检查结果：自动检查只在有新版时提示；手动检查总要给个答复
+void handleUpdateResult(const ReleaseInfo& info) {
+    const std::wstring current = toWide(appVersion());
+    const bool manual = g_app.updateCheckManual;
+    g_app.updateCheckManual = false;
+
+    if (!info.ok) {
+        guiLog("检查更新失败：" + info.error);
+        if (manual) {
+            messageInfo(L"检查更新失败",
+                        L"没能连上 GitHub：\n" + toWide(info.error) +
+                            L"\n\n可以稍后再试，或直接打开 https://github.com/CodeWithiYouth/rshell/releases");
+        }
+        return;
+    }
+    guiLog("检查更新：" + info.tag + "（当前 " + std::string(appVersion()) + "）");
+    if (!info.newer) {
+        if (manual) messageInfo(L"已是最新版本", L"当前版本 " + current + L"，没有更新的发布。");
+        return;
+    }
+
+    g_app.updateTag = info.tag;
+    g_app.updateUrl = info.url.empty()
+                          ? std::string("https://github.com/CodeWithiYouth/rshell/releases")
+                          : info.url;
+    if (g_app.main) {
+        layoutMain(g_app.main);
+        InvalidateRect(g_app.main, nullptr, FALSE);
+    }
+    setStatus(L"发现新版本 " + toWide(info.tag) + L"，点标签栏右上角可以查看");
+    if (manual) {
+        const std::wstring title = L"发现新版本 " + toWide(info.tag);
+        std::wstring text = L"当前版本 " + current + L"，最新发布是 " + toWide(info.tag) + L"。";
+        if (!info.body.empty()) {
+            std::wstring notes = toWide(info.body);
+            if (notes.size() > 600) notes = notes.substr(0, 600) + L"…";
+            text += L"\n\n" + notes;
+        }
+        if (messageConfirm(title, text, L"打开发布页", L"以后再说"))
+            openInBrowser(g_app.updateUrl);
+    }
 }
 
 void layoutMain(HWND hwnd) {
@@ -7511,8 +7583,25 @@ void paintTitleBar(HDC dc, const RECT& rc) {
     const int pillRight = g_app.titleAi.left - dp(8);
     const int pillLeft = pillRight - pillW;
 
-    // 当前会话名（放不下就省略号）
-    const int subMaxW = pillLeft - x - dp(12);
+    // 新版本提示：贴在连接状态药丸左边，点一下打开发布页
+    if (!g_app.updateTag.empty()) {
+        const std::wstring label = L"↑ " + toWide(g_app.updateTag);
+        const int chipH = dp(20);
+        const int chipW = textWidth(dc, label, g_app.tinyFont) + dp(18);
+        g_app.updateChip = RECT{pillLeft - dp(8) - chipW, (h - chipH) / 2,
+                                pillLeft - dp(8), (h - chipH) / 2 + chipH};
+        fillRoundRect(dc, g_app.updateChip, chipH / 2,
+                      ui::mix(ui::accent, ui::bgPanel, g_app.hoverUpdateChip ? 0.68 : 0.84),
+                      ui::mix(ui::accent, ui::bgPanel, 0.45));
+        drawText(dc, label, g_app.updateChip, ui::accent, g_app.tinyFont,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    } else {
+        g_app.updateChip = RECT{};
+    }
+
+    // 当前会话名（放不下就省略号；有新版本提示时给它让位）
+    const int nameLimit = IsRectEmpty(&g_app.updateChip) ? pillLeft : g_app.updateChip.left;
+    const int subMaxW = nameLimit - x - dp(12);
     if (subMaxW > dp(36)) {
         fillCircle(dc, x + dp(1), h / 2, dp(2), ui::textFaint);
         x += dp(8);
@@ -8443,6 +8532,10 @@ void openMainMenu(HWND hwnd) {
     add(IDM_ZOOM_OUT, L"缩小字体", L"Ctrl+-");
     add(IDM_ZOOM_RESET, L"重置字体", L"Ctrl+0");
     sep();
+    add(IDM_CHECK_UPDATE, L"检查更新…");
+    add(IDM_TOGGLE_UPDATE_CHECK,
+        g_app.updateCheckOnStart ? L"启动时自动检查更新（已开）" : L"启动时自动检查更新（已关）");
+    sep();
     add(IDM_ABOUT, L"关于 rshell");
     add(IDM_EXIT, L"退出");
 
@@ -8814,6 +8907,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             initializeSessionTabs();
             g_app.dpi = wincompat::windowDpi(hwnd);
             loadUiLayout();  // 上次拖好的分栏宽度
+            if (g_app.updateCheckOnStart) SetTimer(hwnd, kUpdateCheckTimer, 4000, nullptr);
 
             g_app.list = CreateWindowExW(
                 0, kListClass, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10, hwnd,
@@ -8913,6 +9007,11 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const int button = hitButton(pt);
             const int titleButton = hitTitleButton(pt);
             const bool aiHover = hitAiButton(pt);
+            const bool updateHover = !IsRectEmpty(&g_app.updateChip) && PtInRect(&g_app.updateChip, pt);
+            if (updateHover != g_app.hoverUpdateChip) {
+                g_app.hoverUpdateChip = updateHover;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             // 下载胶囊 / 列表里的悬停状态
             const DownloadHit downloadHit = hitDownloadUi(hwnd, pt);
             const bool chipHover = downloadHit.chip;
@@ -8972,6 +9071,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             hideStatusHint();
+            if (!IsRectEmpty(&g_app.updateChip) && PtInRect(&g_app.updateChip, pt)) {
+                openInBrowser(g_app.updateUrl);
+                return 0;
+            }
             // 分栏分隔条：按下就开始拖
             if (const int split = splitterAt(pt)) {
                 g_app.splitDrag = split;
@@ -9103,6 +9206,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 RECT client;
                 GetClientRect(hwnd, &client);
                 const StatusLayout status = statusGeometry(client);
+                if (!IsRectEmpty(&g_app.updateChip) && PtInRect(&g_app.updateChip, pt)) {
+                    SetCursor(LoadCursorW(nullptr, IDC_HAND));
+                    return TRUE;
+                }
                 if (hitButton(pt) >= 0 || hitTitleButton(pt) >= 0 || hitAiButton(pt) || downloadHit.chip ||
                     downloadHit.close || downloadHit.clear || downloadHit.cancelIndex >= 0 ||
                     PtInRect(&status.reconnect, pt) || PtInRect(&status.dismiss, pt) ||
@@ -9124,6 +9231,9 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_app.term) InvalidateRect(g_app.term, nullptr, FALSE);
                 // 列目录还没回来时让「正在加载」的三个点动起来
                 if (g_app.fsLoading && g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
+            } else if (wp == kUpdateCheckTimer) {
+                KillTimer(hwnd, kUpdateCheckTimer);
+                startUpdateCheck(false);
             } else if (wp == kReconnectTimer) {
                 if (g_app.main) KillTimer(hwnd,
                     static_cast<UINT_PTR>(g_app.tabId * 8) + kReconnectTimer);
@@ -9331,6 +9441,16 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case IDM_ZOOM_RESET:
                     applyFontSize(16);
+                    return 0;
+                case IDM_CHECK_UPDATE:
+                    setStatus(L"正在检查新版本…");
+                    startUpdateCheck(true);
+                    return 0;
+                case IDM_TOGGLE_UPDATE_CHECK:
+                    g_app.updateCheckOnStart = !g_app.updateCheckOnStart;
+                    saveUiLayout();
+                    setStatus(g_app.updateCheckOnStart ? L"启动时会自动检查更新"
+                                                      : L"已关闭启动时自动检查更新");
                     return 0;
                 case IDM_ABOUT:
                     messageInfo(L"关于 rshell",
@@ -9601,7 +9721,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
-        case WM_ASK_HOSTKEY: {
+        case WM_UPDATE_AVAILABLE: {
+            std::unique_ptr<ReleaseInfo> info(reinterpret_cast<ReleaseInfo*>(lp));
+            if (g_applicationClosing.load()) return 0;
+            if (info) handleUpdateResult(*info);
+            return 0;
+        }        case WM_ASK_HOSTKEY: {
             auto* request = reinterpret_cast<HostKeyRequest*>(lp);
             if (request && !g_applicationClosing.load() &&
                 (!request->connectionId || findSessionState(request->connectionId, true))) {

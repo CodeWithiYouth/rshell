@@ -619,8 +619,18 @@ AI 面板全局面板只有一份，工具的目标主机跟着当前标签走�
 - 没有注册审批回调时，写操作默认拒绝（安全默认，不是放行）
 - 被拒绝的调用会作为工具结果回灌给模型，让它换方案；「终止任务」会中断整轮
 
-### 配置
+### 检查更新
 
+- 启动 4 秒后在工作线程里 `GET https://api.github.com/repos/CodeWithiYouth/rshell/releases/latest`
+  （系统 `winhttp.dll`，Win7 上自动退回系统代理设置），比较 `tag_name` 与编译进去的
+  `RSHELL_VERSION`（CMake 的 `PROJECT_VERSION`，按点分段数值比较，见 `version_compare.h`）。
+- 有新版本：标题栏状态胶囊左边出现「↑ vX.Y.Z」胶囊，点击 `ShellExecute` 打开 Release 页面；
+  同时状态栏提示一次。没有新版本/请求失败只写 `gui.log`，不弹框。
+- 菜单「检查更新…」是手动版本，总会给答复（已是最新 / 发现新版本 + 打开发布页 / 失败原因）。
+- 「启动时自动检查更新」开关存 `~/.rshell/ui.ini` 的 `updatecheck=`；关掉后启动不再联网。
+- 只发一个带固定 User-Agent 的 GET，不携带任何机器/用户标识。
+
+### 配置
 ```ini
 # ~/.rshell/ai.ini（可用 RSHELL_AI_CONFIG 覆盖路径）
 base_url=https://api.openai.com/v1

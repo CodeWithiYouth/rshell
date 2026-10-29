@@ -22,6 +22,7 @@
 #include "credential_store.h"
 #include "protected_secret.h"
 #include "reconnect.h"
+#include "version_compare.h"
 #include "session_store.h"
 #include "ssh_session.h"
 #include "terminal.h"
@@ -2376,6 +2377,20 @@ void testAiAgentHistoryTrim() {
     }
 }
 
+void testVersionCompare() {
+    // 数值比较，不是字符串比较
+    CHECK(versionNewer("v1.2.10", "1.2.9"));
+    CHECK(versionNewer("v1.10.0", "1.9.9"));
+    CHECK(versionNewer("1.2.6", "v1.2.5"));
+    CHECK(!versionNewer("v1.2.5", "1.2.5"));
+    CHECK(!versionNewer("v1.2.4", "1.2.5"));
+    // 段数不同：1.2 与 1.2.0 视为相同
+    CHECK(!versionNewer("1.2", "1.2.0"));
+    CHECK(versionNewer("1.2.1", "1.2"));
+    // 带后缀的预发布标签
+    CHECK(versionNewer("v1.3.0", "1.2.5"));
+    CHECK(!versionNewer("", "1.2.5"));
+}
 void testReconnectPolicy() {
     // 退避：1 秒 / 2 秒 / 4 秒，最多 3 次
     CHECK_EQ(ReconnectPolicy::delayMs(0), 1000);
@@ -2611,6 +2626,7 @@ int main() {
     testAiAgentHistoryTrim();
     testAiSettings();
     testMarkdownParse();
+    testVersionCompare();
     testReconnectPolicy();
     testProxyUrl();
 #endif

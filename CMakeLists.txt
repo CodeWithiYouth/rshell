@@ -240,9 +240,11 @@ if(WIN32)
         src/ai_panel.cpp         # GDI 自绘面板，只编进 GUI
         src/ai_tab.cpp           # AI 标签页：子窗口 + 工作线程
         src/md_render.cpp        # Markdown 的 GDI 排版
+        src/update_check.cpp     # 检查 GitHub 新版本（只编进 GUI）
         src/rshell.rc
     )
-    target_link_libraries(rshell_gui PRIVATE rshell_core comdlg32 comctl32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp)
+    target_compile_definitions(rshell_gui PRIVATE RSHELL_VERSION="${PROJECT_VERSION}")
+    target_link_libraries(rshell_gui PRIVATE rshell_core comdlg32 comctl32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp shell32)
     set_target_properties(rshell_gui PROPERTIES OUTPUT_NAME "rshell-gui")
 endif()
 
@@ -303,9 +305,11 @@ if(RSHELL_BUILD_TESTS)
         # 隐藏窗口回归：直接调用 GUI 的标签、事件分发及连接清理路径。
         add_executable(rshell_gui_tabs_probe tests/gui_tabs_probe.cpp
             src/terminal.cpp src/ssh_shell.cpp src/session_store.cpp src/remote_fs.cpp
-            src/ai_panel.cpp src/ai_tab.cpp src/ai_ssh_backend.cpp src/md_render.cpp ${RSHELL_AI_SOURCES})
+            src/ai_panel.cpp src/ai_tab.cpp src/ai_ssh_backend.cpp src/md_render.cpp
+            src/update_check.cpp ${RSHELL_AI_SOURCES})
+        target_compile_definitions(rshell_gui_tabs_probe PRIVATE RSHELL_VERSION="${PROJECT_VERSION}")
         target_link_libraries(rshell_gui_tabs_probe PRIVATE rshell_core
-            comdlg32 comctl32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp)
+            comdlg32 comctl32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp shell32)
         add_test(NAME rshell_gui_tabs COMMAND rshell_gui_tabs_probe)
 
         # AI 工具链对真实 SSH/SFTP 的冒烟测试（需先启动 tests/sftp_test_server.py）

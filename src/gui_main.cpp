@@ -89,6 +89,7 @@ enum : int {
     ID_BTN_ACTION,      // 侧栏主按钮：未连接 -> 打开会话列表，已连接 -> 断开
     ID_BTN_FS_UP,       // 文件面板：上级目录
 ID_BTN_FS_REFRESH,  // 文件面板：刷新当前目录
+ID_BTN_FS_TOGGLE,   // 文件面板：折叠 / 展开
     ID_STATUS,
     ID_TERM,
     ID_SEARCH_EDIT,
@@ -212,6 +213,7 @@ struct App : SessionState {
     // 分栏宽度（0 = 按窗口自动算）；拖过分隔条后记住，存在 ~/.rshell/ui.ini
     int sidebarWanted = 0;  // 拖拽后的期望宽度（0 = 自动）
     int aiDockWanted = 0;
+    bool fsCollapsed = false;  // 远端文件面板折叠成一条窄栏
     int splitDrag = 0;     // 0=没在拖 1=文件面板 2=AI 面板
     int splitStartX = 0;
     int splitStartW = 0;
@@ -6927,6 +6929,7 @@ void loadUiLayout() {
         if (value <= 0) continue;
         if (key == "sidebar") g_app.sidebarWanted = static_cast<int>(value * scale);
         else if (key == "aidock") g_app.aiDockWanted = static_cast<int>(value * scale);
+        else if (key == "fscollapsed") g_app.fsCollapsed = value != 0;
     }
 }
 
@@ -6939,9 +6942,15 @@ void saveUiLayout() {
     std::ofstream out(utf8ToPath(uiIniPath()), std::ios::trunc);
     if (!out) return;
     const double scale = g_app.dpi > 0 ? 96.0 / g_app.dpi : 1.0;
+    // 只记住「用户设过的」宽度：0 表示还是自动，不要把手动布局算出来的值写进去
+    const int sidebarLogical =
+        g_app.sidebarWanted > 0 ? static_cast<int>(g_app.sidebarWanted * scale) : 0;
+    const int aiLogical =
+        g_app.aiDockWanted > 0 ? static_cast<int>(g_app.aiDockWanted * scale) : 0;
     out << "# rshell 界面布局（96dpi 逻辑像素）\n";
-    out << "sidebar=" << static_cast<int>(g_app.sidebarW * scale) << "\n";
-    out << "aidock=" << static_cast<int>(g_app.aiDockWanted * scale) << "\n";
+    out << "sidebar=" << sidebarLogical << "\n";
+    out << "aidock=" << aiLogical << "\n";
+    out << "fscollapsed=" << (g_app.fsCollapsed ? 1 : 0) << "\n";
 }
 
 // 拖拽中的分隔条：1=文件面板 2=AI 面板 0=没有
@@ -6965,9 +6974,11 @@ void layoutMain(HWND hwnd) {
     // 文件面板宽度：拖过分隔条就按记住的值，否则按窗口四分之一（230~340）
     const int sidebarMax = std::max<int>(dp(240), std::min<int>(rc.right / 2, dp(560)));
     const int sidebarW =
-        g_app.sidebarWanted > 0
-            ? std::clamp(g_app.sidebarWanted, dp(200), sidebarMax)
-            : std::clamp<int>(rc.right / 4, dp(230), dp(340));
+        g_app.fsCollapsed
+            ? dp(34)  // 折叠成一条窄栏，只留展开按钮
+            : (g_app.sidebarWanted > 0
+                   ? std::clamp(g_app.sidebarWanted, dp(200), sidebarMax)
+                   : std::clamp<int>(rc.right / 4, dp(230), dp(340)));
 
     g_app.titleH = titleH;
     g_app.statusH = statusH;
@@ -7015,10 +7026,10 @@ void layoutMain(HWND hwnd) {
         return;
     }
 
-    if (g_app.list) ShowWindow(g_app.list, SW_SHOW);
+    if (g_app.list) ShowWindow(g_app.list, g_app.fsCollapsed ? SW_HIDE : SW_SHOW);
     if (g_app.term) ShowWindow(g_app.term, SW_SHOW);
     if (g_app.status) ShowWindow(g_app.status, SW_SHOW);
-    if (g_app.fsPathEdit) ShowWindow(g_app.fsPathEdit, SW_SHOW);
+    if (g_app.fsPathEdit) ShowWindow(g_app.fsPathEdit, g_app.fsCollapsed ? SW_HIDE : SW_SHOW);
 
     // 侧栏：分组标题 + 文件列表 + 底部一个动作按钮（打开会话 / 断开）
     const int headerH = dp(76);
@@ -7031,8 +7042,10 @@ void layoutMain(HWND hwnd) {
     g_app.contentTop = contentTop;
     g_app.contentBottom = contentBottom;
     // 路径条：标题行左侧（右边留给「上级目录」小按钮），点一下能输入路径
-    g_app.fsPathRect = RECT{pad, contentTop + dp(36), pad + sidebarW - dp(36),
-                            contentTop + dp(66)};
+    g_app.fsPathRect = g_app.fsCollapsed
+                           ? RECT{}
+                           : RECT{pad, contentTop + dp(36), pad + sidebarW - dp(36),
+                                  contentTop + dp(66)};
     if (g_app.fsPathEdit) {
         const RECT& box = g_app.fsPathRect;
         const int editH = std::min<int>(box.bottom - box.top - dp(4), g_app.uiTextH + dp(2));
@@ -7044,24 +7057,35 @@ void layoutMain(HWND hwnd) {
     if (g_app.list) MoveWindow(g_app.list, pad, listTop, sidebarW, listH, TRUE);
 
     g_app.buttons.clear();
-    // 主按钮：未连接时打开会话列表，连上后是断开（id 不变，文字按连接状态在绘制时决定）
-    g_app.buttons.push_back(App::UiButton{
-        ID_BTN_ACTION, RECT{pad, buttonY, pad + sidebarW, buttonY + btnH}, true, false});
-    // 分组标题右侧的「上级目录」小按钮
-    const int upSize = dp(30);
-    g_app.buttons.push_back(
-        App::UiButton{ID_BTN_FS_UP,
-                      RECT{pad + sidebarW - upSize, contentTop + dp(36), pad + sidebarW,
-                           contentTop + dp(66)},
-                      false, true});
-    // 标题行：刷新按钮（紧挨着 SFTP 标签左边）
-    {
+    if (g_app.fsCollapsed) {
+        // 折叠成窄栏：整条顶部一个「展开」按钮
+        g_app.buttons.push_back(
+            App::UiButton{ID_BTN_FS_TOGGLE,
+                          RECT{pad, contentTop, pad + sidebarW, contentTop + dp(30)},
+                          false, true});
+    } else {
+        // 主按钮：未连接时打开会话列表，连上后是断开（id 不变，文字按连接状态在绘制时决定）
+        g_app.buttons.push_back(App::UiButton{
+            ID_BTN_ACTION, RECT{pad, buttonY, pad + sidebarW, buttonY + btnH}, true, false});
+        // 分组标题右侧的「上级目录」小按钮
+        const int upSize = dp(30);
+        g_app.buttons.push_back(
+            App::UiButton{ID_BTN_FS_UP,
+                          RECT{pad + sidebarW - upSize, contentTop + dp(36), pad + sidebarW,
+                               contentTop + dp(66)},
+                          false, true});
+        // 标题行：折叠按钮 + 刷新按钮（紧挨着 SFTP 标签左边）
         const int refreshSize = dp(22);
         const int refreshRight = pad + sidebarW - dp(54);
         g_app.buttons.push_back(
             App::UiButton{ID_BTN_FS_REFRESH,
                           RECT{refreshRight - refreshSize, contentTop + dp(2), refreshRight,
                                contentTop + dp(2) + refreshSize},
+                          false, true});
+        g_app.buttons.push_back(
+            App::UiButton{ID_BTN_FS_TOGGLE,
+                          RECT{refreshRight - refreshSize * 2 - dp(4), contentTop + dp(2),
+                               refreshRight - refreshSize - dp(4), contentTop + dp(2) + refreshSize},
                           false, true});
     }
 
@@ -7071,7 +7095,9 @@ void layoutMain(HWND hwnd) {
         const int termRight = (g_app.aiOpen && !aiFullScreen) ? aiRect.left - dp(10)
                                                              : rc.right - pad;
         // 两条分隔条的命中区：文件面板右侧的空隙、终端与 AI 面板之间的空隙
-        g_app.fsSplitter = RECT{pad + sidebarW, contentTop, termX, contentBottom};
+        g_app.fsSplitter = g_app.fsCollapsed
+                               ? RECT{}
+                               : RECT{pad + sidebarW, contentTop, termX, contentBottom};
         g_app.aiSplitter = (g_app.aiOpen && !aiFullScreen)
                                ? RECT{termRight - dp(2), contentTop, aiRect.left + dp(2),
                                       contentBottom}
@@ -7525,6 +7551,22 @@ void drawRefreshGlyph(HDC dc, const RECT& rc, std::uint32_t color) {
     DeleteObject(brush);
 }
 
+// 折叠/展开的箭头：往左指「收起来」，往右指「打开」
+void drawChevronGlyph(HDC dc, const RECT& rc, std::uint32_t color, bool pointRight) {
+    const int cx = (rc.left + rc.right) / 2;
+    const int cy = (rc.top + rc.bottom) / 2;
+    const int dx = dp(3);
+    const int dy = dp(4);
+    const int dir = pointRight ? 1 : -1;
+    HPEN pen = CreatePen(PS_SOLID, std::max(1, dp(1) + (dp(1) == 0 ? 1 : 0)), toColorRef(color));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    MoveToEx(dc, cx - dx * dir, cy - dy, nullptr);
+    LineTo(dc, cx + dx * dir,         cy);
+    LineTo(dc, cx - dx * dir, cy + dy);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+}
+
 void paintButtons(HDC dc) {
     const bool connected = g_app.shell->running();
     for (const auto& b : g_app.buttons) {
@@ -7580,6 +7622,8 @@ void paintButtons(HDC dc) {
         }
         if (b.id == ID_BTN_FS_REFRESH) {
             drawRefreshGlyph(dc, b.rc, fg);
+        } else if (b.id == ID_BTN_FS_TOGGLE) {
+            drawChevronGlyph(dc, b.rc, fg, g_app.fsCollapsed);
         } else if (b.id == ID_BTN_FS_UP) {
             drawText(dc, label, b.rc, fg, g_app.uiFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
@@ -8125,13 +8169,21 @@ void paintMain(HWND hwnd) {
         fillRoundRect(mem, RECT{pad - dp(6), g_app.contentTop - dp(4),
                                pad + g_app.sidebarW + dp(6), g_app.contentBottom + dp(6)},
                       dp(10), ui::bgPanel, ui::borderSoft);
-        drawText(mem, L"远端文件", RECT{pad + dp(4), g_app.contentTop, pad + g_app.sidebarW - dp(58),
-                                      g_app.contentTop + dp(28)}, ui::text, g_app.uiFontBold);
-        const RECT protocol{pad + g_app.sidebarW - dp(48), g_app.contentTop + dp(4),
-                            pad + g_app.sidebarW - dp(2), g_app.contentTop + dp(24)};
-        fillRoundRect(mem, protocol, dp(5), ui::bgCard);
-        drawText(mem, L"SFTP", protocol, ui::textDim, g_app.tinyFont,
-                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        if (g_app.fsCollapsed) {
+            // 折叠成一条窄栏：只留一个文件夹图标，展开按钮由 paintButtons 画在顶部
+            const int iconCx = pad + g_app.sidebarW / 2;
+            paintFileIcon(mem, RECT{iconCx - dp(9), g_app.contentTop + dp(40), iconCx + dp(9),
+                                    g_app.contentTop + dp(58)},
+                          FileKind::Folder);
+        } else {
+            drawText(mem, L"远端文件", RECT{pad + dp(4), g_app.contentTop, pad + g_app.sidebarW - dp(58),
+                                          g_app.contentTop + dp(28)}, ui::text, g_app.uiFontBold);
+            const RECT protocol{pad + g_app.sidebarW - dp(48), g_app.contentTop + dp(4),
+                                pad + g_app.sidebarW - dp(2), g_app.contentTop + dp(24)};
+            fillRoundRect(mem, protocol, dp(5), ui::bgCard);
+            drawText(mem, L"SFTP", protocol, ui::textDim, g_app.tinyFont,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
 
         // 终端上方的会话名标题栏已删除：标签栏已经显示会话名。
         // 只有搜索框打开时才需要这条辅助条。
@@ -9178,6 +9230,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         fsRefresh();
                         setStatus(L"正在刷新文件列表…");
                     }
+                    return 0;
+                case ID_BTN_FS_TOGGLE:
+                    g_app.fsCollapsed = !g_app.fsCollapsed;
+                    saveUiLayout();
+                    layoutMain(hwnd);
+                    InvalidateRect(hwnd, nullptr, TRUE);
                     return 0;
                 case IDM_FS_UPLOAD:
                     fsUploadFiles();

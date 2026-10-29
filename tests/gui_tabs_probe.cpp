@@ -700,6 +700,32 @@ void splitterRegression() {
     g_app.fsReady = fsReadyBefore;
 }
 
+// 远端文件面板：折叠成窄栏 / 展开
+void fsCollapseRegression() {
+    const auto visible = [](HWND window) {
+        return window != nullptr && (GetWindowLongPtrW(window, GWL_STYLE) & WS_VISIBLE) != 0;
+    };
+    g_app.fsCollapsed = false;
+    layoutMain(g_app.main);
+    const int expandedW = g_app.sidebarW;
+    check(expandedW > dp(200), "the file panel starts expanded");
+    check(g_app.fsPathRect.right > g_app.fsPathRect.left, "path bar visible when expanded");
+    check(g_app.fsSplitter.right > g_app.fsSplitter.left, "file splitter active when expanded");
+
+    SendMessageW(g_app.main, WM_COMMAND, MAKEWPARAM(ID_BTN_FS_TOGGLE, BN_CLICKED), 0);
+    check(g_app.fsCollapsed, "toggle collapses the file panel");
+    check(g_app.sidebarW < dp(60), "collapsed panel becomes a narrow rail");
+    check(g_app.fsPathRect.right == g_app.fsPathRect.left, "path bar hidden when collapsed");
+    check(!visible(g_app.list), "file list hidden when collapsed");
+    check(g_app.fsSplitter.right == g_app.fsSplitter.left, "no splitter while collapsed");
+
+    SendMessageW(g_app.main, WM_COMMAND, MAKEWPARAM(ID_BTN_FS_TOGGLE, BN_CLICKED), 0);
+    check(!g_app.fsCollapsed, "toggling again expands the panel");
+    check(g_app.sidebarW == expandedW, "expanded width comes back");
+    check(g_app.fsPathRect.right > g_app.fsPathRect.left, "path bar is back");
+    check(visible(g_app.list), "file list is back");
+}
+
 void titleAiButtonRegression() {
     RECT client{}; GetClientRect(g_app.main, &client);
     HDC screen = GetDC(nullptr);
@@ -763,6 +789,7 @@ int main(int argc, char** argv) {
         autoReconnectRegression();
         fsLoadingRegression();
         splitterRegression();
+        fsCollapseRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);

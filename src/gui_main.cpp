@@ -88,6 +88,7 @@ enum : int {
     ID_LIST = 1001,
     ID_BTN_ACTION,      // 侧栏主按钮：未连接 -> 打开会话列表，已连接 -> 断开
     ID_BTN_FS_UP,       // 文件面板：上级目录
+ID_BTN_FS_REFRESH,  // 文件面板：刷新当前目录
     ID_STATUS,
     ID_TERM,
     ID_SEARCH_EDIT,
@@ -208,6 +209,15 @@ struct App : SessionState {
     ai::AiTab* aiTab = nullptr;
     bool aiOpen = false;   // 右侧 AI 面板是否展开
     bool aiFull = false;   // 展开时是否全屏
+    // 分栏宽度（0 = 按窗口自动算）；拖过分隔条后记住，存在 ~/.rshell/ui.ini
+    int sidebarWanted = 0;  // 拖拽后的期望宽度（0 = 自动）
+    int aiDockWanted = 0;
+    int splitDrag = 0;     // 0=没在拖 1=文件面板 2=AI 面板
+    int splitStartX = 0;
+    int splitStartW = 0;
+    RECT fsSplitter{};     // 文件面板与终端之间的命中区
+    RECT aiSplitter{};     // 终端与 AI 面板之间的命中区
+    int layoutAiDockW = 0;  // 本次布局实际用的 AI 宽度（拖拽起点用）
     HWND main = nullptr;
     HWND list = nullptr;
     HWND fsPathEdit = nullptr;
@@ -6899,6 +6909,50 @@ void handleFsEvent(const FsEvent& event) {
 }
 
 
+// ---------------------------------------------------------------- 分栏宽度
+
+std::string uiIniPath() { return homeDirectory() + "/.rshell/ui.ini"; }
+
+// 宽度按 96dpi 的逻辑像素存，换显示器/缩放比例后不会一下子撑爆
+void loadUiLayout() {
+    std::ifstream in(utf8ToPath(uiIniPath()));
+    if (!in) return;
+    const double scale = g_app.dpi > 0 ? g_app.dpi / 96.0 : 1.0;
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = trim(line.substr(0, eq));
+        const int value = std::atoi(line.c_str() + eq + 1);
+        if (value <= 0) continue;
+        if (key == "sidebar") g_app.sidebarWanted = static_cast<int>(value * scale);
+        else if (key == "aidock") g_app.aiDockWanted = static_cast<int>(value * scale);
+    }
+}
+
+void saveUiLayout() {
+    // 回归测试里不要改用户真实的布局文件
+    if (std::getenv("RSHELL_NO_UI_SAVE")) return;
+    const std::string dir = homeDirectory() + "/.rshell";
+    std::error_code ec;
+    std::filesystem::create_directories(utf8ToPath(dir), ec);
+    std::ofstream out(utf8ToPath(uiIniPath()), std::ios::trunc);
+    if (!out) return;
+    const double scale = g_app.dpi > 0 ? 96.0 / g_app.dpi : 1.0;
+    out << "# rshell 界面布局（96dpi 逻辑像素）\n";
+    out << "sidebar=" << static_cast<int>(g_app.sidebarW * scale) << "\n";
+    out << "aidock=" << static_cast<int>(g_app.aiDockWanted * scale) << "\n";
+}
+
+// 拖拽中的分隔条：1=文件面板 2=AI 面板 0=没有
+int splitterAt(POINT pt) {
+    if (g_app.splitDrag) return g_app.splitDrag;
+    if (g_app.aiSplitter.right > g_app.aiSplitter.left && PtInRect(&g_app.aiSplitter, pt))
+        return 2;
+    if (g_app.fsSplitter.right > g_app.fsSplitter.left && PtInRect(&g_app.fsSplitter, pt)) return 1;
+    return 0;
+}
+
 void layoutMain(HWND hwnd) {
     if (!foregroundSession()) return;
     hideStatusHint();
@@ -6908,7 +6962,12 @@ void layoutMain(HWND hwnd) {
     const int titleH = dp(48);
     const int statusH = dp(34);
     const int btnH = dp(36);
-    const int sidebarW = std::clamp<int>(rc.right / 4, dp(230), dp(340));
+    // 文件面板宽度：拖过分隔条就按记住的值，否则按窗口四分之一（230~340）
+    const int sidebarMax = std::max<int>(dp(240), std::min<int>(rc.right / 2, dp(560)));
+    const int sidebarW =
+        g_app.sidebarWanted > 0
+            ? std::clamp(g_app.sidebarWanted, dp(200), sidebarMax)
+            : std::clamp<int>(rc.right / 4, dp(230), dp(340));
 
     g_app.titleH = titleH;
     g_app.statusH = statusH;
@@ -6927,8 +6986,12 @@ void layoutMain(HWND hwnd) {
     // 全屏只在「面板确实开着」时生效——aiFull 万一残留（面板已关），
     // 也不能让终端和文件面板被永久隐藏。
     const bool aiFullScreen = g_app.aiOpen && g_app.aiFull && g_app.aiTab != nullptr;
-    const int aiWidth = g_app.aiOpen && !aiFullScreen
-                            ? std::clamp<int>(rc.right / 3, dp(360), dp(560))
+    // 宽度：拖过分隔条就按记住的值；否则给终端留够位置（至少 ~60 列）
+    const int aiWanted = g_app.aiDockWanted > 0 ? g_app.aiDockWanted
+                                           : std::clamp<int>(rc.right / 3, dp(360), dp(560));
+    const int aiMax = std::max<int>(dp(280), rc.right - pad * 2 - sidebarW - dp(480));
+    const int aiWidth = (g_app.aiOpen && !aiFullScreen)
+                            ? std::clamp<int>(aiWanted, dp(280), std::max<int>(dp(280), aiMax))
                             : 0;
     RECT aiRect{};
     if (g_app.aiOpen) {
@@ -6936,6 +6999,7 @@ void layoutMain(HWND hwnd) {
                      ? RECT{pad, contentTop, rc.right - pad, rc.bottom}
                      : RECT{rc.right - pad - aiWidth, contentTop, rc.right - pad, contentBottom};
     }
+    g_app.layoutAiDockW = aiWidth;
     if (g_app.aiTab) {
         g_app.aiTab->setBounds(aiRect);
         g_app.aiTab->show(g_app.aiOpen);
@@ -6990,12 +7054,28 @@ void layoutMain(HWND hwnd) {
                       RECT{pad + sidebarW - upSize, contentTop + dp(36), pad + sidebarW,
                            contentTop + dp(66)},
                       false, true});
+    // 标题行：刷新按钮（紧挨着 SFTP 标签左边）
+    {
+        const int refreshSize = dp(22);
+        const int refreshRight = pad + sidebarW - dp(54);
+        g_app.buttons.push_back(
+            App::UiButton{ID_BTN_FS_REFRESH,
+                          RECT{refreshRight - refreshSize, contentTop + dp(2), refreshRight,
+                               contentTop + dp(2) + refreshSize},
+                          false, true});
+    }
 
     if (g_app.term) {
         const int termX = pad * 2 + sidebarW;
         // 停靠模式下右侧让给 AI 面板
         const int termRight = (g_app.aiOpen && !aiFullScreen) ? aiRect.left - dp(10)
                                                              : rc.right - pad;
+        // 两条分隔条的命中区：文件面板右侧的空隙、终端与 AI 面板之间的空隙
+        g_app.fsSplitter = RECT{pad + sidebarW, contentTop, termX, contentBottom};
+        g_app.aiSplitter = (g_app.aiOpen && !aiFullScreen)
+                               ? RECT{termRight - dp(2), contentTop, aiRect.left + dp(2),
+                                      contentBottom}
+                               : RECT{};
         const int termW = std::max(dp(120), termRight - termX);
         g_app.searchBox = RECT{termX + dp(4), contentTop, termRight - dp(170), contentTop + dp(28)};
         g_app.searchPrev = RECT{termRight - dp(88), contentTop, termRight - dp(60), contentTop + dp(28)};
@@ -7220,6 +7300,8 @@ bool buttonEnabled(int id) {
             return !connected && !busy && selectedSession();
         case ID_BTN_FS_UP:
             return g_app.fsReady && !g_app.fsPath.empty() && g_app.fsPath != "/";
+        case ID_BTN_FS_REFRESH:
+            return g_app.fsReady;
         default:
             return true;
     }
@@ -7416,6 +7498,33 @@ void paintTitleBar(HDC dc, const RECT& rc) {
 }
 
 // 侧栏按钮：主按钮实心主色；连接后主按钮变“断开”（危险色描边）
+// 刷新图标：一段圆弧 + 箭头，纯矢量，不依赖字体里有没有 ↗↻ 这类符号
+void drawRefreshGlyph(HDC dc, const RECT& rc, std::uint32_t color) {
+    const int cx = (rc.left + rc.right) / 2;
+    const int cy = (rc.top + rc.bottom) / 2;
+    const int r = std::max(4, dp(6));
+    const int penW = std::max(1, dp(1));
+    HPEN pen = CreatePen(PS_SOLID, penW, toColorRef(color));
+    HGDIOBJ oldPen = SelectObject(dc, pen);
+    HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+    // 从正上方逆时针画到右侧，留出右上角的缺口给箭头
+    Arc(dc, cx - r, cy - r, cx + r + 1, cy + r + 1, cx, cy - r, cx + r, cy);
+    SelectObject(dc, oldBrush);
+    SelectObject(dc, oldPen);
+    DeleteObject(pen);
+    // 箭头：贴在上方缺口处，指向右
+    POINT arrow[3] = {{cx - dp(1), cy - r - dp(3)},
+                      {cx - dp(1), cy - r + dp(3)},
+                      {cx + dp(4), cy - r}};
+    HBRUSH brush = CreateSolidBrush(toColorRef(color));
+    HGDIOBJ old = SelectObject(dc, brush);
+    HGDIOBJ oldP = SelectObject(dc, GetStockObject(NULL_PEN));
+    Polygon(dc, arrow, 3);
+    SelectObject(dc, oldP);
+    SelectObject(dc, old);
+    DeleteObject(brush);
+}
+
 void paintButtons(HDC dc) {
     const bool connected = g_app.shell->running();
     for (const auto& b : g_app.buttons) {
@@ -7469,7 +7578,9 @@ void paintButtons(HDC dc) {
             default:
                 break;
         }
-        if (b.id == ID_BTN_FS_UP) {
+        if (b.id == ID_BTN_FS_REFRESH) {
+            drawRefreshGlyph(dc, b.rc, fg);
+        } else if (b.id == ID_BTN_FS_UP) {
             drawText(dc, label, b.rc, fg, g_app.uiFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             drawText(dc, label, b.rc, fg, g_app.uiFontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -8051,7 +8162,8 @@ void paintMain(HWND hwnd) {
         if (path.empty()) path = g_app.fsReady ? L"/" : L"未连接";
         int textRight = box.right - dp(7);
         if (g_app.fsReady) {
-            const std::wstring count = std::to_wstring(g_app.fsEntries.size());
+            const std::wstring count = g_app.fsLoading ? L"加载中"
+                                       : std::to_wstring(g_app.fsEntries.size()) + L" 项";
             const int countW = textWidth(mem, count, g_app.tinyFont);
             drawText(mem, count,
                      RECT{textRight - countW, box.top, textRight, box.bottom}, ui::textFaint,
@@ -8601,6 +8713,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_applicationClosing.store(false);
             initializeSessionTabs();
             g_app.dpi = wincompat::windowDpi(hwnd);
+            loadUiLayout();  // 上次拖好的分栏宽度
 
             g_app.list = CreateWindowExW(
                 0, kListClass, nullptr, WS_CHILD | WS_VISIBLE | WS_TABSTOP, 0, 0, 10, 10, hwnd,
@@ -8673,6 +8786,17 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_MOUSEMOVE: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            // 正在拖分隔条：只更新分栏宽度，别的悬停逻辑都先跳过
+            if (g_app.splitDrag) {
+                const int dx = pt.x - g_app.splitStartX;
+                if (g_app.splitDrag == 1)
+                    g_app.sidebarWanted = std::max(dp(160), g_app.splitStartW + dx);
+                else
+                    g_app.aiDockWanted = std::max(dp(240), g_app.splitStartW - dx);
+                layoutMain(hwnd);
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return 0;
+            }
             RECT clientRc;
             GetClientRect(hwnd, &clientRc);
             // 状态栏详情浮窗：只有真的离开状态栏才收起。
@@ -8748,6 +8872,14 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_LBUTTONDOWN: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             hideStatusHint();
+            // 分栏分隔条：按下就开始拖
+            if (const int split = splitterAt(pt)) {
+                g_app.splitDrag = split;
+                g_app.splitStartX = pt.x;
+                g_app.splitStartW = split == 1 ? g_app.sidebarW : g_app.layoutAiDockW;
+                SetCapture(hwnd);
+                return 0;
+            }
             if (msg == WM_LBUTTONDOWN && handleSessionTabClick(pt)) return 0;
             if (msg == WM_MOUSEMOVE && PtInRect(&g_app.tabsRect, pt)) InvalidateRect(hwnd, &g_app.tabsRect, FALSE);
             RECT client;
@@ -8825,6 +8957,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_LBUTTONUP: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (g_app.splitDrag) {
+                g_app.splitDrag = 0;
+                ReleaseCapture();
+                saveUiLayout();  // 松手才写盘，拖拽过程中不碰文件
+                return 0;
+            }
             if (g_app.pressTitleAi) {
                 g_app.pressTitleAi = false;
                 ReleaseCapture();
@@ -8857,6 +8995,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 POINT pt;
                 GetCursorPos(&pt);
                 ScreenToClient(hwnd, &pt);
+                if (splitterAt(pt)) {  // 分隔条上给左右箭头
+                    SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                    return TRUE;
+                }
                 const DownloadHit downloadHit = hitDownloadUi(hwnd, pt);
                 RECT client;
                 GetClientRect(hwnd, &client);
@@ -9030,6 +9172,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case ID_BTN_FS_UP:
                     fsGoUp();
+                    return 0;
+                case ID_BTN_FS_REFRESH:
+                    if (g_app.fsReady) {
+                        fsRefresh();
+                        setStatus(L"正在刷新文件列表…");
+                    }
                     return 0;
                 case IDM_FS_UPLOAD:
                     fsUploadFiles();

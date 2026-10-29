@@ -458,7 +458,9 @@ void aiTabRegression() {    auto visible = [](HWND window) {
 
     RECT dockRect{}; GetWindowRect(docked->window(), &dockRect);
     const int dockWidth = dockRect.right - dockRect.left;
-    check(dockWidth > 300 && dockWidth < 600, "docked panel keeps a bounded width");
+    // 窗口只有 900px 宽时，给终端留出最小宽度后 AI 面板会落到下限 280
+    check(dockWidth >= 270 && dockWidth < 600,
+          ("docked panel keeps a bounded width, got " + std::to_string(dockWidth)).c_str());
 
     setAiPanelFull(true);
     check(g_app.aiFull, "full screen flag is set");
@@ -656,6 +658,48 @@ void fsLoadingRegression() {
     g_app.fsQuietPath.clear();
 }
 
+// 分栏分隔条：能拖、拖完记住宽度；SFTP 面板有刷新按钮
+void splitterRegression() {
+    RECT client{};
+    GetClientRect(g_app.main, &client);
+    const int beforeSidebar = g_app.sidebarW;
+    const int midY = (g_app.fsSplitter.top + g_app.fsSplitter.bottom) / 2;
+    const int splitX = (g_app.fsSplitter.left + g_app.fsSplitter.right) / 2;
+    check(splitX > 0, "the file splitter has a hit zone");
+    check(splitterAt(POINT{splitX, midY}) == 1, "the file splitter is hit-tested");
+
+    SendMessageW(g_app.main, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(splitX, midY));
+    check(g_app.splitDrag == 1, "pressing the splitter starts a drag");
+    SendMessageW(g_app.main, WM_MOUSEMOVE, MK_LBUTTON, MAKELPARAM(splitX + dp(60), midY));
+    check(g_app.sidebarWanted > 0, "dragging sets an explicit sidebar width");
+    SendMessageW(g_app.main, WM_LBUTTONUP, 0, MAKELPARAM(splitX + dp(60), midY));
+    check(g_app.splitDrag == 0, "releasing ends the drag");
+    check(g_app.sidebarW > beforeSidebar, "the sidebar actually got wider");
+    check(std::abs(g_app.sidebarW - (beforeSidebar + dp(60))) <= dp(4),
+          "the sidebar follows the drag distance");
+
+    // 恢复自动宽度，别影响后面的布局断言
+    g_app.sidebarWanted = 0;
+    layoutMain(g_app.main);
+
+    // 刷新按钮在侧栏标题行里，且只有连上才可用
+    bool found = false;
+    for (const auto& button : g_app.buttons) {
+        if (button.id != ID_BTN_FS_REFRESH) continue;
+        found = true;
+        check(button.rc.left >= 0 && button.rc.right <= client.right, "refresh button inside the window");
+        check(button.rc.top >= 0 && button.rc.bottom < g_app.contentTop + dp(34),
+              "refresh button sits in the sidebar header");
+    }
+    check(found, "the file panel has a refresh button");
+    const bool fsReadyBefore = g_app.fsReady;
+    g_app.fsReady = false;
+    check(!buttonEnabled(ID_BTN_FS_REFRESH), "refresh is disabled while disconnected");
+    g_app.fsReady = true;
+    check(buttonEnabled(ID_BTN_FS_REFRESH), "refresh is enabled once connected");
+    g_app.fsReady = fsReadyBefore;
+}
+
 void titleAiButtonRegression() {
     RECT client{}; GetClientRect(g_app.main, &client);
     HDC screen = GetDC(nullptr);
@@ -700,6 +744,7 @@ int main(int argc, char** argv) {
     const auto aiSettings=std::filesystem::temp_directory_path() / ("rshell-ai-"+std::to_string(GetCurrentProcessId())+".ini");
     SetEnvironmentVariableW(L"RSHELL_AI_CONFIG", aiSettings.c_str());
     try {
+        _putenv_s("RSHELL_NO_UI_SAVE", "1");  // 探针不改用户真实布局
         g_app.inst = GetModuleHandleW(nullptr); g_app.dpi = 96;
         auto runtime = std::make_shared<Libssh2Runtime>(); g_app.runtime = runtime;
         g_app.store=SessionStore::load(pathToUtf8(settings));
@@ -717,6 +762,7 @@ int main(int argc, char** argv) {
         statusHintRegression();
         autoReconnectRegression();
         fsLoadingRegression();
+        splitterRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);

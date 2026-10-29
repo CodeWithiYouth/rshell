@@ -445,8 +445,17 @@ void ChatPanel::clearPreedit() {
 
 // ---------------------------------------------------------------- 布局与绘制
 
-int ChatPanel::itemHeight(HDC dc, const ChatItem& item, int width) const {
-    const int bodyFont = lineHeight(dc, fonts_.ui);
+// 工具卡片标题占几行：卡片宽减去图标、边距和右侧元信息（结果大小/退出码）
+int ChatPanel::toolTitleLines(HDC dc, const ChatItem& item, int width) const {
+    int metaW = 0;
+    if (!item.meta.empty()) {
+        metaW = std::min(textWidth(dc, item.meta, fonts_.caption),
+                         std::max(40, width * 2 / 5)) + 10;
+    }
+    const int titleWidth = std::max(40, width - 20 - 18 - 10 - metaW);
+    return textWidth(dc, item.title, fonts_.ui) > titleWidth ? 2 : 1;
+}
+int ChatPanel::itemHeight(HDC dc, const ChatItem& item, int width) const {    const int bodyFont = lineHeight(dc, fonts_.ui);
     const int labelFont = lineHeight(dc, fonts_.caption);
 
     switch (item.kind) {
@@ -469,7 +478,8 @@ int ChatPanel::itemHeight(HDC dc, const ChatItem& item, int width) const {
         }
 
         case ItemKind::Tool: {
-            const int header = std::max(bodyFont, lineHeight(dc, fonts_.caption)) + 12;
+            const int lines = toolTitleLines(dc, item, width);
+            const int header = bodyFont * lines + 12;
             if (!item.expanded) return header;
             return header + wrappedHeight(dc, item.body, fonts_.mono, width - 20) + 12;
         }
@@ -505,7 +515,15 @@ void ChatPanel::paint(HDC dc) {
 
     ensureGdiplus();
     RECT full = bounds_;
-    fillRect(dc, full, bgApp);
+    fillRect(dc, full, bgApp);  // 圆角外露出的就是主窗口底色
+
+    // 圆角卡片：把后续绘制裁进圆角区域，四角自然透明，和左右两块卡片一致
+    const int cardRadius = 10;
+    HRGN cardShape = CreateRoundRectRgn(full.left, full.top, full.right + 1, full.bottom + 1,
+                                        cardRadius * 2, cardRadius * 2);
+    const int savedDc = SaveDC(dc);
+    if (cardShape) SelectClipRgn(dc, cardShape);
+    fillRect(dc, full, bgPanel);
 
     RECT header{full.left, full.top, full.right, full.top + kHeaderH};
     RECT composer{full.left, full.bottom - kComposerH, full.right, full.bottom};
@@ -530,9 +548,9 @@ void ChatPanel::paint(HDC dc) {
     if (stickBottom_) scrollBack_ = 0;
     scrollBack_ = std::clamp(scrollBack_, 0, maxScroll);
 
-    // 消息区裁剪，避免滚动时画到标题栏/输入框上
-    HRGN clip = CreateRectRgn(view.left, view.top, view.right, view.bottom);
-    SelectClipRgn(dc, clip);
+    // 消息区裁剪，避免滚动时画到标题栏/输入框上（用 Intersect，别把外层的圆角裁掉）
+    const int messageClip = SaveDC(dc);
+    IntersectClipRect(dc, view.left, view.top, view.right, view.bottom);
 
     // 内容不足一屏时从顶部开始排，避免只有一条提示时上方一大片空白
     int y = contentHeight_ <= viewportHeight_ ? view.top
@@ -543,9 +561,7 @@ void ChatPanel::paint(HDC dc) {
         if (rc.bottom >= view.top && rc.top <= view.bottom) drawItem(dc, items_[i], rc, i);
         y += h + kItemGap;
     }
-
-    SelectClipRgn(dc, nullptr);
-    DeleteObject(clip);
+    RestoreDC(dc, messageClip);  // 标题栏/输入框在裁剪区外，得先把消息区的裁剪撤掉
 
     // 空状态：标题 + 说明 + 可选的「打开设置」按钮
     if (items_.empty() && !welcomeTitle_.empty()) {
@@ -585,6 +601,12 @@ void ChatPanel::paint(HDC dc) {
 
     drawHeader(dc);
     drawComposer(dc);
+
+    // 恢复裁剪并描边：现在是一张和左右两块一致的圆角卡片
+    RestoreDC(dc, savedDc);
+    if (cardShape) DeleteObject(cardShape);
+    strokeRoundRect(dc, RECT{full.left, full.top, full.right - 1, full.bottom - 1}, cardRadius,
+                    border);
 }
 
 void ChatPanel::drawHeader(HDC dc) {
@@ -831,20 +853,24 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
             const int titleWidth = std::max(40, right - titleLeft);
             std::wstring title = item.title;
             // 「读取 /very/long/path」：保留动词，路径留尾部（文件名最关键）
+            const int titleLines = toolTitleLines(dc, item, rc.right - rc.left);
             const std::size_t split = title.find(L' ');
-            if (split != std::wstring::npos && split + 1 < title.size() &&
+            if (titleLines == 1 && split != std::wstring::npos && split + 1 < title.size() &&
                 (title[split + 1] == L'/' || title[split + 1] == L'~')) {
                 const std::wstring prefix = title.substr(0, split + 1);
                 const std::wstring path = title.substr(split + 1);
                 const int prefixW = std::min(textWidth(dc, prefix, fonts_.ui), titleWidth / 2);
                 title = prefix +
                         ellipsizeTail(dc, path, fonts_.ui, std::max(20, titleWidth - prefixW));
-            } else {
+            } else if (titleLines == 1) {
                 title = ellipsize(dc, title, fonts_.ui, titleWidth);
             }
             drawText(dc, title,
-                     RECT{titleLeft, inner.top, titleLeft + titleWidth, inner.top + body}, text,
-                     fonts_.ui, DT_LEFT | DT_TOP | DT_SINGLELINE);
+                     RECT{titleLeft, inner.top, titleLeft + titleWidth,
+                          inner.top + body * titleLines},
+                     text, fonts_.ui,
+                     DT_LEFT | DT_TOP |
+                         (titleLines == 2 ? (DT_WORDBREAK | DT_END_ELLIPSIS) : DT_SINGLELINE));
 
             if (item.expanded) {
                 RECT bodyRect{inner.left + 18, inner.top + body + 4, inner.right, rc.bottom - 6};

@@ -150,6 +150,8 @@ private:
     void drawButton(HDC dc, const RECT& rc, const std::wstring& label, std::uint32_t fill,
                     std::uint32_t textColor, bool hovered);
     int itemHeight(HDC dc, const ChatItem& item, int contentWidth) const;
+    // 工具卡片标题占几行（1 或 2）：摘要长的时候给两行，别只剩一句被截断的命令
+    int toolTitleLines(HDC dc, const ChatItem& item, int contentWidth) const;
     void rebuildDerivedFonts();
     md::Style markdownStyle(HDC dc) const;
     void pushHistory(const ChatItem& item);

@@ -660,10 +660,14 @@ void RemoteFs::runSample() {
 
 bool RemoteFs::execCapture(const std::string& command, std::string& out, int timeoutMs,
                            int* latencyMs, int* exitCode, std::size_t maxOutputBytes,
-                           bool* truncated) {
-    if (!session_) return false;
+                           bool* truncated, std::string* error) {
+    const auto fail = [error](const std::string& why) {
+        if (error) *error = why;
+        return false;
+    };
+    if (!session_) return fail("远端连接未建立");
     LIBSSH2_SESSION* raw = session_->raw();
-    if (!raw) return false;
+    if (!raw) return fail("远端会话已失效");
 
     if (exitCode) *exitCode = -1;
     if (truncated) *truncated = false;
@@ -672,10 +676,13 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
     const auto started = std::chrono::steady_clock::now();
 
     LIBSSH2_CHANNEL* channel = libssh2_channel_open_session(raw);
-    if (!channel) return false;
+    if (!channel) {
+        return fail("打开 exec 通道失败（" + std::to_string(libssh2_session_last_errno(raw)) + "）");
+    }
     if (libssh2_channel_exec(channel, command.c_str()) != 0) {
+        const int code = libssh2_session_last_errno(raw);
         libssh2_channel_free(channel);
-        return false;
+        return fail("exec 请求被拒绝（" + std::to_string(code) + "）");
     }
 
     libssh2_session_set_blocking(raw, 0);
@@ -683,16 +690,13 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
     const auto deadline = started + std::chrono::milliseconds(timeoutMs);
     int spin = 0;
     bool ok = true;
+    std::string why;
 
-    for (;;) {
-        if (!running_.load()) {  // 断开时尽快退出，别把 UI 线程卡在 join 上
-            ok = false;
-            break;
-        }
-        bool active = false;
-        ssize_t n = libssh2_channel_read(channel, buf.data(), buf.size());
+    // 同一段输出缓冲：命令的 stderr 也读出来并进（不读的话远端写满管道会卡住，
+    // 表现出来就是“第一条命令成功、第二条一直超时”）。
+    auto drain = [&](int stream) {
+        ssize_t n = libssh2_channel_read_ex(channel, stream, buf.data(), buf.size());
         while (n > 0) {
-            // 超出上限的部分照样读掉（否则远端会卡在写满的管道上），只是不保留
             const std::size_t chunk = static_cast<std::size_t>(n);
             const std::size_t room =
                 out.size() < maxOutputBytes ? maxOutputBytes - out.size() : 0;
@@ -704,27 +708,34 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
             } else {
                 out.append(buf.data(), chunk);
             }
-            active = true;
-            n = libssh2_channel_read(channel, buf.data(), buf.size());
+            n = libssh2_channel_read_ex(channel, stream, buf.data(), buf.size());
         }
         if (n < 0 && n != LIBSSH2_ERROR_EAGAIN) {
             ok = false;
+            why = "读取输出失败（" + std::to_string(n) + "）";
+            return false;
+        }
+        return n > 0;
+    };
+
+    for (;;) {
+        if (!running_.load()) {  // 断开时尽快退出，别把 UI 线程卡在 join 上
+            ok = false;
+            why = "连接已断开";
             break;
         }
+        bool active = drain(0);
+        active = drain(1) || active;
+        if (!ok) break;
         if (libssh2_channel_eof(channel) == 1) break;
         if (std::chrono::steady_clock::now() > deadline) {
             ok = false;
+            why = "等待远端输出超时（" + std::to_string(timeoutMs) + " ms）";
             break;
         }
         if (!active) {
             std::this_thread::sleep_for(std::chrono::milliseconds(++spin % 20 == 0 ? 20 : 5));
         }
-    }
-
-    if (exitCode) {
-        // 只有正常收到 EOF 时退出码才有意义；超时/中断保持 -1
-        if (ok && libssh2_channel_eof(channel) == 1)
-            *exitCode = libssh2_channel_get_exit_status(channel);
     }
 
     if (latencyMs) {
@@ -734,13 +745,17 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
                 .count());
     }
 
-    // 非阻塞收尾，避免 close 再等一轮网络往返
-    libssh2_channel_close(channel);
-    libssh2_channel_free(channel);
+    // 先恢复阻塞再收尾：非阻塞下 close/free 只是“发出去就不管了”，
+    // 高延迟链路上通道可能没真正关掉，下一条命令就会卡在打开通道上。
+    const bool sawEof = libssh2_channel_eof(channel) == 1;
     libssh2_session_set_blocking(raw, 1);
+    libssh2_channel_close(channel);
+    // 退出码在 close 之后取：exit-status 请求可能比 EOF 晚到，抢在 close 前读会拿到 -1
+    if (exitCode && ok && sawEof) *exitCode = libssh2_channel_get_exit_status(channel);
+    libssh2_channel_free(channel);
+    if (!ok && error) *error = why.empty() ? "命令执行失败" : why;
     return ok;
 }
-
 // ---------------------------------------------------------------- AI 工具的同步接口
 //
 // 这几个方法会从 AI 工作线程调用，而 libssh2 会话只能由文件线程触碰，
@@ -769,8 +784,9 @@ RemoteFs::ExecOutcome RemoteFs::execSync(const std::string& command, int timeout
         [this, state, command, timeoutMs, maxOutputBytes]() {
             try {
                 state->ok = execCapture(command, state->output, timeoutMs, nullptr,
-                                        &state->exitCode, maxOutputBytes, &state->truncated);
-                if (!state->ok) state->error = "命令执行失败或超时";
+                                        &state->exitCode, maxOutputBytes, &state->truncated,
+                                        &state->error);
+                if (!state->ok && state->error.empty()) state->error = "命令执行失败或超时";
             } catch (const std::exception& ex) {
                 state->ok = false;
                 state->error = ex.what();

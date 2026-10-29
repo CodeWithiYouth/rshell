@@ -44,6 +44,7 @@
 #include "dnd_virtual_file.h"
 #include "protected_secret.h"
 #include "remote_fs.h"
+#include "reconnect.h"
 #include "resource.h"
 #include "session_store.h"
 #include "ssh_session.h"
@@ -80,6 +81,8 @@ constexpr UINT_PTR kCwdHookTimer1 = 2;
 constexpr UINT_PTR kCwdHookTimer2 = 3;
 constexpr UINT_PTR kCwdHookTimer3 = 4;
 constexpr UINT_PTR kCwdHookTimer4 = 5;
+// 定时器 id 与 tabId 一起编码成 tabId*8+id（见 mainProc 的 WM_TIMER 分发）
+constexpr UINT_PTR kReconnectTimer = 6;
 
 enum : int {
     ID_LIST = 1001,
@@ -169,6 +172,11 @@ struct SessionState {
     bool holdTermPaint = false;
     std::shared_ptr<RemoteFs> fs = std::make_shared<RemoteFs>();                 // 独立 SSH 连接：SFTP + 机器状态采样
     bool fsReady = false;        // 独立连接已建立
+    // ---- 断线自动重连 ----
+    bool reconnectPending = false;   // 已经排好/正在等待下一次重连
+    int reconnectAttempt = 0;        // 已经排过几次（0 表示还没开始）
+    bool reconnectTimerSet = false;
+    std::string reconnectSession;    // 掉线时的会话名
     bool fsFailed = false;       // 独立连接失败（左侧显示原因）
     std::string fsPath;          // 当前远端目录
     std::string fsHome;          // 登录后的 home
@@ -399,7 +407,13 @@ void ensureActiveTabVisible(int width);
 bool applySessionProxy(ConnectionOptions& options, const Session& session, std::string& error);
 
 void connectToSession(const Session& session, const std::wstring& password,
-                      const std::wstring& keyPassphrase);
+                      const std::wstring& keyPassphrase, bool preserveTerminal = false,
+                      bool autoRetry = false);
+// ---- 断线自动重连（策略在 reconnect.h，这里只负责界面与流程）----
+void cancelAutoReconnect(bool dropCredentials);
+void scheduleAutoReconnect();
+bool armAutoReconnect();
+void runAutoReconnectAttempt();
 void messageWarn(const std::wstring& title, const std::wstring& text);
 void stopRemoteFs();
 void startRemoteFs(const Session& session, const std::wstring& password,
@@ -2366,6 +2380,7 @@ bool sendCwdHookScript() {
 
 void disconnectSession() {
     stopCwdHook();
+    cancelAutoReconnect(true);
     g_app.connectionId = g_nextConnectionId++;
     if (g_app.shell->running() || g_app.connecting) {
         if (g_app.connecting) g_app.shell = std::make_shared<SshShell>();
@@ -2406,8 +2421,10 @@ bool applySessionProxy(ConnectionOptions& options, const Session& session, std::
 }
 
 void connectToSession(const Session& session, const std::wstring& password,
-                      const std::wstring& keyPassphrase) {
+                      const std::wstring& keyPassphrase, bool preserveTerminal,
+                      bool autoRetry) {
     if (g_app.connecting) return;
+    if (!autoRetry) cancelAutoReconnect(true);  // 用户手动连，别再排队重连
     if (g_app.shell->running()) disconnectSession();
     stopCwdHook();
     g_app.shellGotOutput = false;
@@ -2476,7 +2493,12 @@ void connectToSession(const Session& session, const std::wstring& password,
     g_app.currentSession = session.name;
     g_app.currentPassword.assign(password);
     g_app.currentKeyPassphrase.assign(keyPassphrase);
-    g_app.termData.reset();
+    if (preserveTerminal) {
+        // 自动重连：留着屏幕上的历史，只追加一行提示
+        g_app.termData.feed("\r\n[正在重新连接…]\r\n");
+    } else {
+        g_app.termData.reset();
+    }
     g_app.hasSelection = false;
     g_app.searchMatches.clear();
     g_app.searchIndex = -1;
@@ -2506,6 +2528,106 @@ void connectToSession(const Session& session, const std::wstring& password,
         }
         shell.reset();  // 在 runtime 的生命周期内释放可能已被关闭标签放弃的连接。
     }).detach();
+}
+
+// ---------------------------------------------------------------- 断线自动重连
+
+namespace {
+UINT_PTR reconnectTimerId(const SessionState& state) {
+    return static_cast<UINT_PTR>(state.tabId * 8) + kReconnectTimer;
+}
+}  // namespace
+
+void cancelAutoReconnect(bool dropCredentials) {
+    if (g_app.reconnectTimerSet && g_app.main) {
+        KillTimer(g_app.main, reconnectTimerId(g_app));
+    }
+    g_app.reconnectTimerSet = false;
+    g_app.reconnectPending = false;
+    g_app.reconnectAttempt = 0;
+    g_app.reconnectSession.clear();
+    if (dropCredentials) {
+        g_app.currentPassword.clear();
+        g_app.currentKeyPassphrase.clear();
+    }
+}
+
+void scheduleAutoReconnect() {
+    if (!g_app.reconnectPending || !g_app.main) return;
+    if (!ReconnectPolicy::shouldRetry(g_app.reconnectAttempt)) {
+        guiLog("自动重连失败：已尝试 " + std::to_string(g_app.reconnectAttempt) + " 次");
+        if (foregroundSession()) {
+            g_app.termData.feed("\r\n[自动重连失败，请点状态栏「重新连接」手动重试]\r\n");
+            InvalidateRect(g_app.term, nullptr, FALSE);
+        }
+        cancelAutoReconnect(true);
+        setStatus(L"自动重连失败，请手动重连", true);
+        layoutMain(g_app.main);
+        updateButtons();
+        return;
+    }
+    const int delay = ReconnectPolicy::delayMs(g_app.reconnectAttempt);
+    ++g_app.reconnectAttempt;
+    guiLog("自动重连：第 " + std::to_string(g_app.reconnectAttempt) + " 次，等 " +
+           std::to_string(delay) + " ms");
+    setStatus(L"连接中断，" + std::to_wstring(delay / 1000) + L" 秒后自动重连（" +
+              std::to_wstring(g_app.reconnectAttempt) + L"/" +
+              std::to_wstring(ReconnectPolicy::maxAttempts) + L"）…");
+    SetTimer(g_app.main, reconnectTimerId(g_app), static_cast<UINT>(delay), nullptr);
+    g_app.reconnectTimerSet = true;
+}
+
+// 意外掉线时调用：保留凭据、排第一次重连。返回 false 表示条件不具备。
+bool armAutoReconnect() {
+    const Session* session = selectedSession();
+    if (!session || !g_app.main) return false;
+    g_app.reconnectPending = true;
+    g_app.reconnectAttempt = 0;
+    g_app.reconnectSession = session->name;
+    // 凭据先留着：断线重连需要它，等重连窗口结束再抹
+    scheduleAutoReconnect();
+    return true;
+}
+
+void runAutoReconnectAttempt() {
+    g_app.reconnectTimerSet = false;
+    if (!g_app.reconnectPending) return;
+    const Session* session = g_app.store.find(g_app.reconnectSession);
+    if (!session) {
+        guiLog("自动重连取消：会话配置已删除");
+        cancelAutoReconnect(true);
+        setStatus(L"自动重连失败：会话配置已删除", true);
+        layoutMain(g_app.main);
+        updateButtons();
+        return;
+    }
+    if (g_app.connecting) {  // 上一次尝试还在连，等它结束
+        scheduleAutoReconnect();
+        return;
+    }
+    std::wstring password = g_app.currentPassword.reveal();
+    std::wstring passphrase = g_app.currentKeyPassphrase.reveal();
+    if (password.empty() && passphrase.empty() && session->keyPath.empty()) {
+        // 内存里没有凭据了（比如保险库锁定期间），试着从保险库取一次，不弹框
+        std::string saved;
+        std::string error;
+        if (session->savePassword && g_app.vault.unlocked() &&
+            loadCredential(credentialTarget(session->name), saved, &error)) {
+            password = toWide(saved);
+            wipeString(saved);
+        } else {
+            guiLog("自动重连取消：没有可用凭据");
+            cancelAutoReconnect(true);
+            setStatus(L"自动重连失败：需要重新输入密码", true);
+            layoutMain(g_app.main);
+            updateButtons();
+            return;
+        }
+    }
+    connectToSession(*session, password, passphrase, /*preserveTerminal=*/true,
+                     /*autoRetry=*/true);
+    wipeWideString(password);
+    wipeWideString(passphrase);
 }
 
 // ---------------------------------------------------------------- 对话框
@@ -8731,6 +8853,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_app.searchDirty) refreshTerminalSearch(false);
                 g_app.cursorOn = !g_app.cursorOn;
                 if (g_app.term) InvalidateRect(g_app.term, nullptr, FALSE);
+            } else if (wp == kReconnectTimer) {
+                if (g_app.main) KillTimer(hwnd,
+                    static_cast<UINT_PTR>(g_app.tabId * 8) + kReconnectTimer);
+                runAutoReconnectAttempt();
             } else if (wp == kCwdHookTimer1) {
                 killCwdTimer(kCwdHookTimer1);
                 if (!g_app.shell->running()) return 0;
@@ -8973,6 +9099,18 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp != g_app.connectionId) return 0;
             g_app.connecting = false;
             if (!g_app.shell->running()) { layoutMain(hwnd); updateButtons(); return 0; }
+            // 自动重连成功：收掉重连状态，并在终端里留一行痕迹
+            if (g_app.reconnectPending) {
+                g_app.reconnectPending = false;
+                g_app.reconnectAttempt = 0;
+                g_app.reconnectSession.clear();
+                if (g_app.reconnectTimerSet && g_app.main) {
+                    KillTimer(g_app.main, static_cast<UINT_PTR>(g_app.tabId * 8) + kReconnectTimer);
+                    g_app.reconnectTimerSet = false;
+                }
+                guiLog("自动重连成功");
+                g_app.termData.feed("\r\n[连接已自动恢复]\r\n");
+            }
             layoutMain(hwnd);
             layoutTerminal(g_app.term);
             std::wstring status = L"已连接 " + toWide(g_app.currentSession);
@@ -9063,6 +9201,28 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (wp != g_app.connectionId) return 0;
             stopCwdHook();
             g_app.connecting = false;
+            // 自动重连中的失败：不弹框、不打断用户，按策略重试或停手
+            if (g_app.reconnectPending) {
+                const std::string why = payload ? *payload : std::string();
+                guiLog("自动重连失败：" + (why.empty() ? std::string("未知错误") : why));
+                if (ReconnectPolicy::retryableError(why)) {
+                    layoutMain(hwnd);
+                    updateButtons();
+                    scheduleAutoReconnect();
+                    return 0;
+                }
+                // 指纹/认证这类错误重试没有意义，直接停手
+                if (foregroundSession()) {
+                    g_app.termData.feed("\r\n[自动重连失败：" + (why.empty() ? "未知错误" : why) +
+                                        "]\r\n");
+                    InvalidateRect(g_app.term, nullptr, FALSE);
+                }
+                cancelAutoReconnect(true);
+                setStatus(L"自动重连失败：" + (payload ? toWide(*payload) : L"未知错误"), true);
+                layoutMain(hwnd);
+                updateButtons();
+                return 0;
+            }
             layoutMain(hwnd);
             // 连接都没成功，别把这次输入的口令存进密码保险库
             g_app.pendingCredentialTarget.clear();
@@ -9091,15 +9251,22 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.connecting = false;
             {
                 const std::string detail = reason && !reason->empty() ? *reason : "连接已断开";
+                // 「远端会话已结束（退出码 N）」是远端正常结束，不该自动重连；
+                // 其余（网络读取失败、通道断开）当作掉线处理。
+                const bool cleanExit = detail.rfind("远端会话已结束", 0) == 0;
                 g_app.termData.feed("\r\n[" + detail + "]\r\n");
                 g_app.searchDirty = g_app.searchOpen;
                 InvalidateRect(g_app.term, nullptr, FALSE);
-                setStatus(toWide(detail), detail.rfind("远端会话已结束", 0) != 0);
+                setStatus(toWide(detail), !cleanExit);
                 guiLog("会话结束：" + detail);
                 if (foregroundSession()) SetWindowTextW(hwnd, L"rshell");
                 stopRemoteFs();
-                g_app.currentPassword.clear();
-                g_app.currentKeyPassphrase.clear();
+                if (!cleanExit && armAutoReconnect()) {
+                    // 凭据留到重连窗口结束（成功后照常使用，失败再抹）
+                } else {
+                    g_app.currentPassword.clear();
+                    g_app.currentKeyPassphrase.clear();
+                }
             }
             layoutMain(hwnd);
             updateButtons();

@@ -179,7 +179,7 @@ private:
     // 在自有连接上执行命令并抓取 stdout（不碰进程的 stdout）
     bool execCapture(const std::string& command, std::string& out, int timeoutMs, int* latencyMs,
                      int* exitCode = nullptr, std::size_t maxOutputBytes = 0,
-                     bool* truncated = nullptr);
+                     bool* truncated = nullptr, std::string* error = nullptr);
 
     RemoteFsCallbacks callbacks_;
     std::thread worker_;

@@ -21,6 +21,7 @@
 #include "config.h"
 #include "credential_store.h"
 #include "protected_secret.h"
+#include "reconnect.h"
 #include "session_store.h"
 #include "ssh_session.h"
 #include "terminal.h"
@@ -2262,10 +2263,26 @@ void testAiAgentHistoryTrim() {
     }
 }
 
+void testReconnectPolicy() {
+    // 退避：1 秒 / 2 秒 / 4 秒，最多 3 次
+    CHECK_EQ(ReconnectPolicy::delayMs(0), 1000);
+    CHECK_EQ(ReconnectPolicy::delayMs(1), 2000);
+    CHECK_EQ(ReconnectPolicy::delayMs(2), 4000);
+    CHECK(ReconnectPolicy::shouldRetry(0));
+    CHECK(ReconnectPolicy::shouldRetry(2));
+    CHECK(!ReconnectPolicy::shouldRetry(ReconnectPolicy::maxAttempts));
+
+    // 指纹/认证类错误不重试：重试只会触发 fail2ban，还可能连到被换掉的机器
+    CHECK(!ReconnectPolicy::retryableError("未知主机密钥 1.2.3.4 ECDSA-256 SHA256:xxx"));
+    CHECK(!ReconnectPolicy::retryableError("SSH 认证失败：用户名 root，服务器不接受"));
+    CHECK(ReconnectPolicy::retryableError("连接失败：连接 1.2.3.4:22 失败：连接超时"));
+    CHECK(ReconnectPolicy::retryableError("网络读取失败（-9）"));
+    CHECK(ReconnectPolicy::retryableError(""));
+}
+
 void testProxyUrl() {
     rshell::ProxyConfig proxy;
     std::string error;
-
     CHECK(rshell::parseProxyUrl("socks5://127.0.0.1:1080", proxy, error));
     CHECK(proxy.kind == rshell::ProxyConfig::Kind::Socks5);
     CHECK_EQ(proxy.host, std::string("127.0.0.1"));
@@ -2476,6 +2493,7 @@ int main() {
     testAiAgentHistoryTrim();
     testAiSettings();
     testMarkdownParse();
+    testReconnectPolicy();
     testProxyUrl();
 #endif
 

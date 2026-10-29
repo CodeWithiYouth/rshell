@@ -263,6 +263,42 @@ void networkRegression(int port, const std::string& upload, const std::string& d
     closeSessionTab(1);
     waitUntil([&] { return pending.expired(); }, "closing a connecting tab releases its backend without touching active shell");
     check(g_app.shell->running(), "active connection survives closing a pending connection");
+
+    // 断线自动重连：用和读线程失败时完全相同的那条消息模拟掉线
+    if (std::getenv("RSHELL_TEST_RECONNECT")) {
+        const UINT_PTR before = g_app.connectionId;
+        // 真的把通道关掉（读线程退出），再补上它掉线时会发的那条消息
+        g_app.shell->close();
+        PostMessageW(g_app.main, WM_SHELL_CLOSED, before,
+                     reinterpret_cast<LPARAM>(new std::string("网络读取失败（-9）")));
+        waitUntil([&] { return g_app.reconnectPending; }, "a network drop arms the auto reconnect");
+        waitUntil([&] {
+            return !g_app.reconnectPending && g_app.shell->running() &&
+                   g_app.connectionId != before;
+        }, "auto reconnect establishes a new session");
+        check(output(g_app).find("连接已自动恢复") != std::string::npos,
+              "terminal reports the recovered connection");
+        waitUntil([&] { return g_app.fsReady; }, "file channel comes back after the reconnect");
+
+        // exec 通道连续调用必须稳定（曾经「第一条成功、第二条就超时」）
+        for (int i = 0; i < 5; ++i) {
+            const std::string command = "echo exec-" + std::to_string(i);
+            const RemoteFs::ExecOutcome outcome = g_app.fs->execSync(command, 8000, 4096);
+            check(outcome.ok && outcome.output.find("exec-" + std::to_string(i)) != std::string::npos,
+                  "repeated exec on the same session keeps working");
+        }
+        // stderr 也要读掉，否则远端写满管道就卡住（&& 在 cmd 和 sh 下都能用）
+        {
+            const RemoteFs::ExecOutcome outcome =
+                g_app.fs->execSync("echo merged-out && echo merged-err 1>&2 && exit 3", 8000, 4096);
+            check(outcome.ok && outcome.output.find("merged-out") != std::string::npos &&
+                      outcome.output.find("merged-err") != std::string::npos,
+                  "stderr is drained into the output");
+            check(outcome.exitCode == 3,
+                  ("exit status is reported for exec, got " +
+                   std::to_string(outcome.exitCode) + " output=[" + outcome.output + "]").c_str());
+        }
+    }
 }
 
 void sessionMgrLayoutRegression() {
@@ -530,6 +566,28 @@ void statusHintRegression() {
     check(!hintShown(), "leaving the status bar hides the popup");
 }
 
+// 断线自动重连：排程 / 取消 / 凭据保留
+void autoReconnectRegression() {
+    Session target;
+    target.name = "auto-reconnect-probe";
+    target.host = "127.0.0.1";
+    target.port = 1;  // 不会真的连上，测试在定时器触发前就取消
+    g_app.store.upsert(target);
+    g_app.currentSession = target.name;
+    g_app.currentPassword.assign(L"probe-secret");
+
+    check(armAutoReconnect(), "auto reconnect arms after a network drop");
+    check(g_app.reconnectPending, "reconnect is pending");
+    check(g_app.reconnectAttempt == 1, "the first retry is already scheduled");
+    check(g_app.reconnectTimerSet, "the retry timer is running");
+    check(g_app.currentPassword.reveal() == L"probe-secret",
+          "credentials are kept for the retry window");
+
+    cancelAutoReconnect(true);
+    check(!g_app.reconnectPending && !g_app.reconnectTimerSet, "cancel stops the retry");
+    check(g_app.currentPassword.reveal().empty(), "cancel wipes the retained password");
+}
+
 void titleAiButtonRegression() {
     RECT client{}; GetClientRect(g_app.main, &client);
     HDC screen = GetDC(nullptr);
@@ -589,6 +647,7 @@ int main(int argc, char** argv) {
         aiTabRegression();
         aiUnlockCancelRegression();
         statusHintRegression();
+        autoReconnectRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);

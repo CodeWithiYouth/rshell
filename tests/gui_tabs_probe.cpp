@@ -468,6 +468,41 @@ void terminalDockReflowRegression() {
           "terminal text survives narrowing and widening");
 }
 
+// 保险库已锁时点「解锁」，用户在密码框上点「取消」不能跳进 AI 设置表单
+void aiUnlockCancelRegression() {
+    ai::AiTabContext context;
+    context.vault = &g_app.vault;
+    context.uiFont = g_app.uiFont;
+    context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font;
+    context.captionFont = g_app.tinyFont;
+    context.vaultPresent = []() { return true; };
+
+    int prompts = 0;
+    context.ensureVaultUnlocked = [&prompts]() { ++prompts; return false; };  // 用户点了取消
+    ai::AiTab* cancelled = ai::AiTab::create(g_app.main, context);
+    check(cancelled != nullptr, "standalone AI tab is created");
+    cancelled->setBounds(RECT{0, 0, 420, 600});
+    cancelled->startSettings(true);
+    check(prompts == 1, "the unlock prompt is shown once");
+    check(!cancelled->settingsOpen(), "cancelling the unlock prompt keeps the settings form closed");
+
+    // 没有 vault.dat 时不该弹解锁框，直接进设置页填 Key
+    int promptsWithoutVault = 0;
+    ai::AiTabContext noVault = context;
+    noVault.vaultPresent = []() { return false; };
+    noVault.ensureVaultUnlocked = [&promptsWithoutVault]() { ++promptsWithoutVault; return false; };
+    ai::AiTab* direct = ai::AiTab::create(g_app.main, noVault);
+    check(direct != nullptr, "second standalone AI tab is created");
+    direct->setBounds(RECT{0, 0, 420, 600});
+    direct->startSettings(true);
+    check(promptsWithoutVault == 0, "no unlock prompt when the vault file does not exist");
+    check(direct->settingsOpen(), "without a vault the settings form opens directly");
+
+    ai::AiTab::destroy(cancelled);
+    ai::AiTab::destroy(direct);
+}
+
 void titleAiButtonRegression() {
     RECT client{}; GetClientRect(g_app.main, &client);
     HDC screen = GetDC(nullptr);
@@ -525,6 +560,7 @@ int main(int argc, char** argv) {
         panelScrollRegression();
         sessionMgrLayoutRegression();
         aiTabRegression();
+        aiUnlockCancelRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);

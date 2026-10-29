@@ -428,9 +428,15 @@ void AiTab::updateKeyNotice() {
     panel_.addNotice(L"还没有配置 API Key。点击右上角「设置」填写，密钥会保存到本机主密码保险库。");
 }
 
+// 本机有保险库文件、并且当前锁着——只有这种情况才值得弹解锁框
+bool AiTab::vaultLocked() const {
+    return context_.vault && !context_.vault->unlocked() &&
+           (!context_.vaultPresent || context_.vaultPresent());
+}
+
 void AiTab::updateWelcome() {
     if (impl_->apiKey.empty()) {
-        if (context_.vault && !context_.vault->unlocked()) {
+        if (vaultLocked()) {
             // Key 可能已经存好了，只是保险库锁着：不误导成「没配置」
             panel_.setWelcome(L"保险库已锁定",
                               L"API Key 保存在本机保险库。点「解锁」输入主密码后即可直接提问。", true,
@@ -449,13 +455,15 @@ void AiTab::updateWelcome() {
 
 void AiTab::sendMessage(const std::wstring& text) {
     if (impl_->busy || text.empty()) return;
-    if (impl_->apiKey.empty() && context_.ensureVaultUnlocked && context_.ensureVaultUnlocked()) {
-        if (context_.vault) loadApiKey(*context_.vault, impl_->apiKey);
+    if (impl_->apiKey.empty() && vaultLocked() && context_.ensureVaultUnlocked) {
+        if (context_.ensureVaultUnlocked() && context_.vault) loadApiKey(*context_.vault, impl_->apiKey);
     }
     if (impl_->apiKey.empty()) {
         updateKeyNotice();
         updateWelcome();
-        startSettings(true);  // 优先走解锁；真的没配再让用户填
+        // 保险库锁着时刚才已经弹过解锁框了，用户取消就停在这里，别再弹第二次、
+        // 也别把他丢进设置表单；没有保险库才直接进设置填 Key。
+        if (!vaultLocked()) startSettings(true);
         return;
     }
     if (!currentBackend()) {
@@ -690,7 +698,15 @@ void AiTab::startSettings(bool unlockOnly) {
     settingsOpen_ = true;
 
     bool unlockedNow = false;
-    if (impl_->apiKey.empty() && context_.ensureVaultUnlocked && context_.ensureVaultUnlocked()) {
+    if (impl_->apiKey.empty() && vaultLocked() && context_.ensureVaultUnlocked) {
+        // 用户点了「取消」或解锁失败：留在空状态，绝不能跳进设置表单
+        // （以前这里忽略返回值，取消后照样打开设置页）
+        if (!context_.ensureVaultUnlocked()) {
+            settingsOpen_ = false;
+            updateWelcome();
+            InvalidateRect(window_, nullptr, FALSE);
+            return;
+        }
         if (context_.vault) {
             std::string stored;
             if (loadApiKey(*context_.vault, stored)) {

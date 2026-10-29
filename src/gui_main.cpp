@@ -8323,6 +8323,7 @@ ai::AiTab* ensureAiPanel(SessionState& state) {
     context.hosts = aiHostList;
     context.vault = &g_app.vault;
     context.ensureVaultUnlocked = []() { return ensureVaultUnlocked(); };
+    context.vaultPresent = []() { return vaultFilePresent(); };
     context.uiFont = g_app.uiFont;
     context.boldFont = g_app.uiFontBold;
     context.monoFont = g_app.font;

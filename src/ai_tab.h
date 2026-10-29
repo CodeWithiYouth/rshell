@@ -36,6 +36,9 @@ struct AiTabContext {
     Vault* vault = nullptr;
     // 保险库未解锁时由宿主弹出解锁框；返回 true 表示已解锁
     std::function<bool()> ensureVaultUnlocked;
+    // 本机是否存在 vault.dat。没有文件时「解锁」无从谈起，直接走设置页填 Key。
+    // 空表示宿主没有提供，按「有保险库」处理。
+    std::function<bool()> vaultPresent;
     HFONT uiFont = nullptr;
     HFONT boldFont = nullptr;
     HFONT monoFont = nullptr;
@@ -55,6 +58,11 @@ public:
     void show(bool visible);
     void focus();
     void setFullScreen(bool full);
+    // 打开设置视图；unlockOnly=true 表示从空状态「解锁」进来
+    // （解锁成功且已经读到 Key 就直接返回，不弹表单）
+    void startSettings(bool unlockOnly = false);
+    // 设置表单是否展开（回归测试用：取消解锁时不能打开）
+    bool settingsOpen() const { return settingsOpen_; }
 
 private:
     AiTab() = default;
@@ -67,12 +75,13 @@ private:
     void applyTheme();
     void sendMessage(const std::wstring& text);
     void cancelTurn();
-    void startSettings(bool unlockOnly = false);
     void finishSettings(bool save);
     void createSettingsControls();
     void layoutSettings();
     void startModelFetch();
     void updateHostLabel();
+    // 本机有保险库文件且当前锁着（只有这种情况才弹解锁框）
+    bool vaultLocked() const;
     void updateKeyNotice();
     void updateWelcome();
     void paint(HDC dc);

@@ -8524,7 +8524,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         case WM_MOUSEMOVE: {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
-            hideStatusHint();
+            RECT clientRc;
+            GetClientRect(hwnd, &clientRc);
+            // 状态栏详情浮窗：只有真的离开状态栏才收起。
+            // 以前每次 WM_MOUSEMOVE 都收，手一抖就是「弹出 → 收起 → 再弹出」的闪烁。
+            const bool overStatus = pt.y >= clientRc.bottom - g_app.statusH;
+            if (!overStatus) hideStatusHint();
             if (msg == WM_LBUTTONDOWN && handleSessionTabClick(pt)) return 0;
             if (msg == WM_MOUSEMOVE && PtInRect(&g_app.tabsRect, pt)) InvalidateRect(hwnd, &g_app.tabsRect, FALSE);
             RECT client;

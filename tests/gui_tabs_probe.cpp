@@ -503,6 +503,33 @@ void aiUnlockCancelRegression() {
     ai::AiTab::destroy(direct);
 }
 
+// 状态栏详情浮窗：悬停时出现，鼠标在状态栏内继续移动不应把它抖没
+void statusHintRegression() {
+    RECT client{};
+    GetClientRect(g_app.main, &client);
+    const int statusY = client.bottom - dp(8);
+    const int bodyY = client.bottom / 2;
+    const auto hover = [&](int x, int y) {
+        SendMessageW(g_app.main, WM_MOUSEMOVE, 0, MAKELPARAM(x, y));
+        SendMessageW(g_app.main, WM_MOUSEHOVER, 0, MAKELPARAM(x, y));
+    };
+    const auto hintShown = []() {
+        return g_app.statusHint != nullptr && IsWindowVisible(g_app.statusHint) != FALSE;
+    };
+
+    hover(client.right / 2, statusY);
+    check(g_app.statusHint != nullptr, "hovering the status bar creates the details popup");
+    check(hintShown(), "the details popup is visible after the hover delay");
+
+    // 手指轻微移动（还在状态栏里）不能让它一闪而过
+    SendMessageW(g_app.main, WM_MOUSEMOVE, 0, MAKELPARAM(client.right / 2 + 6, statusY - 2));
+    check(hintShown(), "moving inside the status bar keeps the popup visible");
+
+    // 移出状态栏才收起
+    SendMessageW(g_app.main, WM_MOUSEMOVE, 0, MAKELPARAM(client.right / 2, bodyY));
+    check(!hintShown(), "leaving the status bar hides the popup");
+}
+
 void titleAiButtonRegression() {
     RECT client{}; GetClientRect(g_app.main, &client);
     HDC screen = GetDC(nullptr);
@@ -561,6 +588,7 @@ int main(int argc, char** argv) {
         sessionMgrLayoutRegression();
         aiTabRegression();
         aiUnlockCancelRegression();
+        statusHintRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);

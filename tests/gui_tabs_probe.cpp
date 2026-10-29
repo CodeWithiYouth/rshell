@@ -617,6 +617,45 @@ void autoReconnectRegression() {
     check(g_app.currentPassword.reveal().empty(), "cancel wipes the retained password");
 }
 
+// 高延迟下列目录：从发出请求到结果回来之间，面板要处于「正在加载」
+void fsLoadingRegression() {
+    const UINT_PTR connection = g_app.connectionId;
+    g_app.fsReady = true;
+    g_app.store.upsert(Session{});
+    fsNavigate("/");
+    fsNavigate("/tmp");
+    check(g_app.fsLoading, "a directory switch marks the panel as loading");
+    check(g_app.fsEntries.empty(), "the old listing is cleared while loading");
+
+    FsEvent listing;
+    listing.kind = FsEventKind::Listing;
+    listing.path = "/tmp";
+    dispatchFs(connection, listing);
+    check(!g_app.fsLoading, "the listing result clears the loading state");
+
+    // 刷新（列表还在）也要标出来
+    g_app.fsEntries.push_back(RemoteEntry{});
+    fsRefresh();
+    check(g_app.fsLoading, "a refresh is marked as loading too");
+    FsEvent refreshed = listing;
+    refreshed.entries = {RemoteEntry{}};
+    dispatchFs(connection, refreshed);
+    check(!g_app.fsLoading, "a refresh result clears the loading state");
+
+    // 列目录失败也要退出加载态，别一直转圈
+    g_app.fsLoading = true;
+    FsEvent failure;
+    failure.kind = FsEventKind::Error;
+    failure.path = "/tmp";
+    failure.message = "permission denied";
+    g_app.fsQuietPath = "/tmp";
+    dispatchFs(connection, failure);
+    check(!g_app.fsLoading, "a failed listing clears the loading state");
+    g_app.fsError.clear();
+    g_app.fsEntries.clear();
+    g_app.fsQuietPath.clear();
+}
+
 void titleAiButtonRegression() {
     RECT client{}; GetClientRect(g_app.main, &client);
     HDC screen = GetDC(nullptr);
@@ -677,6 +716,7 @@ int main(int argc, char** argv) {
         aiUnlockCancelRegression();
         statusHintRegression();
         autoReconnectRegression();
+        fsLoadingRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);

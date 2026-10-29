@@ -178,6 +178,7 @@ struct SessionState {
     std::string fsPath;          // 当前远端目录
     std::string fsHome;          // 登录后的 home
     std::string fsError;         // 列目录失败原因
+    bool fsLoading = false;      // 列目录请求还在路上（高延迟时面板要显示「正在加载」）
     std::string fsQuietPath;     // 终端跟随触发的导航：列目录失败只在状态栏提示
     std::vector<RemoteEntry> fsEntries;
     int fsSel = -1;
@@ -5616,7 +5617,10 @@ const RemoteEntry* selectedFileEntry() {
 }
 
 void fsRefresh() {
-    if (!g_app.fsPath.empty()) g_app.fs->listDir(g_app.fsPath);
+    if (g_app.fsPath.empty()) return;
+    g_app.fsLoading = true;
+    g_app.fs->listDir(g_app.fsPath);
+    if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
 }
 
 // quiet：由终端目录跟随触发的导航。远端目录可能进不去（权限 / 已被删除），
@@ -5628,6 +5632,7 @@ void fsNavigate(const std::string& path, bool quiet = false) {
     g_app.fsScroll = 0;
     g_app.fsError.clear();
     g_app.fsEntries.clear();
+    g_app.fsLoading = true;  // 高延迟时先给个「正在加载」，别让人以为目录是空的
     g_app.fs->listDir(g_app.fsPath);
     if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
@@ -6511,9 +6516,31 @@ void paintFileList(HWND hwnd) {
                  g_app.uiFont, DT_LEFT | DT_TOP | DT_SINGLELINE);
         drawText(mem, toWide(g_app.fsError), RECT{dp(12), dp(32), rc.right - dp(12), dp(96)},
                  ui::textDim, g_app.tinyFont, DT_LEFT | DT_TOP | DT_WORDBREAK);
+    } else if (g_app.fsEntries.empty() && g_app.fsLoading) {
+        // 高延迟链路下列目录要等，先明确告诉用户在加载，而不是画成「空目录」
+        const int top = std::max(dp(10), std::min(dp(72), static_cast<int>(rc.bottom) / 5));
+        const int center = rc.right / 2;
+        const int box = dp(22);
+        // 三个点轮流亮（跟着主窗口 530ms 的定时器重绘，不需要额外定时器）
+        const int phase = static_cast<int>((GetTickCount64() / 500) % 3);
+        for (int i = 0; i < 3; ++i) {
+            const bool on = i == phase;
+            fillCircle(mem, center - dp(14) + i * dp(14), top + box / 2, on ? dp(4) : dp(3),
+                       on ? ui::accent : ui::mix(ui::accent, ui::bgPanel, 0.72));
+        }
+        drawText(mem, L"正在加载目录",
+                 RECT{dp(12), top + box + dp(10), rc.right - dp(12), top + box + dp(34)},
+                 ui::textDim, g_app.uiFontBold, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        drawText(mem, L"远端响应慢时会多等一会儿",
+                 RECT{dp(12), top + box + dp(36), rc.right - dp(12), top + box + dp(58)},
+                 ui::textFaint, g_app.tinyFont, DT_CENTER | DT_TOP | DT_WORDBREAK);
     } else if (g_app.fsEntries.empty()) {
         drawText(mem, L"空目录", RECT{dp(12), dp(10), rc.right - dp(12), dp(30)}, ui::textFaint,
                  g_app.tinyFont, DT_LEFT | DT_TOP | DT_SINGLELINE);
+    } else if (g_app.fsLoading) {
+        // 刷新（列表还在）：顶部挂一行细提示，不遮挡已有条目
+        drawText(mem, L"正在刷新…", RECT{dp(12), dp(8), rc.right - dp(12), dp(28)}, ui::accent,
+                 g_app.tinyFont, DT_RIGHT | DT_TOP | DT_SINGLELINE);
     }
 
     const int count = static_cast<int>(g_app.fsEntries.size());
@@ -6802,12 +6829,14 @@ void handleFsEvent(const FsEvent& event) {
             }
             break;
         case FsEventKind::Failed:
+            g_app.fsLoading = false;
             g_app.fsReady = false;
             g_app.fsFailed = true;
             g_app.fsError = event.message;
             setStatus(L"文件通道连接失败", true);
             break;
         case FsEventKind::Listing: {
+            g_app.fsLoading = false;
             const std::string previous =
                 (g_app.fsSel >= 0 && g_app.fsSel < static_cast<int>(g_app.fsEntries.size()))
                     ? g_app.fsEntries[static_cast<std::size_t>(g_app.fsSel)].name
@@ -6844,6 +6873,7 @@ void handleFsEvent(const FsEvent& event) {
             break;
         }
         case FsEventKind::Error:
+            g_app.fsLoading = false;
             if (g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
             if (App::DownloadTask* task = findDownloadTask(event.path, event.upload)) {
                 task->state = App::DownloadState::Failed;
@@ -8850,6 +8880,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_app.searchDirty) refreshTerminalSearch(false);
                 g_app.cursorOn = !g_app.cursorOn;
                 if (g_app.term) InvalidateRect(g_app.term, nullptr, FALSE);
+                // 列目录还没回来时让「正在加载」的三个点动起来
+                if (g_app.fsLoading && g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
             } else if (wp == kReconnectTimer) {
                 if (g_app.main) KillTimer(hwnd,
                     static_cast<UINT_PTR>(g_app.tabId * 8) + kReconnectTimer);

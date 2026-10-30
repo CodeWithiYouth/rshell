@@ -471,17 +471,42 @@ std::vector<ToolSpec> ToolRegistry::specs() const {
         specs.push_back(std::move(spec));
     }
 
+    {
+        // 纯本地工具：给这次对话起名字、打标签，供「历史会话」列表使用。
+        // 不碰远端，所以是读级（免审批），但会显示在对话里。
+        ToolSpec spec;
+        spec.name = "name_session";
+        spec.description =
+            "给当前这段对话起个标题并打标签，写进历史会话列表。"
+            "在你弄清楚用户想做什么之后调用一次即可；话题明显变化时可以再调一次覆盖。"
+            "标题用 4~14 个汉字概括任务，不要带主机名；标签 1~3 个，例如 nginx、部署、磁盘。"
+            "这个工具不执行任何远程操作，不需要用户确认。";
+        Json properties = Json::object();
+        properties["title"] = Json::object();
+        properties["title"]["type"] = Json::string("string");
+        properties["title"]["description"] = Json::string("对话标题，4~14 个汉字");
+        properties["tags"] = Json::object();
+        properties["tags"]["type"] = Json::string("array");
+        properties["tags"]["description"] = Json::string("可选：1~3 个短标签");
+        properties["tags"]["items"] = Json::object();
+        properties["tags"]["items"]["type"] = Json::string("string");
+        spec.parameters["type"] = Json::string("object");
+        spec.parameters["properties"] = std::move(properties);
+        spec.parameters["required"].push(Json::string("title"));
+        specs.push_back(std::move(spec));
+    }
+
     return specs;
 }
 
 ToolKind ToolRegistry::kindOf(const std::string& name) const {
-    if (name == "read_file" || name == "list_dir") return ToolKind::Read;
+    if (name == "read_file" || name == "list_dir" || name == "name_session") return ToolKind::Read;
     return ToolKind::Write;
 }
 
 bool ToolRegistry::known(const std::string& name) const {
     return name == "run_command" || name == "read_file" || name == "list_dir" ||
-           name == "write_file";
+           name == "write_file" || name == "name_session";
 }
 
 namespace {
@@ -561,6 +586,25 @@ ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::strin
     } else if (name == "read_file") {
         info.summary = onHost + "读取 " + pathText;
         info.detail = pathText;
+    } else if (name == "name_session") {
+        const Json* title = args.find("title");
+        const std::string text = title && title->isString() ? title->asString() : std::string();
+        if (text.empty()) {
+            info.valid = false;
+            info.problem = "缺少标题";
+            return info;
+        }
+        info.summary = "命名对话：" + firstLine(text, 40);
+        info.detail = text;
+        std::string tags;
+        if (const Json* list = args.find("tags"); list && list->isArray()) {
+            for (const Json& tag : list->items()) {
+                if (!tag.isString() || tag.asString().empty()) continue;
+                if (!tags.empty()) tags += "、";
+                tags += tag.asString();
+            }
+        }
+        info.detail += tags.empty() ? "" : "（标签：" + tags + "）";
     } else {  // list_dir
         info.summary = onHost + "列出目录 " + pathText;
         info.detail = pathText;
@@ -584,6 +628,7 @@ ToolResult ToolRegistry::execute(const std::string& name, const std::string& arg
         if (name == "read_file") return readFile(args);
         if (name == "write_file") return writeFile(args);
         if (name == "list_dir") return listDir(args);
+        if (name == "name_session") return nameSession(args);
     } catch (const std::exception& e) {
         ToolResult result;
         result.ok = false;
@@ -786,6 +831,55 @@ ToolResult ToolRegistry::listDir(const Json& args) {
     result.brief = std::to_string(entries.size()) + " 项" + (truncated ? " · 截断" : "");
     result.display = "已列出 " + target + "（" + std::to_string(entries.size()) + " 项" +
                      (truncated ? "，已截断" : "") + "）";
+    return result;
+}
+
+ToolResult ToolRegistry::nameSession(const Json& args) {
+    const Json* title = args.find("title");
+    const std::string text = title && title->isString() ? trim(title->asString()) : std::string();
+    if (text.empty()) {
+        ToolResult result;
+        result.ok = false;
+        result.json = makeError("缺少 title 参数").dump();
+        result.display = "缺少标题";
+        return result;
+    }
+
+    std::vector<std::string> tags;
+    if (const Json* list = args.find("tags"); list && list->isArray()) {
+        for (const Json& tag : list->items()) {
+            if (!tag.isString()) continue;
+            const std::string value = trim(tag.asString());
+            if (!value.empty() && tags.size() < 4) tags.push_back(value);
+        }
+    }
+
+    std::string error;
+    if (sessionNamer_ && !sessionNamer_(text, tags, error)) {
+        ToolResult result;
+        result.ok = false;
+        result.json = makeError(error.empty() ? "命名失败" : error).dump();
+        result.display = "命名失败";
+        return result;
+    }
+
+    Json payload = Json::object();
+    payload["title"] = Json::string(text);
+    Json list = Json::array();
+    for (const std::string& tag : tags) list.push(Json::string(tag));
+    payload["tags"] = std::move(list);
+
+    ToolResult result;
+    result.json = payload.dump();
+    result.brief = "已命名";
+    result.display = "对话标题：" + text;
+    if (!tags.empty()) {
+        result.display += " · 标签 ";
+        for (std::size_t i = 0; i < tags.size(); ++i) {
+            if (i) result.display += "、";
+            result.display += tags[i];
+        }
+    }
     return result;
 }
 

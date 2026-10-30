@@ -535,6 +535,123 @@ void terminalDockReflowRegression() {
           "terminal text survives narrowing and widening");
 }
 
+// 远端会话历史：打开面板自动接上最近一次，点「历史」按钮能切换到旧对话
+class ProbeSessionBackend : public ai::ToolBackend {
+public:
+    std::map<std::string, std::string> files;
+
+    std::string homeDir() override { return "/home/probe"; }
+    bool makeDir(const std::string&, std::string&) override { return true; }
+    CommandResult runCommand(const std::string&, int, const std::string&) override {
+        return CommandResult{};
+    }
+    bool readFile(const std::string& path, std::size_t, std::string& out, bool& truncated,
+                  std::string& error, const std::string&) override {
+        const auto it = files.find(path);
+        if (it == files.end()) {
+            error = "missing " + path;
+            return false;
+        }
+        out = it->second;
+        truncated = false;
+        return true;
+    }
+    bool writeFile(const std::string& path, const std::string& content, std::string&,
+                   const std::string&) override {
+        files[path] = content;
+        return true;
+    }
+    bool listDir(const std::string& path, std::vector<ai::DirEntryView>& out, std::string&,
+                 const std::string&) override {
+        const std::string prefix = path + "/";
+        for (const auto& entry : files) {
+            if (entry.first.compare(0, prefix.size(), prefix) != 0) continue;
+            const std::string name = entry.first.substr(prefix.size());
+            if (name.find('/') != std::string::npos) continue;
+            ai::DirEntryView view;
+            view.name = name;
+            view.size = entry.second.size();
+            out.push_back(view);
+        }
+        return true;
+    }
+};
+
+void aiSessionHistoryRegression() {
+    ProbeSessionBackend store;
+    const std::string dir = "/home/probe/.rshell/sessions";
+
+    ai::SessionRecord older;
+    older.title = "旧对话";
+    older.tags = {"nginx"};
+    older.created = older.updated = 1700000000;
+    older.messages.push_back({true, "旧的问题"});
+    older.messages.push_back({false, "旧回答"});
+
+    ai::SessionRecord newer;
+    newer.title = "新对话";
+    newer.tags = {"磁盘"};
+    newer.created = newer.updated = 1700003600;
+    newer.messages.push_back({true, "新的问题"});
+    newer.messages.push_back({false, "新回答"});
+
+    store.files[dir + "/" + ai::sessionFileName(older, older.created)] = ai::serializeSession(older);
+    store.files[dir + "/" + ai::sessionFileName(newer, newer.created)] = ai::serializeSession(newer);
+
+    ai::AiTabContext context;
+    context.uiFont = g_app.uiFont;
+    context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font;
+    context.captionFont = g_app.tinyFont;
+    context.hosts = [&store]() {
+        ai::AiHostInfo host;
+        host.id = 7;
+        host.label = L"probe-host";
+        host.store = std::shared_ptr<ai::ToolBackend>(&store, [](ai::ToolBackend*) {});
+        return std::vector<ai::AiHostInfo>{host};
+    };
+    context.activeHostId = []() { return static_cast<std::uintptr_t>(7); };
+    std::vector<std::wstring> labels;
+    int picks = 0;
+    context.pickFromList = [&](POINT, const std::vector<std::wstring>& list) {
+        labels = list;
+        ++picks;
+        return 1;  // 选第二行（较旧的那段）
+    };
+
+    ai::AiTab* tab = ai::AiTab::create(g_app.main, context);
+    check(tab != nullptr, "history panel is created");
+    tab->setBounds(RECT{0, 0, 460, 640});
+    tab->show(true);
+
+    // 打开面板自动接上最近的「新对话」
+    waitUntil([&]() { return tab->transcript().size() >= 2; },
+              "the newest conversation is restored automatically");
+    check(tab->transcript().front().kind == ai::ItemKind::User, "restored log starts with the user turn");
+    check(tab->transcript().front().body == L"新的问题", "the newest conversation is the one restored");
+
+    // 「历史」按钮：连上主机才有，点一下弹列表。
+    // 探针窗口是隐藏的，RedrawWindow 不会派发 WM_PAINT，所以直接发一次让面板算出按钮位置。
+    SendMessageW(tab->window(), WM_PAINT, 0, 0);
+    const RECT button = tab->historyButton();
+    check(!IsRectEmpty(&button), "the history button appears once a host is connected");
+    const LPARAM at = MAKELPARAM((button.left + button.right) / 2, (button.top + button.bottom) / 2);
+    SendMessageW(tab->window(), WM_LBUTTONDOWN, MK_LBUTTON, at);
+    SendMessageW(tab->window(), WM_LBUTTONUP, 0, at);
+    waitUntil([&]() { return picks == 1; }, "clicking history asks the host for a picker");
+    check(labels.size() == 2, "the picker lists both stored conversations");
+    check(labels[0].find(L"新对话") != std::wstring::npos, "newest conversation is listed first");
+    check(labels[0].find(L"2 条") != std::wstring::npos, "list shows the message count");
+    check(labels[0].find(L"#磁盘") != std::wstring::npos, "list shows the tags");
+
+    // 选第二行 → 换成旧对话
+    waitUntil([&]() { return tab->transcript().front().body == L"旧的问题"; },
+              "picking an older conversation replaces the log");
+    check(tab->transcript().size() == 2, "the replaced log holds the stored turns only");
+
+    ai::AiTab::destroy(tab);
+}
+
 // 保险库已锁时点「解锁」，用户在密码框上点「取消」不能跳进 AI 设置表单
 void aiUnlockCancelRegression() {
     ai::AiTabContext context;
@@ -909,6 +1026,7 @@ int main(int argc, char** argv) {
         panelScrollRegression();
         sessionMgrLayoutRegression();
         aiTabRegression();
+        aiSessionHistoryRegression();
         aiUnlockCancelRegression();
         statusHintRegression();
         autoReconnectRegression();

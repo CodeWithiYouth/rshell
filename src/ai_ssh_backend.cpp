@@ -61,4 +61,10 @@ bool SshToolBackend::listDir(const std::string& path, std::vector<DirEntryView>&
     return true;
 }
 
+std::string SshToolBackend::homeDir() { return fs_.homePath(); }
+
+bool SshToolBackend::makeDir(const std::string& path, std::string& error) {
+    return fs_.mkdirSync(path, error);
+}
+
 }  // namespace rshell::ai

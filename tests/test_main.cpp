@@ -34,6 +34,7 @@
 #include "ai_client.h"
 #include "ai_json.h"
 #include "ai_settings.h"
+#include "ai_session.h"
 #include "ai_tools.h"
 #include "md.h"
 #include "proxy.h"
@@ -1985,8 +1986,129 @@ void testAiToolPolicy() {
     CHECK(!truncated);
 }
 
-void testAiToolRegistry() {
-    FakeToolBackend backend;
+// 远端会话文件：标题/标签/文件名/序列化都要稳定，历史列表和自动接上都靠它
+void testAiSessions() {
+    using namespace rshell::ai;
+
+    // slug 只留 ASCII 字母数字，中文折叠成一个分隔符，纯中文退化成 session
+    CHECK_EQ(sessionSlug("Deploy nginx to prod"), std::string("deploy-nginx-to-prod"));
+    CHECK_EQ(sessionSlug("部署 nginx"), std::string("nginx"));
+    CHECK_EQ(sessionSlug("磁盘清理"), std::string("session"));
+    CHECK_EQ(sessionSlug(""), std::string("session"));
+    CHECK_EQ(sessionDir("/home/deploy"), std::string("/home/deploy/.rshell/sessions"));
+    CHECK_EQ(sessionDir("/home/deploy/"), std::string("/home/deploy/.rshell/sessions"));
+
+    SessionRecord record;
+    record.title = "排查 502";
+    record.host = "prod-web-01";
+    record.tags = {"nginx", "502"};
+    record.created = 1700000000;
+    record.updated = 1700000100;
+    record.messages.push_back({true, "为什么 502"});
+    record.messages.push_back({false, "上游挂了"});
+
+    SessionRecord back;
+    CHECK(parseSession(serializeSession(record), back, nullptr));
+    CHECK_EQ(back.title, record.title);
+    CHECK_EQ(back.host, record.host);
+    CHECK_EQ(back.tags.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(back.messages.size(), static_cast<std::size_t>(2));
+    CHECK(back.messages[0].user && !back.messages[1].user);
+    CHECK_EQ(back.messages[1].text, std::string("上游挂了"));
+    CHECK_EQ(back.updated, record.updated);
+
+    // 文件名带时间戳：按名字排序就是时间顺序
+    const std::string name = sessionFileName(record, 1700000000);
+    CHECK(isSessionFileName(name));
+    CHECK(name.find(".json") == name.size() - 5);
+    CHECK(name.find("session.json") == std::string::npos);
+    CHECK_EQ(sessionStampFromName(name), static_cast<std::int64_t>(1700000000));
+    CHECK_EQ(sessionStampFromName("readme.txt"), static_cast<std::int64_t>(0));
+    CHECK(!isSessionFileName("notes.json"));
+    CHECK(!isSessionFileName("20261030-141233.json.bak"));
+    CHECK(!sessionStampText(0).empty() == false);
+
+    // 老文件没有 title：用第一条用户消息兜底（历史列表里才有东西可看）
+    SessionRecord untitled;
+    CHECK(parseSession(R"({"messages":[{"role":"user","text":"看看磁盘"}]})", untitled, nullptr));
+    CHECK_EQ(untitled.title, std::string("看看磁盘"));
+
+    // 坏 JSON 不崩、不清空已有内容
+    SessionRecord broken;
+    broken.title = "keep";
+    CHECK(!parseSession("{not json", broken, nullptr));
+    CHECK_EQ(broken.title, std::string("keep"));
+
+    // 远端读写：建目录（含缓存）→ 写两段 → 读最新，杂项/坏文件跳过
+    class FakeStore : public ai::ToolBackend {
+    public:
+        std::map<std::string, std::string> files;
+
+        std::string homeDir() override { return "/home/probe"; }
+        bool makeDir(const std::string&, std::string&) override { return true; }
+        CommandResult runCommand(const std::string&, int, const std::string&) override {
+            return CommandResult{};
+        }
+        bool readFile(const std::string& path, std::size_t, std::string& out, bool& truncated,
+                      std::string& error, const std::string&) override {
+            const auto it = files.find(path);
+            if (it == files.end()) {
+                error = "missing " + path;
+                return false;
+            }
+            out = it->second;
+            truncated = false;
+            return true;
+        }
+        bool writeFile(const std::string& path, const std::string& content, std::string&,
+                       const std::string&) override {
+            files[path] = content;
+            return true;
+        }
+        bool listDir(const std::string& path, std::vector<ai::DirEntryView>& out, std::string&,
+                     const std::string&) override {
+            const std::string prefix = path + "/";
+            for (const auto& entry : files) {
+                if (entry.first.compare(0, prefix.size(), prefix) != 0) continue;
+                const std::string name = entry.first.substr(prefix.size());
+                if (name.find('/') != std::string::npos) continue;
+                ai::DirEntryView view;
+                view.name = name;
+                view.size = entry.second.size();
+                out.push_back(view);
+            }
+            return true;
+        }
+    };
+
+    FakeStore store;
+    std::string dir;
+    std::string storeError;
+    CHECK(ai::ensureSessionDir(store, dir, storeError));
+    CHECK_EQ(dir, std::string("/home/probe/.rshell/sessions"));
+    // 第二次直接命中缓存，不再花一次往返
+    CHECK(ai::ensureSessionDir(store, dir, storeError));
+
+    SessionRecord older = record;
+    older.title = "旧对话";
+    SessionRecord newer = record;
+    newer.title = "新对话";
+    CHECK(ai::writeSessionFile(store, dir, ai::sessionFileName(older, 1700000000), older,
+                               storeError));
+    CHECK(ai::writeSessionFile(store, dir, ai::sessionFileName(newer, 1700003600), newer,
+                               storeError));
+    store.files[dir + "/notes.txt"] = "别的东西";   // 不是我们的命名规则，忽略
+    store.files[dir + "/upload"] = "x";             // 目录外的文件也不会被列进来
+
+    const auto latest = ai::readSessions(store, dir, 10, storeError);
+    CHECK_EQ(latest.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(latest[0].record.title, std::string("新对话"));  // 文件名排序 = 时间排序
+    CHECK_EQ(latest[1].record.title, std::string("旧对话"));
+    CHECK_EQ(latest[0].record.messages.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(ai::readSessions(store, dir, 1, storeError).size(), static_cast<std::size_t>(1));
+}
+
+void testAiToolRegistry() {    FakeToolBackend backend;
     backend.files["/tmp/a.txt"] = "hello";
 
     ai::ToolPolicy policy = ai::defaultToolPolicy();
@@ -1995,13 +2117,34 @@ void testAiToolRegistry() {
     ai::ToolRegistry registry(backend, policy);
 
     const std::vector<ai::ToolSpec> specs = registry.specs();
-    CHECK_EQ(specs.size(), static_cast<std::size_t>(4));
+    CHECK_EQ(specs.size(), static_cast<std::size_t>(5));
     CHECK(registry.kindOf("run_command") == ai::ToolKind::Write);
     CHECK(registry.kindOf("write_file") == ai::ToolKind::Write);
     CHECK(registry.kindOf("read_file") == ai::ToolKind::Read);
     CHECK(registry.kindOf("list_dir") == ai::ToolKind::Read);
+    // name_session 只给对话起名，不碰远端，所以是读级（免审批）
+    CHECK(registry.kindOf("name_session") == ai::ToolKind::Read);
+    CHECK(registry.known("name_session"));
     CHECK(registry.known("read_file"));
     CHECK(!registry.known("rm_rf"));
+
+    // name_session：纯本地记账，不发命令、不需要审批
+    std::string namedTitle;
+    std::vector<std::string> namedTags;
+    registry.setSessionNamer([&](const std::string& title, const std::vector<std::string>& tags,
+                                 std::string&) {
+        namedTitle = title;
+        namedTags = tags;
+        return true;
+    });
+    const std::size_t commandsBefore = backend.commands.size();
+    const ai::ToolResult naming =
+        registry.execute("name_session", R"({"title":"排查 502","tags":["nginx","502"]})");
+    CHECK(naming.ok);
+    CHECK_EQ(namedTitle, std::string("排查 502"));
+    CHECK_EQ(namedTags.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(backend.commands.size(), commandsBefore);  // 一条命令都没打到远端
+    CHECK(registry.describe("name_session", R"({"title":"排查 502"})").kind == ai::ToolKind::Read);
 
     // 审批卡片摘要
     const ai::ToolRequestInfo info =
@@ -2011,8 +2154,10 @@ void testAiToolRegistry() {
     CHECK(info.summary.find("systemctl status nginx") != std::string::npos);
     CHECK(!info.dangerous);
 
-    // 每个工具都带可选的 host 参数；指定了会话名要出现在摘要里并传给后端
+    // 每个远程工具都带可选的 host 参数；指定了会话名要出现在摘要里并传给后端。
+    // name_session 是对这段对话本身的操作，没有 host。
     for (const auto& spec : specs) {
+        if (spec.name == "name_session") continue;
         bool hasHost = false;
         const ai::Json* props = spec.parameters.find("properties");
         if (props) hasHost = props->find("host") != nullptr;
@@ -2102,7 +2247,7 @@ void testAiAgentReadsWithoutApproval() {
 
     // 请求里带了 system 与全部工具描述
     CHECK_EQ(chat.requests.size(), static_cast<std::size_t>(2));
-    CHECK_EQ(chat.lastTools.size(), static_cast<std::size_t>(4));
+    CHECK_EQ(chat.lastTools.size(), static_cast<std::size_t>(5));
     CHECK(chat.requests[0][0].role == ai::Message::Role::System);
     CHECK(chat.requests[0][1].role == ai::Message::Role::User);
 
@@ -2617,6 +2762,7 @@ int main() {
     testAiSse();
     testAiStreamAccumulator();
     testAiToolPolicy();
+    testAiSessions();
     testAiToolRegistry();
     testAiAgentReadsWithoutApproval();
     testAiAgentWriteNeedsApproval();

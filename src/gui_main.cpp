@@ -40,6 +40,7 @@
 
 #include "credential_store.h"
 #include "ai_panel.h"
+#include "ai_ssh_backend.h"
 #include "ai_tab.h"
 #include "dnd_virtual_file.h"
 #include "protected_secret.h"
@@ -9038,7 +9039,12 @@ std::vector<ai::AiHostInfo> aiHostList() {
         ai::AiHostInfo info;
         info.id = state.tabId;  // 用 tabId 对应，标签增减时不会串台
         info.label = state.currentSession.empty() ? L"未命名会话" : toWide(state.currentSession);
-        if (state.fs->ready()) info.backend = state.fs.get();
+        if (state.fs->ready()) {
+            info.backend = state.fs.get();
+            // 后台读写会话历史时用它们：keepAlive 防标签关掉后 RemoteFs 提前析构
+            info.keepAlive = state.fs;
+            info.store = std::make_shared<ai::SshToolBackend>(*state.fs);
+        }
         hosts.push_back(std::move(info));
     };
     for (auto& state : g_tabs)
@@ -9064,6 +9070,21 @@ ai::AiTab* ensureAiPanel() {
     context.onSettingsSaved = []() {};
     context.onToggleFullScreen = []() { setAiPanelFull(!g_app.aiFull); };
     context.onClose = []() { toggleAiPanel(); };
+    // 「历史会话」用它弹列表：复用主界面的自绘菜单，
+    // 一行是「标题 · 条数 · 时间 · #标签」，id = 下标 + 1（0 表示取消）
+    context.pickFromList = [](POINT screenPt, const std::vector<std::wstring>& labels) {
+        if (labels.empty()) return -1;
+        std::vector<popup::Item> items;
+        items.reserve(labels.size());
+        for (std::size_t i = 0; i < labels.size(); ++i) {
+            popup::Item item;
+            item.id = static_cast<int>(i) + 1;
+            item.text = labels[i];
+            items.push_back(std::move(item));
+        }
+        const int id = popup::run(g_app.main, screenPt, items);
+        return id > 0 ? id - 1 : -1;
+    };
 
     g_app.aiTab = ai::AiTab::create(g_app.main, std::move(context));
     if (g_app.aiTab) g_app.aiTab->setFullScreen(g_app.aiFull);
@@ -9791,6 +9812,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             layoutMain(hwnd);
             layoutTerminal(g_app.term);
+            // 连上了：面板头部的主机名要更新，空面板则接上这台机器的历史对话
+            if (g_app.aiTab) g_app.aiTab->refreshHost();
             std::wstring status = L"已连接 " + toWide(g_app.currentSession);
             if (!g_app.shell->fingerprint().empty()) {
                 status += L"  ·  " + toWide(g_app.shell->kex());

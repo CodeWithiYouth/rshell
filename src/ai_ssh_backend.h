@@ -28,6 +28,8 @@ public:
                    std::string& error, const std::string& host) override;
     bool listDir(const std::string& path, std::vector<DirEntryView>& out,
                  std::string& error, const std::string& host) override;
+    std::string homeDir() override;
+    bool makeDir(const std::string& path, std::string& error) override;
 
 private:
     RemoteFs& fs_;

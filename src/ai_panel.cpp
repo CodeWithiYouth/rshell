@@ -668,6 +668,7 @@ void ChatPanel::drawHeader(HDC dc) {
     }
 
     // 目标主机：点击在已连接的主机之间轮换
+    historyRect_ = RECT{};
     if (!host_.empty()) {
         const int available = std::max(60, secondRight - left);
         const int chipW = std::min(textWidth(dc, host_, fonts_.caption) + 18, available);
@@ -676,6 +677,15 @@ void ChatPanel::drawHeader(HDC dc) {
         drawText(dc, ellipsize(dc, host_, fonts_.caption, chipW - 14), chip, accent,
                  fonts_.caption, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if (hostClickable_) hits_.push_back({chip, Hit::Host, 0});
+
+        // 「历史」只在连上主机时出现：对话存在远端，没有连接就读不到
+        const int histW = 38;
+        RECT hist{chip.right + 6, secondTop, chip.right + 6 + histW, secondBottom};
+        if (hist.right < secondRight - 4) {
+            drawButton(dc, hist, L"历史", bgCard, textDim, hover_ == Hit::History);
+            hits_.push_back({hist, Hit::History, 0});
+            historyRect_ = hist;
+        }
     }
 }
 
@@ -1005,6 +1015,9 @@ bool ChatPanel::onMouseUp(POINT pt) {
                 return true;
             case Hit::Clear:
                 if (actions_.onClear) actions_.onClear();
+                return true;
+            case Hit::History:
+                if (actions_.onHistory) actions_.onHistory();
                 return true;
             case Hit::Host:
                 if (actions_.onHost) actions_.onHost();

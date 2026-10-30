@@ -69,6 +69,13 @@ void Agent::addUserMessage(const std::string& text) {
     history_.push_back(std::move(message));
 }
 
+// 从远端读回来的历史：只有纯文本轮次，没有 tool_calls，
+// 语义上等价于「用户和助手之前聊过这些」，可以直接接着问。
+void Agent::importHistory(std::vector<Message> messages) {
+    history_ = std::move(messages);
+    trimHistory();
+}
+
 std::size_t Agent::historyBytes() const {
     std::size_t total = systemPrompt_.size();
     for (const Message& message : history_) {

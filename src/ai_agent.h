@@ -88,6 +88,8 @@ public:
 
     void reset();
     void addUserMessage(const std::string& text);
+    // 载入历史会话：整段替换当前上下文（调用方负责只放 user/assistant 的纯文本轮次）
+    void importHistory(std::vector<Message> messages);
 
     // 阻塞运行，直到模型给出最终回答、被取消、被终止或出错。
     // 不要与同一个 Agent 并发调用。

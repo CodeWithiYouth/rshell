@@ -167,6 +167,11 @@ public:
                       bool& truncated, std::string& error);
     bool writeFileSync(const std::string& path, const std::string& content, std::string& error);
     bool listDirSync(const std::string& path, std::vector<RemoteEntry>& out, std::string& error);
+    // 建目录（含上级），目录已存在也算成功。只走 SFTP，不碰 libssh2 会话，
+    // 所以可以在后台线程里和界面同时用（会话历史保存要用）。
+    bool mkdirSync(const std::string& path, std::string& error);
+    // 连接时解析出的家目录（SFTP realpath），不可用时为空
+    const std::string& homePath() const { return homePath_; }
 
 private:
     using Task = std::function<void()>;
@@ -198,6 +203,7 @@ private:
     std::atomic<bool> sftpReady_{false};
     std::atomic<bool> statsPending_{false};
     int sampleInterval_ = 5;
+    std::string homePath_;  // 连接时 SFTP 解析出的家目录（会话历史拼路径用）
 };
 
 }  // namespace rshell

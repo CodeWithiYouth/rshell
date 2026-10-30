@@ -507,6 +507,7 @@ void RemoteFs::workerLoop() {
         } catch (...) {
             homePath = ".";
         }
+        homePath_ = homePath;
     } catch (const std::exception& ex) {
         sftpError = ex.what();
         sftp_.reset();
@@ -967,6 +968,57 @@ bool RemoteFs::listDirSync(const std::string& path, std::vector<RemoteEntry>& ou
         return false;
     }
     out = std::move(state->entries);
+    return true;
+}
+
+bool RemoteFs::mkdirSync(const std::string& path, std::string& error) {
+    error.clear();
+    if (path.empty()) {
+        error = "缺少目录路径";
+        return false;
+    }
+    if (!running_.load()) {
+        error = "远端连接尚未建立";
+        return false;
+    }
+
+    struct State {
+        bool ok = false;
+        std::string error;
+    };
+    auto state = std::make_shared<State>();
+
+    const bool finished = runSync(
+        [this, state, path]() {
+            if (!sftp_) {
+                state->error = "SFTP 尚未就绪";
+                return;
+            }
+            try {
+                // parents=true：一次把 ~/.rshell/sessions 建出来
+                sftp_->mkdir(path, 0755, true);
+                state->ok = true;
+            } catch (const std::exception& ex) {
+                // 已经存在不算失败：会话目录会被反复使用
+                try {
+                    sftp_->listDir(path);
+                    state->ok = true;
+                    return;
+                } catch (...) {
+                }
+                state->error = ex.what();
+            }
+        },
+        20000);
+
+    if (!finished) {
+        error = "等待远端响应超时";
+        return false;
+    }
+    if (!state->ok) {
+        error = state->error.empty() ? "建目录失败" : state->error;
+        return false;
+    }
     return true;
 }
 

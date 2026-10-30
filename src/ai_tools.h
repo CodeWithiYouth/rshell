@@ -9,6 +9,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -52,6 +53,16 @@ public:
 
     virtual bool listDir(const std::string& path, std::vector<DirEntryView>& out,
                          std::string& error, const std::string& host = {}) = 0;
+
+    // 家目录与建目录：AI 对话要存到 ~/.rshell/sessions。
+    // 这两个走 SFTP 而不是 exec——libssh2 会话不能同时被两个线程用，
+    // 后台线程里发命令会和界面上的文件面板/采样撞车。
+    virtual std::string homeDir() { return {}; }
+    virtual bool makeDir(const std::string& path, std::string& error) {
+        (void)path;
+        (void)error;
+        return false;
+    }
 };
 
 struct ToolPolicy {
@@ -115,6 +126,12 @@ public:
     // 执行一次工具调用；不抛异常，失败信息写在返回值里
     ToolResult execute(const std::string& name, const std::string& arguments);
 
+    // name_session 的落点：纯本地记账（不碰远端），由 AiTab 写入当前对话的标题/标签
+    using SessionNamer = std::function<bool(const std::string& title,
+                                            const std::vector<std::string>& tags,
+                                            std::string& error)>;
+    void setSessionNamer(SessionNamer namer) { sessionNamer_ = std::move(namer); }
+
     const ToolPolicy& policy() const { return policy_; }
     void setPolicy(ToolPolicy policy) { policy_ = std::move(policy); }
 
@@ -123,9 +140,11 @@ private:
     ToolResult readFile(const Json& args);
     ToolResult writeFile(const Json& args);
     ToolResult listDir(const Json& args);
+    ToolResult nameSession(const Json& args);
 
     ToolBackend& backend_;
     ToolPolicy policy_;
+    SessionNamer sessionNamer_;
 };
 
 // ---------------------------------------------------------------- 可单测的纯函数

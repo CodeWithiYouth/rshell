@@ -59,6 +59,8 @@ struct PanelActions {
     std::function<void()> onCancel;
     std::function<void()> onSettings;
     std::function<void()> onClear;
+    // 历史会话：远端 ~/.rshell/sessions/ 里的旧对话（按钮只在连了主机时出现）
+    std::function<void()> onHistory;
     std::function<void()> onHost;
     std::function<void()> onToggleFullScreen;
     // 空状态里的按钮（与标题栏「设置」分开：可能只是去解锁保险库）
@@ -122,6 +124,8 @@ public:
     std::wstring preedit() const { return preedit_; }
     // 最近一次绘制时光标的客户区位置：输入法合成窗/候选窗要摆在这里
     RECT caretRect() const { return caretRect_; }
+    // 最近一次绘制时「历史」按钮的位置（宿主拿它当弹出列表的锚点）
+    RECT historyRect() const { return historyRect_; }
     // 供宿主/回归测试观察滚动状态
     int scrollOffset() const { return scrollBack_; }
     bool stickToBottom() const { return stickBottom_; }
@@ -134,7 +138,7 @@ public:
     void setInput(std::wstring text);
 
 private:
-    enum class Hit { None, Send, Cancel, Settings, Clear, Allow, Deny, Toggle, Host, Full, WelcomeSettings, Close };
+    enum class Hit { None, Send, Cancel, Settings, Clear, History, Allow, Deny, Toggle, Host, Full, WelcomeSettings, Close };
 
     struct HitRect {
         RECT rect{};
@@ -175,6 +179,7 @@ private:
     int viewportHeight_ = 0;
 
     RECT caretRect_{};
+    RECT historyRect_{};  // 「历史」按钮，宿主据此定位弹出列表
     std::wstring input_;
     std::size_t caret_ = 0;
     std::wstring preedit_;       // 输入法组字串，插在 caret_ 位置显示

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <ctime>
 #include <random>
 #include <condition_variable>
 #include <memory>
@@ -12,6 +13,7 @@
 
 #include "ai_agent.h"
 #include "ai_client.h"
+#include "ai_session.h"
 #include "ai_settings.h"
 #include "ai_ssh_backend.h"
 #include "ai_tools.h"
@@ -116,8 +118,30 @@ std::string toUtf8Text(const std::wstring& text) {
     return out;
 }
 
-int textWidthOf(HDC dc, const std::wstring& text, HFONT font) {
-    if (text.empty() || !font) return 0;
+// ---------------------------------------------------------------- 远端会话存储
+//
+// 对话存在远端主机的 ~/.rshell/sessions/，一台主机一份历史：
+// 换台机器连同一台服务器，打开面板能接着上次继续问。
+// 建目录 / 列文件 / 序列化都在 ai_session.cpp（假后端可单测），这里只做线程与事件调度。
+
+std::string firstLineOf(const std::string& text) {
+    const std::size_t end = text.find('\n');
+    return end == std::string::npos ? text : text.substr(0, end);
+}
+
+// 历史列表里的一行：标题 · 6 条 · 10-30 14:12 · #标签
+std::wstring sessionEntryLabel(const StoredSession& entry) {
+    std::wstring label = toWideText(entry.record.title.empty() ? "未命名对话" : entry.record.title);
+    label += L"  ·  " + std::to_wstring(entry.record.messages.size()) + L" 条";
+    const std::int64_t stamp =
+        entry.record.updated > 0 ? entry.record.updated : sessionStampFromName(entry.file);
+    const std::string when = sessionStampText(stamp);
+    if (!when.empty()) label += L"  ·  " + toWideText(when);
+    for (const std::string& tag : entry.record.tags) label += L"  #" + toWideText(tag);
+    return label;
+}
+
+int textWidthOf(HDC dc, const std::wstring& text, HFONT font) {    if (text.empty() || !font) return 0;
     HGDIOBJ old = SelectObject(dc, font);
     SIZE size{};
     GetTextExtentPoint32W(dc, text.c_str(), static_cast<int>(text.size()), &size);
@@ -193,6 +217,23 @@ public:
         return backend.listDir(path, out, error, {});
     }
 
+    std::string homeDir() override {
+        std::string why;
+        void* fs = lookup({}, why);
+        if (!fs) return {};
+        return static_cast<RemoteFs*>(fs)->homePath();
+    }
+
+    bool makeDir(const std::string& path, std::string& error) override {
+        std::string why;
+        void* fs = lookup({}, why);
+        if (!fs) {
+            error = why;
+            return false;
+        }
+        return static_cast<RemoteFs*>(fs)->mkdirSync(path, error);
+    }
+
 private:
     static constexpr const char* kNotConnected = "当前没有可用的主机连接（先在会话标签里连上主机）";
 
@@ -245,6 +286,7 @@ struct AiTab::Impl {
 
     std::thread worker;
     std::atomic<bool> cancel{false};
+    bool shown = false;   // 面板是否处于打开状态（决定要不要自动读历史）
     std::atomic<bool> busy{false};
     bool closing = false;
 
@@ -274,6 +316,21 @@ struct AiTab::Impl {
     std::string apiKey;
     std::string sessionId = makeSessionId();
     bool keyNoticeShown = false;
+
+    // ---- 远端会话存储（~/.rshell/sessions/）----
+    // RemoteFs 不是线程安全的：一轮对话、保存、载入三者串行
+    std::mutex remoteMutex;
+    std::mutex metaMutex;            // 标题/标签/文件名
+    std::thread loader;              // 读历史（自动接上 / 历史按钮）
+    std::atomic<bool> loading{false};
+    std::string sessionDirPath;      // 缓存的 <home>/.rshell/sessions
+    std::uintptr_t sessionDirHost = 0;
+    std::string sessionFile;         // 当前对话的文件名（空 = 还没存过）
+    std::string sessionTitle;
+    std::vector<std::string> sessionTags;
+    std::int64_t sessionCreated = 0;
+    // 自动载入只对每台主机做一次；清空对话后保持同一个 id，避免刚清掉又被载回来
+    std::uintptr_t autoLoadHost = 0;
 
     // 设置视图
     HWND editBase = nullptr;
@@ -336,6 +393,7 @@ void AiTab::destroy(AiTab* tab) {
             }
         }
         if (tab->impl_->worker.joinable()) tab->impl_->worker.join();
+        if (tab->impl_->loader.joinable()) tab->impl_->loader.join();
     }
     if (tab->window_) DestroyWindow(tab->window_);  // WM_NCDESTROY 里 delete
 }
@@ -365,8 +423,19 @@ void AiTab::initialize(HWND) {
         impl_->agent.reset();
         panel_.clear();
         impl_->assistantIndex = static_cast<std::size_t>(-1);
+        {
+            // 清空 = 开一段新对话：标题/标签/文件名都重置，但保留 autoLoadHost，
+            // 否则刚清掉的这段会被「自动接上」立刻载回来
+            std::lock_guard<std::mutex> meta(impl_->metaMutex);
+            impl_->sessionFile.clear();
+            impl_->sessionTitle.clear();
+            impl_->sessionTags.clear();
+            impl_->sessionCreated = 0;
+        }
+        impl_->autoLoadHost = activeHostId();
         updateWelcome();
     };
+    actions.onHistory = [this]() { showSessionHistory(); };
     // 面板是全局的，换主机 = 换标签，标题上的主机名只做展示
     actions.onHost = []() {};
     actions.onToggleFullScreen = [this]() {
@@ -379,7 +448,22 @@ void AiTab::initialize(HWND) {
 
     impl_->settings = loadAiSettings();
     impl_->applyAutoApprove();
-    impl_->client.setConfig(makeApiConfig(impl_->settings, std::string(), impl_->sessionId));
+    // name_session 只做本地记账：模型给这段对话起名字/打标签，历史列表里用
+    impl_->registry.setSessionNamer(
+        [this](const std::string& title, const std::vector<std::string>& tags, std::string& error) {
+            if (impl_->closing) {
+                error = "面板已关闭";
+                return false;
+            }
+            if (title.empty()) {
+                error = "标题为空";
+                return false;
+            }
+            std::lock_guard<std::mutex> meta(impl_->metaMutex);
+            impl_->sessionTitle = title;
+            impl_->sessionTags = tags;
+            return true;
+        });    impl_->client.setConfig(makeApiConfig(impl_->settings, std::string(), impl_->sessionId));
     panel_.setModelName(toWideText(impl_->settings.model));
 
     // Agent 的流式回调 → 界面线程事件
@@ -422,8 +506,11 @@ void AiTab::setBounds(const RECT& bounds) {
 
 void AiTab::show(bool visible) {
     if (!window_) return;
+    impl_->shown = visible;
     if (visible) updateHostLabel();  // 会话可能刚连上
     ShowWindow(window_, visible ? SW_SHOWNA : SW_HIDE);
+    // 打开面板后再自动接历史：收起来时不碰远端连接
+    if (visible) autoLoadLatestSession();
 }
 
 void AiTab::focus() {
@@ -442,6 +529,7 @@ void AiTab::updateHostLabel() {
 
 void AiTab::refreshHost() {
     updateHostLabel();
+    autoLoadLatestSession();  // 换了主机：面板还空着就接上那台机器的历史
     if (window_) InvalidateRect(window_, nullptr, FALSE);
 }
 
@@ -463,6 +551,20 @@ void* AiTab::hostBackendById(std::uintptr_t id) const {
     for (const auto& host : context_.hosts())
         if (host.id == id) return host.backend;
     return nullptr;
+}
+
+std::shared_ptr<void> AiTab::hostKeepAlive(std::uintptr_t id) const {
+    if (!context_.hosts) return {};
+    for (const auto& host : context_.hosts())
+        if (host.id == id) return host.keepAlive;
+    return {};
+}
+
+std::shared_ptr<ToolBackend> AiTab::hostStore(std::uintptr_t id) const {
+    if (!context_.hosts) return {};
+    for (const auto& host : context_.hosts())
+        if (host.id == id) return host.store;
+    return {};
 }
 
 std::wstring AiTab::currentHostLabel() const { return hostLabelById(activeHostId()); }
@@ -557,6 +659,11 @@ std::string AiTab::buildSystemPrompt() {
             }
         }
     }
+    // 历史会话列表靠标题/标签区分，模型起名比截取第一句话好认
+    prompt +=
+        "\n当用户的目的已经清楚时，调用一次 name_session 给这段对话起个中文标题（4~14 字）"
+        "并打 1~3 个标签；话题明显换掉时可以再调一次覆盖。这是本地记账工具，不执行任何远程操作，"
+        "不要因为它打断正在做的事。";
     return prompt;
 }
 
@@ -610,8 +717,17 @@ void AiTab::sendMessage(const std::wstring& text) {
     panel_.setStatus(L"生成中…");
 
     if (impl_->worker.joinable()) impl_->worker.join();
-    impl_->worker = std::thread([this]() {
-        const AgentTurn turn = impl_->agent.run([this]() { return impl_->cancel.load(); });
+    const std::uintptr_t turnHost = turnHostId;
+    const std::wstring turnLabel = currentHostLabel();
+    impl_->worker = std::thread([this, turnHost, turnLabel]() {
+        AgentTurn turn;
+        {
+            // 整轮对话都占着远端锁：同一时刻只有一个线程碰 RemoteFs
+            std::lock_guard<std::mutex> remote(impl_->remoteMutex);
+            turn = impl_->agent.run([this]() { return impl_->cancel.load(); });
+        }
+        // 这一轮聊完了就落盘（远端写失败不打断对话，下一轮还会再写）
+        if (!impl_->closing) saveSessionSnapshot(turnHost, turnLabel);
 
         std::wstring status;
         bool ok = true;
@@ -779,6 +895,43 @@ void AiTab::handleEvent(Event& event) {
             requestRepaint();
             return;
         }
+        case EventKind::SessionLoaded: {
+            if (impl_->busy || !panel_.items().empty()) return;  // 期间用户已经开始聊了
+            auto entries = std::static_pointer_cast<std::vector<StoredSession>>(event.payload);
+            if (!entries || entries->empty()) return;
+            applySession(entries->front().file, entries->front().record, true);
+            return;
+        }
+        case EventKind::SessionList: {
+            auto entries = std::static_pointer_cast<std::vector<StoredSession>>(event.payload);
+            panel_.setStatus(L"");
+            requestRepaint();
+            if (!entries || entries->empty()) {
+                panel_.addNotice(L"这台主机上还没有历史对话。每到一轮结束会自动存到 "
+                                 L"~/.rshell/sessions/。",
+                                 false);
+                return;
+            }
+            std::vector<std::wstring> labels;
+            labels.reserve(entries->size());
+            for (const StoredSession& entry : *entries) labels.push_back(sessionEntryLabel(entry));
+
+            // 锚点：面板头部「历史」按钮的下沿
+            POINT anchor{0, 0};
+            if (window_) {
+                const RECT button = panel_.historyRect();
+                anchor.x = button.left;
+                anchor.y = button.bottom + 4;
+                ClientToScreen(window_, &anchor);
+            }
+            int choice = -1;
+            if (context_.pickFromList) choice = context_.pickFromList(anchor, labels);
+            if (choice >= 0 && choice < static_cast<int>(entries->size())) {
+                const StoredSession& picked = (*entries)[static_cast<std::size_t>(choice)];
+                applySession(picked.file, picked.record, false);
+            }
+            return;
+        }
         case EventKind::AssistantBegin: return;
     }
 }
@@ -799,6 +952,177 @@ void AiTab::onPanelApproval(std::size_t index, bool allowed) {
     }
     slot->cv.notify_all();
     (void)index;
+}
+
+// ---------------------------------------------------------------- 远端会话存储
+
+// 一轮结束后写一次：同一段对话反复覆盖同一个文件，标题变了也不改名，
+// 历史列表里顺序稳定（文件名就是创建时间）。
+void AiTab::saveSessionSnapshot(std::uintptr_t hostId, const std::wstring& hostLabel) {
+    if (hostId == 0 || impl_->closing) return;
+    // 后台写盘期间标签可能被关掉：抓着后端与保活句柄，别让它们提前析构
+    const std::shared_ptr<ToolBackend> store = hostStore(hostId);
+    if (!store) return;
+    const std::shared_ptr<void> alive = hostKeepAlive(hostId);
+    ToolBackend& backend = *store;
+
+    SessionRecord record;
+    for (const Message& message : impl_->agent.history()) {
+        if (message.role != Message::Role::User && message.role != Message::Role::Assistant) continue;
+        if (message.content.empty()) continue;
+        SessionMessage item;
+        item.user = message.role == Message::Role::User;
+        item.text = message.content;
+        record.messages.push_back(std::move(item));
+    }
+    if (record.messages.empty()) return;
+
+    std::string dir;
+    std::string file;
+    std::int64_t created = 0;
+    {
+        std::lock_guard<std::mutex> meta(impl_->metaMutex);
+        record.title = impl_->sessionTitle;
+        record.tags = impl_->sessionTags;
+        file = impl_->sessionFile;
+        created = impl_->sessionCreated;
+    }
+    record.host = toUtf8Text(hostLabel);
+    if (record.title.empty()) {
+        // 模型没起名：用第一句用户消息兜底，历史列表里至少认得出是哪次
+        for (const SessionMessage& message : record.messages) {
+            if (!message.user) continue;
+            bool truncated = false;
+            record.title = truncateUtf8(firstLineOf(message.text), 48, truncated);
+            break;
+        }
+    }
+    if (record.title.empty()) record.title = "新对话";
+    if (record.tags.empty() && !record.host.empty()) record.tags.push_back(record.host);
+
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    if (created == 0) created = now;
+    record.created = created;
+    record.updated = now;
+    if (file.empty()) file = sessionFileName(record, now);
+
+    std::lock_guard<std::mutex> remote(impl_->remoteMutex);
+    if (impl_->sessionDirHost != hostId) {
+        impl_->sessionDirPath.clear();  // 换机器了，家目录要重新取
+        impl_->sessionDirHost = hostId;
+    }
+    dir = impl_->sessionDirPath;
+    std::string error;
+    if (!ensureSessionDir(backend, dir, error)) return;
+    impl_->sessionDirPath = dir;
+    if (!writeSessionFile(backend, dir, file, record, error)) return;
+
+    std::lock_guard<std::mutex> meta(impl_->metaMutex);
+    impl_->sessionFile = file;
+    impl_->sessionCreated = created;
+}
+
+// 打开面板 / 换主机：面板还空着就接上这台主机最近一次对话
+void AiTab::autoLoadLatestSession() {
+    // 面板收起来时不读：没必要为了看不见的对话去动远端连接（也就不会和断线抢连接）
+    if (!window_ || !impl_->shown) return;
+    if (impl_->busy || impl_->loading) return;
+    const std::uintptr_t hostId = activeHostId();
+    // 会话存在远端，只有连上（SFTP 就绪）的主机才有得读
+    if (hostId == 0 || !hostStore(hostId)) return;
+    if (hostId == impl_->autoLoadHost) return;   // 每台主机只自动接一次
+    if (!panel_.items().empty()) return;         // 已经在聊了，不覆盖
+    impl_->autoLoadHost = hostId;
+    startSessionRead(hostId, 1);
+}
+
+// 点「历史」：读最近 20 段，交给宿主弹列表
+void AiTab::showSessionHistory() {
+    if (impl_->busy) {
+        panel_.addNotice(L"这一轮还没结束，等它跑完再看历史会话。", true);
+        return;
+    }
+    const std::uintptr_t hostId = activeHostId();
+    if (hostId == 0 || !hostStore(hostId)) {
+        panel_.addNotice(L"历史会话存在远端主机上，先在标签里连上一台。", true);
+        return;
+    }
+    if (impl_->loading) return;
+    panel_.setStatus(L"读取历史会话…");
+    requestRepaint();
+    startSessionRead(hostId, 20);
+}
+
+void AiTab::startSessionRead(std::uintptr_t hostId, int limit) {
+    const std::shared_ptr<ToolBackend> backend = hostStore(hostId);
+    if (!backend) return;
+    if (impl_->loader.joinable()) {
+        if (impl_->loading) return;
+        impl_->loader.join();
+    }
+    impl_->loading = true;
+    // 读的过程中标签可能被关掉：拿着一份后端与保活句柄
+    std::shared_ptr<void> alive = hostKeepAlive(hostId);
+    impl_->loader = std::thread([this, backend, hostId, limit, alive]() {
+        auto entries = std::make_shared<std::vector<StoredSession>>();
+        try {
+            std::lock_guard<std::mutex> remote(impl_->remoteMutex);
+            if (impl_->sessionDirHost != hostId) {
+                impl_->sessionDirPath.clear();
+                impl_->sessionDirHost = hostId;
+            }
+            std::string dir = impl_->sessionDirPath;
+            std::string error;
+            *entries = readSessions(*backend, dir, limit, error);
+            impl_->sessionDirPath = dir;
+        } catch (...) {
+            // 远端连接在读取途中断掉：当作没有历史，不能把异常抛到线程外
+        }
+        impl_->loading = false;
+        if (impl_->closing) return;
+        postEvent(limit == 1 ? EventKind::SessionLoaded : EventKind::SessionList, L"", L"", L"",
+                  true, entries);
+    });
+}
+
+// 把一段历史铺回面板与上下文
+void AiTab::applySession(const std::string& file, const SessionRecord& record, bool announce) {
+    if (impl_->busy) return;
+    impl_->agent.reset();
+    panel_.clear();
+    impl_->assistantIndex = static_cast<std::size_t>(-1);
+
+    std::vector<Message> history;
+    for (const SessionMessage& message : record.messages) {
+        if (message.user) {
+            panel_.addUser(toWideText(message.text));
+        } else {
+            const std::size_t index = panel_.beginAssistant();
+            panel_.appendAssistant(index, toWideText(message.text));
+            panel_.finishAssistant(index, true);
+        }
+        Message item;
+        item.role = message.user ? Message::Role::User : Message::Role::Assistant;
+        item.content = message.text;
+        history.push_back(std::move(item));
+    }
+    impl_->agent.importHistory(std::move(history));
+    {
+        std::lock_guard<std::mutex> meta(impl_->metaMutex);
+        impl_->sessionFile = file;
+        impl_->sessionTitle = record.title;
+        impl_->sessionTags = record.tags;
+        impl_->sessionCreated = record.created;
+    }
+    impl_->autoLoadHost = activeHostId();
+    if (announce) {
+        panel_.addNotice(L"已接上上次对话「" + toWideText(record.title) + L"」，共 " +
+                         std::to_wstring(record.messages.size()) +
+                         L" 条。点「历史」可以换一段，点「清空」开始新的。");
+    }
+    updateWelcome();
+    requestRepaint();
+    if (window_) InvalidateRect(window_, nullptr, FALSE);
 }
 
 // ---------------------------------------------------------------- 设置视图
@@ -1314,6 +1638,14 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_NCDESTROY: {
             KillTimer(window_, kCaretTimer);
             KillTimer(window_, kRepaintTimer);
+            // 宿主直接把窗口销毁（没走 AiTab::destroy）时，也要先把线程收干净：
+            // std::thread 析构时还 joinable 会直接 terminate
+            if (impl_) {
+                impl_->closing = true;
+                impl_->cancel = true;
+                if (impl_->worker.joinable()) impl_->worker.join();
+                if (impl_->loader.joinable()) impl_->loader.join();
+            }
             if (impl_ && impl_->backBmp) DeleteObject(impl_->backBmp);
             if (impl_ && impl_->backDc) DeleteDC(impl_->backDc);
             if (bodyFont_) { DeleteObject(bodyFont_); bodyFont_ = nullptr; }

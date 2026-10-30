@@ -18,7 +18,12 @@ namespace rshell {
 
 namespace {
 
-constexpr const char* kVersion = "1.0.0";
+#ifndef RSHELL_VERSION
+#define RSHELL_VERSION "0.0.0"
+#endif
+
+// 版本号来自 CMake 的 PROJECT_VERSION（和 GUI 同一个宏），别再手写死
+constexpr const char* kVersion = RSHELL_VERSION;
 
 bool isKnownCommand(const std::string& s) {
     static const char* kCommands[] = {"connect", "shell", "ssh",  "exec", "run",   "sftp",

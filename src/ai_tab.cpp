@@ -1362,6 +1362,7 @@ void AiTab::finishSettings(bool save) {
         settings.model = trim(readText(impl_->modelCombo));
         settings.autoApprove = impl_->draftAutoApprove;
         settings.saveSessions = impl_->draftSaveSessions;
+        settings.searchProvider = impl_->draftSearchProvider;  // chip 上选的后端
         if (settings.baseUrl.empty() || settings.model.empty()) {
             panel_.addNotice(L"API 地址和模型都不能为空", true);
             return;
@@ -1389,9 +1390,10 @@ void AiTab::finishSettings(bool save) {
             impl_->keyNoticeShown = false;
         }
 
-        // 搜索 Key：只写当前选中的后端；留空表示沿用保险库里已有的
+        // 搜索 Key：只写当前选中的后端；留空表示沿用保险库里已有的。
+        // 选了「关闭」（后端为空）时，输入的 Key 直接忽略，不要用它挡住保存。
         const std::string searchKey = trim(readText(impl_->editSearchKey));
-        if (!searchKey.empty()) {
+        if (!searchKey.empty() && !settings.searchProvider.empty()) {
             if (!context_.vault ||
                 !saveSearchKey(*context_.vault, settings.searchProvider, searchKey, &error)) {
                 panel_.addNotice(toWideText(error.empty() ? "保险库不可用" : error), true);
@@ -1402,9 +1404,11 @@ void AiTab::finishSettings(bool save) {
                 return;
             }
             impl_->searchKey = searchKey;
-        } else if (context_.vault) {
+        } else if (!settings.searchProvider.empty() && context_.vault) {
             impl_->searchKey.clear();
             loadSearchKey(*context_.vault, settings.searchProvider, impl_->searchKey);
+        } else {
+            impl_->searchKey.clear();  // 关闭搜索
         }
         applySearch();  // 换后端/换 Key 立刻生效，不用重开面板
 

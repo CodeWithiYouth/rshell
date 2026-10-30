@@ -927,6 +927,113 @@ void mainMenuRegression() {
           "the startup check toggle shows its state");
 }
 
+// 绘制耗时基线：RSHELL_AI_PAINT_BENCH=1 时跑一次，只打印数字，不做断言。
+// 用来对比「整窗重绘」和「只重绘最后一个气泡」的成本，不参与 CI 判定。
+void aiPanelPaintBench() {
+    const char* enabled = std::getenv("RSHELL_AI_PAINT_BENCH");
+    if (!enabled) return;
+
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 460, 760);
+    HGDIOBJ old = SelectObject(dc, bmp);
+
+    const std::wstring longBody =
+        L"这一行是普通的说明文字，用来模拟真实回答里的长段落，包含中文与 English words 混排。\n\n"
+        L"- 列表项一：**加粗** 与 `code`\n"
+        L"- 列表项二：看看断行是否正确\n\n"
+        L"```bash\nsystemctl status nginx --no-pager\nnginx -t\n```\n";
+    const std::wstring shortBody =
+        L"先看一下端口有没有在听：`ss -lntp | grep 8080`，如果没有输出说明上游没起来。\n";
+
+    auto run = [&](const char* label, int items, const std::wstring& body, int repeats) {
+        ai::ChatPanel panel;
+        ai::PanelFonts fonts;
+        fonts.ui = g_app.uiFont;
+        fonts.bold = g_app.uiFontBold;
+        fonts.mono = g_app.font;
+        fonts.caption = g_app.tinyFont;
+        panel.setFonts(fonts);
+        panel.setBounds(RECT{0, 0, 460, 760});
+        for (int i = 0; i < items; ++i) {
+            panel.addUser(L"第 " + std::to_wstring(i + 1) + L" 个问题：帮我看看服务状态");
+            const std::size_t index = panel.beginAssistant();
+            for (int k = 0; k < repeats; ++k) panel.appendAssistant(index, body);
+            panel.finishAssistant(index, true);
+        }
+
+        auto measure = [&](int rounds, bool partial) -> double {
+            const ULONGLONG started = GetTickCount64();
+            for (int i = 0; i < rounds; ++i) {
+                if (partial) {
+                    const RECT area = panel.lastItemRect();
+                    panel.paint(dc, &area);
+                } else {
+                    panel.paint(dc);
+                }
+            }
+            return static_cast<double>(GetTickCount64() - started) / rounds;
+        };
+
+        panel.paint(dc);  // 预热：把字体/布局缓存建好
+        const double full = measure(20, false);
+        const double part = measure(20, true);
+        std::cout << "BENCH " << label << " items=" << items * 2 << " full=" << full
+                  << "ms partial=" << part << "ms\n";
+    };
+
+    run("long ", 60, longBody, 4);
+    run("short", 12, shortBody, 1);
+
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+}
+
+// 局部重绘：只画最后一个气泡的区域时，其余条目要跳过但不能出错
+void aiPanelPartialPaintRegression() {
+    ai::ChatPanel panel;
+    ai::PanelFonts fonts;
+    fonts.ui = g_app.uiFont;
+    fonts.bold = g_app.uiFontBold;
+    fonts.mono = g_app.font;
+    fonts.caption = g_app.tinyFont;
+    panel.setFonts(fonts);
+    panel.setBounds(RECT{0, 0, 420, 600});
+    panel.addUser(L"先问一句");
+    for (int i = 0; i < 40; ++i) panel.addNotice(L"提示 " + std::to_wstring(i));
+    panel.addUser(L"最后一条");
+
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 420, 600);
+    HGDIOBJ old = SelectObject(dc, bmp);
+
+    panel.paint(dc);
+    const int fullHeight = panel.contentHeight();
+    check(panel.contentOverflows(), "many messages overflow the view");
+
+    const RECT view = panel.viewRect();
+    check(view.top >= 60 && view.bottom <= 600 - 60, "view rect sits between header and composer");
+    const RECT last = panel.lastItemRect();
+    check(!IsRectEmpty(&last), "last item rect is available for partial repaint");
+    check(last.top >= view.top && last.bottom <= view.bottom, "last item rect stays inside the view");
+
+    // 只画最后一条的区域：不能崩、不能改变测量结果
+    panel.paint(dc, &last);
+    check(panel.contentHeight() == fullHeight, "partial repaint keeps the measured height");
+
+    // 再全量画一次，确保局部重绘后回到完整状态
+    panel.paint(dc);
+    check(panel.contentHeight() == fullHeight, "full repaint keeps the measured height");
+
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+}
+
 // 检查更新：发现新版本时，标题栏出现可点击的提示胶囊
 void updateCheckRegression() {
     ReleaseInfo newer;
@@ -1034,6 +1141,8 @@ int main(int argc, char** argv) {
         splitterRegression();
         fsCollapseRegression();
         pasteFocusRegression();
+        aiPanelPaintBench();
+        aiPanelPartialPaintRegression();
         mainMenuRegression();
         updateCheckRegression();
         titleAiButtonRegression();

@@ -77,6 +77,13 @@ public:
     void setCallbacks(PanelActions actions);
     void setBounds(const RECT& bounds);
     RECT bounds() const { return bounds_; }
+    // 消息区 / 输入区 / 最后一个气泡的矩形（客户区坐标，给局部重绘用）
+    RECT viewRect() const;
+    RECT composerRect() const;
+    RECT lastItemRect() const;
+    // 内容是否超过一屏（超过且贴底时，新行会让整段上移）
+    bool contentOverflows() const { return contentHeight_ > viewportHeight_; }
+    int contentHeight() const { return contentHeight_; }
 
     void setBusy(bool busy);
     bool busy() const { return busy_; }
@@ -108,7 +115,8 @@ public:
     void addNotice(const std::wstring& text, bool error = false);
 
     // ---- 绘制 / 交互 ----
-    void paint(HDC dc);
+    // dirty 非空时只重画与它相交的条目（流式刷新只失效最后一个气泡）
+    void paint(HDC dc, const RECT* dirty = nullptr);
     bool onMouseMove(POINT pt);
     bool onMouseDown(POINT pt);
     bool onMouseUp(POINT pt);

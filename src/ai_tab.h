@@ -112,7 +112,6 @@ private:
     bool vaultLocked() const;
     void updateKeyNotice();
     void updateWelcome();
-    void paint(HDC dc);
     void onPanelApproval(std::size_t index, bool allowed);
 
     // 工作线程 → 界面线程的事件
@@ -133,7 +132,10 @@ private:
         bool flag = false;
         std::shared_ptr<void> payload;  // 审批用的等待槽
     };
-    void requestRepaint();
+    void requestRepaint();          // 整块重绘（结构变化）
+    void requestChatRepaint();      // 只脏流式气泡（追加文本）
+    void scheduleRepaint();         // 合并到下一帧，按上帧耗时自适应间隔
+    void paint(HDC dc, const RECT* dirty = nullptr);
     void positionIme();
     void postEvent(EventKind kind, std::wstring a, std::wstring b = {}, std::wstring c = {},
                    bool ok = true, std::shared_ptr<void> payload = nullptr);

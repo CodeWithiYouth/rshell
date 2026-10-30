@@ -507,8 +507,7 @@ void ChatPanel::measure(HDC dc, int contentWidth) {
     if (!items_.empty()) contentHeight_ -= kItemGap;
 }
 
-void ChatPanel::paint(HDC dc) {
-    hits_.clear();
+void ChatPanel::paint(HDC dc, const RECT* dirty) {    hits_.clear();
 
     const int width = bounds_.right - bounds_.left;
     if (width <= 0) return;
@@ -561,7 +560,17 @@ void ChatPanel::paint(HDC dc) {
     for (std::size_t i = 0; i < items_.size(); ++i) {
         const int h = heights_[i];
         RECT rc{view.left + kPad, y, view.right - kPad, y + h};
-        if (rc.bottom >= view.top && rc.top <= view.bottom) drawItem(dc, items_[i], rc, i);
+        if (rc.bottom >= view.top && rc.top <= view.bottom) {
+            // 局部重绘：不相交的「纯文本」条目直接跳过（Markdown 是这里最贵的部分）。
+            // 工具卡/审批卡即使不重画也要保留命中区，否则点不动，所以不跳。
+            const ItemKind kind = items_[i].kind;
+            const bool cheapToSkip = kind == ItemKind::Assistant || kind == ItemKind::User ||
+                                     kind == ItemKind::Notice || kind == ItemKind::Error;
+            const bool outside = dirty != nullptr &&
+                                 (dirty->bottom < rc.top || dirty->top > rc.bottom ||
+                                  dirty->right < rc.left || dirty->left > rc.right);
+            if (!(outside && cheapToSkip)) drawItem(dc, items_[i], rc, i);
+        }
         y += h + kItemGap;
     }
     RestoreDC(dc, messageClip);  // 标题栏/输入框在裁剪区外，得先把消息区的裁剪撤掉
@@ -1306,6 +1315,31 @@ bool renderPreview(const wchar_t* bmpPath, int width, int height, int mode) {
     DeleteObject(fonts.mono);
     DeleteObject(fonts.caption);
     return ok;
+}
+
+// ---------------------------------------------------------------- 局部重绘区域
+
+RECT ChatPanel::viewRect() const {
+    return RECT{bounds_.left, bounds_.top + kHeaderH, bounds_.right,
+                bounds_.bottom - kComposerH};
+}
+
+RECT ChatPanel::composerRect() const {
+    return RECT{bounds_.left, bounds_.bottom - kComposerH, bounds_.right, bounds_.bottom};
+}
+
+// 最后一个气泡的「从它顶部到消息区底部」：流式追加只会往下长，
+// 上面的历史消息一个像素都不会变，没必要跟着重画。
+RECT ChatPanel::lastItemRect() const {
+    const RECT view = viewRect();
+    if (items_.empty() || heights_.size() != items_.size()) return view;
+    int above = 0;
+    for (std::size_t i = 0; i + 1 < heights_.size(); ++i) above += heights_[i] + kItemGap;
+    const int viewport = view.bottom - view.top;
+    const int y = contentHeight_ <= viewport ? view.top
+                                             : view.bottom + scrollBack_ - contentHeight_;
+    const int top = y + above;
+    return RECT{view.left, std::max<int>(top, view.top), view.right, view.bottom};
 }
 
 }  // namespace rshell::ai

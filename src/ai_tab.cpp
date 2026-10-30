@@ -47,7 +47,7 @@ constexpr UINT kAiFlushMessage = WM_APP + 62;
 constexpr UINT kAiModelsMessage = WM_APP + 63;
 constexpr UINT_PTR kCaretTimer = 11;
 constexpr UINT_PTR kRepaintTimer = 12;
-constexpr int kRepaintIntervalMs = 40;  // 流式刷新上限约 25fps
+constexpr int kRepaintIntervalMs = 16;  // 流式刷新上限约 60fps（实际按上帧耗时自适应放慢）
 
 // 设置视图的固定排版（绘制与建控件共用）
 constexpr int kProviderTop = 54;
@@ -307,6 +307,11 @@ struct AiTab::Impl {
     std::atomic<bool> flushPosted{false};
     bool repaintPending = false;
     bool imeComposing = false;
+
+    // 帧合并：一帧在途时只累积脏区，不叠加 SetTimer
+    RECT dirty{};              // 待重绘区域（客户区坐标）
+    bool dirtyFull = true;     // 整块都要重画（结构变化/尺寸变化/首次）
+    int lastPaintMs = 0;       // 上一帧耗时，用来决定下一帧间隔
 
     // 双缓冲：直接画到窗口 DC 会先刷底色再描字，流式时肉眼可见闪烁
     HDC backDc = nullptr;
@@ -837,9 +842,37 @@ void AiTab::positionIme() {
 }
 
 void AiTab::requestRepaint() {
+    impl_->dirtyFull = true;
+    scheduleRepaint();
+}
+
+// 追加流式文本：只有最后一个气泡会变，脏区从它顶部算到底部。
+// 但内容超过一屏且贴着底部时，整段列表会随新行一起上移，这时必须重画整个消息区。
+void AiTab::requestChatRepaint() {
+    if (!impl_->dirtyFull) {
+        const bool scrolls = panel_.stickToBottom() && panel_.contentOverflows();
+        const RECT area = scrolls ? panel_.viewRect() : panel_.lastItemRect();
+        if (!IsRectEmpty(&area)) {
+            if (IsRectEmpty(&impl_->dirty)) {
+                impl_->dirty = area;
+            } else {
+                RECT merged{};
+                UnionRect(&merged, &impl_->dirty, &area);
+                impl_->dirty = merged;
+            }
+        }
+    }
+    scheduleRepaint();
+}
+
+// 一帧在途时不重复起定时器；间隔按上一帧耗时自适应：
+// 画面便宜时跑满 60fps，单帧变贵时就让间隔跟着耗时走，避免刷新消息越积越多。
+void AiTab::scheduleRepaint() {
     if (impl_->repaintPending) return;
     impl_->repaintPending = true;
-    SetTimer(window_, kRepaintTimer, kRepaintIntervalMs, nullptr);
+    int interval = kRepaintIntervalMs;
+    if (impl_->lastPaintMs > interval) interval = std::min(impl_->lastPaintMs, 200);
+    SetTimer(window_, kRepaintTimer, interval, nullptr);
 }
 
 void AiTab::postEvent(EventKind kind, std::wstring a, std::wstring b, std::wstring c, bool ok,
@@ -1490,7 +1523,7 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 if (impl_->assistantIndex == none) impl_->assistantIndex = panel_.beginAssistant();
                 panel_.appendAssistant(impl_->assistantIndex, text);
             }
-            requestRepaint();
+            requestChatRepaint();
             return 0;
         }
 
@@ -1549,8 +1582,21 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             if (impl_->backDc && impl_->backBmp) {
                 HGDIOBJ old = SelectObject(impl_->backDc, impl_->backBmp);
-                paint(impl_->backDc);
-                BitBlt(dc, 0, 0, width, height, impl_->backDc, 0, 0, SRCCOPY);
+                // 只重画更新区；设置页/整窗失效时退化成全量
+                RECT area = ps.rcPaint;
+                const bool full = settingsOpen_ || IsRectEmpty(&area) ||
+                                  (area.left <= 0 && area.top <= 0 && area.right >= width &&
+                                   area.bottom >= height);
+                const ULONGLONG started = GetTickCount64();
+                paint(impl_->backDc, full ? nullptr : &area);
+                if (full) {
+                    BitBlt(dc, 0, 0, width, height, impl_->backDc, 0, 0, SRCCOPY);
+                } else {
+                    // 背景填充是整块的，脏区外也必须刷回去，否则圆角/底色会残留
+                    BitBlt(dc, area.left, area.top, area.right - area.left,
+                           area.bottom - area.top, impl_->backDc, area.left, area.top, SRCCOPY);
+                }
+                impl_->lastPaintMs = static_cast<int>(GetTickCount64() - started);
                 SelectObject(impl_->backDc, old);
             } else {
                 paint(dc);
@@ -1639,9 +1685,14 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             if (wParam == kRepaintTimer) {
                 KillTimer(window_, kRepaintTimer);
                 impl_->repaintPending = false;
-                InvalidateRect(window_, nullptr, FALSE);
-            } else if (wParam == kCaretTimer && panel_.inputFocused()) {
-                InvalidateRect(window_, nullptr, FALSE);
+                const bool full = impl_->dirtyFull || IsRectEmpty(&impl_->dirty);
+                RECT area = impl_->dirty;
+                impl_->dirty = RECT{};
+                impl_->dirtyFull = false;
+                InvalidateRect(window_, full ? nullptr : &area, FALSE);
+            } else if (wParam == kCaretTimer && panel_.inputFocused() && !settingsOpen_) {
+                const RECT caretArea = panel_.composerRect();
+                InvalidateRect(window_, &caretArea, FALSE);
             }
             return 0;
 
@@ -1766,9 +1817,9 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     }
 }
 
-void AiTab::paint(HDC dc) {
+void AiTab::paint(HDC dc, const RECT* dirty) {
     if (!settingsOpen_) {
-        panel_.paint(dc);
+        panel_.paint(dc, dirty);
         return;
     }
 

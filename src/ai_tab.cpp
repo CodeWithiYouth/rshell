@@ -430,8 +430,9 @@ void AiTab::initialize(HWND) {
         panel_.clear();
         impl_->assistantIndex = static_cast<std::size_t>(-1);
         {
-            // 清空 = 开一段新对话：标题/标签/文件名都重置，但保留 autoLoadHost，
-            // 否则刚清掉的这段会被「自动接上」立刻载回来
+            // 「新建」= 开一段新对话：清面板与上下文，标题/标签/文件名重置，
+            // 但保留 autoLoadHost，否则刚放下的这段会被「自动接上」立刻载回来；
+            // 远端已有文件不动，旧对话留在「历史」里
             std::lock_guard<std::mutex> meta(impl_->metaMutex);
             impl_->sessionFile.clear();
             impl_->sessionTitle.clear();
@@ -1128,7 +1129,7 @@ void AiTab::applySession(const std::string& file, const SessionRecord& record, b
     if (announce) {
         panel_.addNotice(L"已接上上次对话「" + toWideText(record.title) + L"」，共 " +
                          std::to_wstring(record.messages.size()) +
-                         L" 条。点「历史」可以换一段，点「清空」开始新的。");
+                         L" 条。点「历史」可以换一段，点「新建」开始新的。");
     }
     updateWelcome();
     requestRepaint();

@@ -642,7 +642,8 @@ void ChatPanel::drawHeader(HDC dc) {
         hits_.push_back({rect, hit, 0});
         right = rect.left - 6;
     };
-    addButton(L"清空", Hit::Clear, hover_ == Hit::Clear);
+    // 「新建」= 开一段新对话（旧对话留在「历史」里，不会删远端文件）
+    addButton(L"新建", Hit::Clear, hover_ == Hit::Clear);
     addButton(L"设置", Hit::Settings, hover_ == Hit::Settings);
     addButton(fullScreen_ ? L"停靠" : L"全屏", Hit::Full, hover_ == Hit::Full);
 

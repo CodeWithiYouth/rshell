@@ -36,6 +36,8 @@ struct AiSettings {
     bool autoApprove = false;
     // 每轮结束把对话存到远端 ~/.rshell/sessions/（历史会话功能）。默认开
     bool saveSessions = true;
+    // 联网搜索后端：空 = 关闭；tinyfish / exa（Key 按后端分别存保险库）
+    std::string searchProvider;
     int maxSteps = 16;           // 单轮工具调用上限
 };
 
@@ -54,12 +56,21 @@ bool saveAiSettings(const AiSettings& settings, std::string* error = nullptr,
 
 // 保险库里的条目名
 constexpr const char* kApiKeyEntry = "ai.apiKey";
+// 搜索 Key 按后端分开存：ai.searchApiKey.<provider>，不写进 ini
+std::string searchKeyEntry(const std::string& provider);
 
 // 保险库未解锁或没有该条目时返回 false
 bool loadApiKey(Vault& vault, std::string& out);
 // 保险库必须已解锁；写入后调用方负责 save()
 bool saveApiKey(Vault& vault, const std::string& key, std::string* error = nullptr);
 bool clearApiKey(Vault& vault);
+
+// 搜索 Key 的读写（按后端分开；provider 为空表示关闭搜索）
+std::string searchKeyEntry(const std::string& provider);
+bool loadSearchKey(Vault& vault, const std::string& provider, std::string& out);
+bool saveSearchKey(Vault& vault, const std::string& provider, const std::string& key,
+                    std::string* error = nullptr);
+bool clearSearchKey(Vault& vault, const std::string& provider);
 
 }  // namespace ai
 }  // namespace rshell

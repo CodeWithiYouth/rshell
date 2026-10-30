@@ -226,6 +226,7 @@ if(WIN32)
         src/ai_tools.cpp
         src/ai_agent.cpp
         src/ai_session.cpp
+        src/ai_search.cpp
         src/ai_settings.cpp
         src/md.cpp
     )

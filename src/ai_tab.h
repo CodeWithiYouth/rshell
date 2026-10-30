@@ -166,6 +166,8 @@ private:
     // 读远端列表：limit=1 是自动接上，20 是历史按钮
     void startSessionRead(std::uintptr_t hostId, int limit);
     void applySession(const std::string& file, const SessionRecord& record, bool announce);
+    // 把当前搜索后端 + Key 应用到工具层（没配好 = 不提供 web_search）
+    void applySearch();
 
     struct Impl;
     std::unique_ptr<Impl> impl_;   // 隐藏 Client/Agent/工具链，避免头文件依赖

@@ -34,6 +34,7 @@
 #include "ai_client.h"
 #include "ai_json.h"
 #include "ai_settings.h"
+#include "ai_search.h"
 #include "ai_session.h"
 #include "ai_tools.h"
 #include "md.h"
@@ -2108,6 +2109,58 @@ void testAiSessions() {
     CHECK_EQ(ai::readSessions(store, dir, 1, storeError).size(), static_cast<std::size_t>(1));
 }
 
+// 联网搜索：编码、两种后端的响应解析、格式化
+void testAiSearch() {
+    using namespace rshell::ai;
+
+    CHECK_EQ(tinyfishPath("hello world"), std::string("/?query=hello+world"));
+    CHECK(tinyfishPath("中文").find("%E4%B8%AD") != std::string::npos);
+    CHECK(tinyfishUrl("q").rfind("https://api.search.tinyfish.ai", 0) == 0);
+    CHECK(searchProviderId(searchProviderFromId("exa")) == std::string("exa"));
+    CHECK(searchProviderId(searchProviderFromId("tinyfish")) == std::string("tinyfish"));
+    CHECK(searchProviderFromId("") == SearchProvider::None);
+    CHECK(searchProviderFromId("nope") == SearchProvider::None);
+
+    const char* tiny = R"({"query":"x","results":[
+        {"title":"A","url":"https://a.example/doc","snippet":"sa","site_name":"a.example","date":"2026-06-01"},
+        {"title":"B","url":"","snippet":"drop me"},
+        {"title":"C","url":"https://c.example","snippet":"sc"}]})";
+    std::vector<SearchHit> hits;
+    std::string error;
+    CHECK(parseTinyfishResponse(tiny, hits, error));
+    CHECK_EQ(hits.size(), static_cast<std::size_t>(2));  // 没有 URL 的结果丢掉
+    CHECK_EQ(hits[0].site, std::string("a.example"));
+    CHECK_EQ(hits[0].date, std::string("2026-06-01"));
+
+    // Exa：请求体走 JSON，响应里 highlights 拼成摘要
+    const std::string exaBody = exaRequestBody("q", 5);
+    CHECK(exaBody.find("\"numResults\":5") != std::string::npos);
+    CHECK(exaBody.find("highlights") != std::string::npos);
+
+    const char* exa = R"({"requestId":"r","results":[
+        {"title":"Exa hit","url":"https://www.exa.ai/blog/x","publishedDate":"2026-05-02T00:00:00Z",
+         "highlights":["第一句","第二句"]},
+        {"title":"Only text","url":"https://b.example/p","text":"正文摘要"}]})";
+    hits.clear();
+    CHECK(parseExaResponse(exa, hits, error));
+    CHECK_EQ(hits.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(hits[0].site, std::string("exa.ai"));  // www. 前缀去掉
+    CHECK(hits[0].snippet.find("第一句") != std::string::npos);
+    CHECK_EQ(hits[1].snippet, std::string("正文摘要"));  // 没有 highlights 就用 text
+    CHECK_EQ(hits[0].date.substr(0, 10), std::string("2026-05-02"));
+
+    const std::string text = formatSearchHits(hits, 4096);
+    CHECK(text.find("1. Exa hit") != std::string::npos);
+    CHECK(text.find("b.example") != std::string::npos);
+    const std::string cut = formatSearchHits(hits, 20);
+    CHECK(cut.size() <= 26 && !cut.empty());  // 截断后只多一个省略号
+
+    hits.clear();
+    CHECK(!parseExaResponse("{oops", hits, error));
+    CHECK(!error.empty());
+    CHECK(!parseTinyfishResponse("{}", hits, error));  // 没有 results
+}
+
 void testAiToolRegistry() {    FakeToolBackend backend;
     backend.files["/tmp/a.txt"] = "hello";
 
@@ -2145,6 +2198,35 @@ void testAiToolRegistry() {    FakeToolBackend backend;
     CHECK_EQ(namedTags.size(), static_cast<std::size_t>(2));
     CHECK_EQ(backend.commands.size(), commandsBefore);  // 一条命令都没打到远端
     CHECK(registry.describe("name_session", R"({"title":"排查 502"})").kind == ai::ToolKind::Read);
+
+    // 联网搜索：没注入回调时模型看不到这个工具
+    CHECK(!registry.searchEnabled());
+    for (const auto& spec : registry.specs()) CHECK(spec.name != std::string("web_search"));
+
+    int searches = 0;
+    registry.setSearch([&](const std::string& query, int maxResults,
+                           std::vector<ai::SearchHit>& out, std::string&) {
+        ++searches;
+        ai::SearchHit hit;
+        hit.title = "命中";
+        hit.url = "https://e.example/doc";
+        hit.snippet = "摘要";
+        hit.site = "e.example";
+        out.push_back(hit);
+        return query == "ok" && maxResults == 3;
+    });
+    CHECK(registry.searchEnabled());
+    bool searchListed = false;
+    for (const auto& spec : registry.specs()) searchListed = searchListed || spec.name == "web_search";
+    CHECK(searchListed);
+
+    const ai::ToolResult searched =
+        registry.execute("web_search", R"({"query":"ok","max_results":3})");
+    CHECK(searched.ok);
+    CHECK_EQ(searches, 1);
+    CHECK(searched.json.find("https://e.example/doc") != std::string::npos);
+    CHECK(searched.json.find("外部内容") != std::string::npos);  // 提示注入的护栏
+    CHECK(registry.describe("web_search", R"({"query":"ok"})").kind == ai::ToolKind::Read);
 
     // 审批卡片摘要
     const ai::ToolRequestInfo info =
@@ -2766,6 +2848,7 @@ int main() {
     testAiSse();
     testAiStreamAccumulator();
     testAiToolPolicy();
+    testAiSearch();
     testAiSessions();
     testAiToolRegistry();
     testAiAgentReadsWithoutApproval();

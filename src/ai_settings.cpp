@@ -86,6 +86,8 @@ AiSettings loadAiSettings(const std::string& path) {
                                      iequals(value, "no"));
         } else if (key == "max_steps" || key == "maxsteps") {
             settings.maxSteps = parseInt(value, settings.maxSteps);
+        } else if (key == "search_provider" || key == "searchprovider") {
+            if (value == "tinyfish" || value == "exa") settings.searchProvider = value;
         } else if (key == "save_sessions" || key == "savesessions") {
             // 默认开：只有明确写成 0/false/no 才关
             settings.saveSessions = !(value == "0" || iequals(value, "false") ||
@@ -120,6 +122,7 @@ bool saveAiSettings(const AiSettings& settings, std::string* error, const std::s
     out << "redact_secrets=" << (settings.redactSecrets ? "1" : "0") << "\n";
     out << "auto_approve=" << (settings.autoApprove ? "1" : "0") << "\n";
     out << "save_sessions=" << (settings.saveSessions ? "1" : "0") << "\n";
+    out << "search_provider=" << settings.searchProvider << "\n";
     out << "max_steps=" << settings.maxSteps << "\n";
     if (!out.good()) {
         if (error) *error = "写入配置文件失败：" + file;
@@ -159,6 +162,44 @@ bool clearApiKey(Vault& vault) {
     if (!vault.unlocked()) return false;
     if (!vault.has(kApiKeyEntry)) return false;
     return vault.remove(kApiKeyEntry);
+}
+
+// 搜索 Key 与模型 Key 同源：都只放在保险库里，不写 ini；按后端分开存，
+// 这样在 TinyFish / Exa 之间来回切不用重新填。
+std::string searchKeyEntry(const std::string& provider) {
+    return std::string("ai.searchApiKey.") + (provider.empty() ? "none" : provider);
+}
+
+bool loadSearchKey(Vault& vault, const std::string& provider, std::string& out) {
+    if (provider.empty() || !vault.unlocked()) return false;
+    const std::string entry = searchKeyEntry(provider);
+    if (!vault.has(entry)) return false;
+    return vault.get(entry, out) && !out.empty();
+}
+
+bool saveSearchKey(Vault& vault, const std::string& provider, const std::string& key,
+                   std::string* error) {
+    if (provider.empty()) {
+        if (error) *error = "没有选择搜索服务商";
+        return false;
+    }
+    if (!vault.unlocked()) {
+        if (error) *error = "保险库未解锁，无法保存搜索 Key";
+        return false;
+    }
+    if (key.empty()) {
+        if (error) *error = "搜索 Key 为空";
+        return false;
+    }
+    vault.set(searchKeyEntry(provider), key);
+    return true;
+}
+
+bool clearSearchKey(Vault& vault, const std::string& provider) {
+    if (provider.empty() || !vault.unlocked()) return false;
+    const std::string entry = searchKeyEntry(provider);
+    if (!vault.has(entry)) return false;
+    return vault.remove(entry);
 }
 
 }  // namespace ai

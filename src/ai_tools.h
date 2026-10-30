@@ -10,10 +10,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "ai_client.h"
+#include "ai_search.h"
 
 namespace rshell::ai {
 
@@ -132,6 +134,13 @@ public:
                                             std::string& error)>;
     void setSessionNamer(SessionNamer namer) { sessionNamer_ = std::move(namer); }
 
+    // web_search 的落点：真正的网络请求由 AiTab 注入（这一层保持离线可单测）。
+    // 不设置回调 = 不提供这个工具，模型看不到它。
+    using SearchFn = std::function<bool(const std::string& query, int maxResults,
+                                        std::vector<SearchHit>& out, std::string& error)>;
+    void setSearch(SearchFn fn);
+    bool searchEnabled() const;
+
     const ToolPolicy& policy() const { return policy_; }
     void setPolicy(ToolPolicy policy) { policy_ = std::move(policy); }
 
@@ -141,10 +150,13 @@ private:
     ToolResult writeFile(const Json& args);
     ToolResult listDir(const Json& args);
     ToolResult nameSession(const Json& args);
+    ToolResult webSearch(const Json& args);
 
     ToolBackend& backend_;
     ToolPolicy policy_;
     SessionNamer sessionNamer_;
+    SearchFn search_;
+    mutable std::mutex searchMutex_;  // 设置页可能在工具跑着的时候换后端
 };
 
 // ---------------------------------------------------------------- 可单测的纯函数

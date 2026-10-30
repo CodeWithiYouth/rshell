@@ -726,6 +726,66 @@ void fsCollapseRegression() {
     check(visible(g_app.list), "file list is back");
 }
 
+// ☰ 主菜单改成二级菜单后：顶层只有分组，命令一个都不能丢
+void mainMenuRegression() {
+    const auto items = buildMainMenu();
+    check(items.size() == 8, "main menu keeps six groups, one separator and exit");
+    const wchar_t* groups[] = {L"会话", L"标签", L"编辑", L"视图", L"工具", L"帮助"};
+    for (int i = 0; i < 6; ++i) {
+        const auto& group = items[static_cast<std::size_t>(i)];
+        check(group.text == groups[i], "groups keep their order");
+        check(group.id == 0 && !group.separator, "a group row only opens its submenu");
+        check(!group.children.empty(), "every group has a submenu");
+        check(!group.children.front().separator, "a submenu never starts with a separator");
+        check(!group.children.back().separator, "a submenu never ends with a separator");
+    }
+    check(items[6].separator, "exit is separated from the groups");
+    check(!items[7].separator && items[7].id == IDM_EXIT && items[7].children.empty(),
+          "exit stays a plain top-level item");
+
+    // 叶子项总数与原来的一字排开菜单一致，而且没有重复 id
+    int leaves = 0;
+    std::vector<int> ids;
+    for (const auto& item : items) {
+        if (item.separator) continue;
+        if (item.children.empty()) {
+            ++leaves;
+            ids.push_back(item.id);
+        }
+        for (const auto& child : item.children) {
+            if (child.separator) continue;
+            ++leaves;
+            ids.push_back(child.id);
+        }
+    }
+    check(leaves == 23, "every command of the old flat menu is still reachable");
+    check(std::find(ids.begin(), ids.end(), 0) == ids.end(), "no reachable row is a placeholder id");
+    std::sort(ids.begin(), ids.end());
+    check(std::adjacent_find(ids.begin(), ids.end()) == ids.end(), "no command appears twice");
+
+    // 顶层高度：233dp 左右，不能再撑满整屏（老菜单 708dp）
+    const int height = popup::contentHeight(items);
+    HDC dc = GetDC(g_app.main);
+    const int width = popup::menuWidth(dc, items);
+    ReleaseDC(g_app.main, dc);
+    check(height <= dp(250), "the top-level menu no longer fills the window");
+    check(height >= dp(180), "the top-level menu still shows all six groups");
+    check(width >= dp(200), "the menu keeps a clickable minimum width");
+
+    // 分组里的动态文案跟着状态走
+    const auto& session = items[0].children;
+    check(session[0].id == IDM_OPEN && session[0].shortcut == L"Ctrl+O",
+          "session management keeps its shortcut");
+    check(!g_app.shell->running(), "the probe is not connected");
+    check(session[2].id == IDM_CONNECT && session[2].text == L"连接…",
+          "connect/disconnect label follows the connection state");
+    const auto& tools = items[4].children;
+    check(tools.size() == 2 && tools[0].id == IDM_CHECK_UPDATE, "tools keeps the update commands");
+    check(tools[1].text == (g_app.updateCheckOnStart ? L"启动时自动检查更新（已开）"
+                                                     : L"启动时自动检查更新（已关）"),
+          "the startup check toggle shows its state");
+}
+
 // 检查更新：发现新版本时，标题栏出现可点击的提示胶囊
 void updateCheckRegression() {
     ReleaseInfo newer;
@@ -831,6 +891,7 @@ int main(int argc, char** argv) {
         fsLoadingRegression();
         splitterRegression();
         fsCollapseRegression();
+        mainMenuRegression();
         updateCheckRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();

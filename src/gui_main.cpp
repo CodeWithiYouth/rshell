@@ -2988,6 +2988,9 @@ void handleDrawItem(HWND hwnd, const DRAWITEMSTRUCT& dis) {
 // 细线（背景白、文字又按暗色取色），既看不清也没法点。这里用自绘弹出窗口实现同样的
 // 交互：hover 高亮、右对齐快捷键、上下键/回车/Esc、点空白或失焦关闭。
 // 标题栏 ☰ 主菜单和文件区右键菜单共用这一份实现。
+//
+// 二级菜单（Item::children 非空）用另一个同级弹窗画，父窗口始终持有焦点：
+// 鼠标悬停即展开，→ 进入子菜单、← 收起，Esc 先收子菜单再关整个菜单。
 namespace popup {
 
 struct Item {
@@ -2997,6 +3000,8 @@ struct Item {
     bool separator = false;
     bool danger = false;
     bool enabled = true;
+    // 非空 = 二级菜单：这一行只负责展开，本身不执行命令（id 通常为 0）
+    std::vector<Item> children;
 };
 
 struct State {
@@ -3005,11 +3010,18 @@ struct State {
     int hover = -1;
     int result = 0;
     bool done = false;
+    // 当前展开的二级菜单
+    HWND child = nullptr;
+    std::vector<Item> childItems;
+    int openIndex = -1;    // 展开的是父级第几项
+    int childHover = -1;
+    int suppressed = -1;   // 被 ← 收起的项：鼠标还停在上面时不自动再展开
 };
 
 State g_popup;
 
 constexpr wchar_t kPopupClass[] = L"RshellPopupMenu";
+constexpr wchar_t kSubmenuClass[] = L"RshellPopupSubmenu";
 
 int itemHeight() { return dp(30); }
 int separatorHeight() { return dp(11); }
@@ -3022,25 +3034,38 @@ int contentHeight(const std::vector<Item>& items) {
     return height;
 }
 
+// 菜单宽度：文字 + 右侧（快捷键/子菜单箭头）一列，父子两级用同一套规则
+int menuWidth(HDC dc, const std::vector<Item>& items) {
+    int textW = 0;
+    int tailW = 0;
+    for (const Item& item : items) {
+        if (item.separator) continue;
+        textW = std::max(textW, textWidth(dc, item.text, g_app.uiFont));
+        tailW = std::max(tailW, textWidth(dc, item.shortcut, g_app.tinyFont));
+        if (!item.children.empty()) tailW = std::max(tailW, dp(12));
+    }
+    return std::max(dp(200), dp(30) + textW + (tailW > 0 ? tailW + dp(28) : 0));
+}
+
 // 第 index 项的矩形（相对弹出窗口客户区）
-RECT itemRect(const RECT& client, int index) {
+RECT itemRect(const std::vector<Item>& items, const RECT& client, int index) {
     int y = padY();
     for (int i = 0; i < index; ++i) {
-        const Item& prev = g_popup.items[static_cast<std::size_t>(i)];
+        const Item& prev = items[static_cast<std::size_t>(i)];
         y += prev.separator ? separatorHeight() : itemHeight();
     }
-    const Item& item = g_popup.items[static_cast<std::size_t>(index)];
+    const Item& item = items[static_cast<std::size_t>(index)];
     const int h = item.separator ? separatorHeight() : itemHeight();
     return RECT{padX(), y, client.right - padX(), y + h};
 }
 
-int hitItem(HWND hwnd, POINT pt) {
+int hitItem(const std::vector<Item>& items, HWND hwnd, POINT pt) {
     RECT client;
     GetClientRect(hwnd, &client);
-    for (int i = 0; i < static_cast<int>(g_popup.items.size()); ++i) {
-        const Item& item = g_popup.items[static_cast<std::size_t>(i)];
+    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+        const Item& item = items[static_cast<std::size_t>(i)];
         if (item.separator || !item.enabled) continue;
-        const RECT rc = itemRect(client, i);
+        const RECT rc = itemRect(items, client, i);
         if (PtInRect(&rc, pt)) return i;
     }
     return -1;
@@ -3068,11 +3093,22 @@ void moveHover(int step) {
     }
 }
 
-}  // namespace popup
+// 子菜单内部的上下移动；-1 表示还没进入任何一项
+void moveChildHover(int step) {
+    const int n = static_cast<int>(g_popup.childItems.size());
+    if (n <= 0) return;
+    int index = g_popup.childHover < 0 && step < 0 ? 0 : g_popup.childHover;
+    for (int guard = 0; guard < n; ++guard) {
+        index = (index + step + n) % n;
+        const Item& item = g_popup.childItems[static_cast<std::size_t>(index)];
+        if (!item.separator && item.enabled) {
+            g_popup.childHover = index;
+            return;
+        }
+    }
+}
 
-namespace popup {
-
-void paintPopup(HWND hwnd) {
+void paintMenu(HWND hwnd, const std::vector<Item>& items, int hover) {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(hwnd, &ps);
     RECT client;
@@ -3088,15 +3124,15 @@ void paintPopup(HWND hwnd) {
     fillRect(mem, client, ui::bgCard);
     fillRoundRect(mem, client, dp(8), ui::bgCard, ui::border);
 
-    for (int i = 0; i < static_cast<int>(g_popup.items.size()); ++i) {
-        const Item& item = g_popup.items[static_cast<std::size_t>(i)];
-        const RECT rc = itemRect(client, i);
+    for (int i = 0; i < static_cast<int>(items.size()); ++i) {
+        const Item& item = items[static_cast<std::size_t>(i)];
+        const RECT rc = itemRect(items, client, i);
         if (item.separator) {
             drawHLine(mem, rc.left + dp(6), rc.right - dp(6), (rc.top + rc.bottom) / 2,
                       ui::borderSoft);
             continue;
         }
-        if (i == g_popup.hover) {
+        if (i == hover) {
             RECT hi = rc;
             hi.top += dp(1);
             hi.bottom -= dp(1);
@@ -3107,6 +3143,12 @@ void paintPopup(HWND hwnd) {
         RECT textRc = rc;
         textRc.left += dp(12);
         textRc.right -= dp(12);
+        if (!item.children.empty()) {
+            // 子菜单箭头占最右一格，快捷键（如果有）往左让位
+            drawText(mem, L"›", RECT{textRc.right - dp(10), rc.top, textRc.right, rc.bottom},
+                     ui::textDim, g_app.uiFontBold, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+            textRc.right -= dp(22);
+        }
         if (!item.shortcut.empty()) {
             const int shortcutW = textWidth(mem, item.shortcut, g_app.tinyFont);
             drawText(mem, item.shortcut,
@@ -3125,51 +3167,225 @@ void paintPopup(HWND hwnd) {
     EndPaint(hwnd, &ps);
 }
 
-LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+void destroySubmenu() {
+    if (g_popup.child && IsWindow(g_popup.child)) DestroyWindow(g_popup.child);
+    g_popup.child = nullptr;
+    g_popup.childItems.clear();
+    g_popup.openIndex = -1;
+    g_popup.childHover = -1;
+}
+
+void openSubmenu(int index) {
+    if (!g_popup.hwnd || index < 0 || index >= static_cast<int>(g_popup.items.size())) return;
+    const Item& item = g_popup.items[static_cast<std::size_t>(index)];
+    if (item.children.empty()) {
+        destroySubmenu();
+        return;
+    }
+    if (index == g_popup.openIndex && g_popup.child) return;
+
+    destroySubmenu();
+    g_popup.childItems = item.children;
+    g_popup.openIndex = index;
+
+    // 与父项上沿对齐；右边放不下就翻到左边（☰ 就在右上角，实际基本都往左翻）
+    RECT client;
+    GetClientRect(g_popup.hwnd, &client);
+    RECT anchor = itemRect(g_popup.items, client, index);
+    POINT pt{anchor.left, anchor.top - padY()};
+    ClientToScreen(g_popup.hwnd, &pt);
+
+    HDC dc = GetDC(g_popup.hwnd);
+    const int width = menuWidth(dc, g_popup.childItems);
+    ReleaseDC(g_popup.hwnd, dc);
+    const int height = contentHeight(g_popup.childItems);
+
+    RECT parent{};
+    GetWindowRect(g_popup.hwnd, &parent);
+    MONITORINFO mi{};
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
+
+    int x = parent.right + dp(2);
+    if (x + width > mi.rcWork.right) x = parent.left - width - dp(2);
+    int y = pt.y;
+    if (y + height > mi.rcWork.bottom) y = mi.rcWork.bottom - height;
+    x = std::max<int>(x, mi.rcWork.left);
+    y = std::max<int>(y, mi.rcWork.top);
+
+    g_popup.child = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                                    kSubmenuClass, L"", WS_POPUP, x, y, width, height,
+                                    g_popup.hwnd, nullptr, g_app.inst, nullptr);
+    if (!g_popup.child) {
+        g_popup.openIndex = -1;
+        g_popup.childItems.clear();
+        return;
+    }
+    dlg::applyRoundRegion(g_popup.child, width, height);
+    ShowWindow(g_popup.child, SW_SHOWNOACTIVATE);
+}
+
+// 二级菜单窗口：不抢焦点（父窗口的键盘处理继续有效），点中即返回结果
+LRESULT CALLBACK submenuProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_ERASEBKGND:
             return 1;
         case WM_PAINT:
-            paintPopup(hwnd);
+            paintMenu(hwnd, g_popup.childItems, g_popup.childHover);
             return 0;
         case WM_MOUSEMOVE: {
-            const int index = hitItem(hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-            if (index != g_popup.hover) {
-                g_popup.hover = index;
+            const int index = hitItem(g_popup.childItems, hwnd,
+                                      POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            if (index != g_popup.childHover) {
+                g_popup.childHover = index;
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             return 0;
         }
         case WM_LBUTTONDOWN: {
+            const int index = hitItem(g_popup.childItems, hwnd,
+                                      POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            if (index >= 0) finish(g_popup.childItems[static_cast<std::size_t>(index)].id);
+            return 0;
+        }
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_CLOSE:
+            finish(0);
+            return 0;
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT:
+            paintMenu(hwnd, g_popup.items, g_popup.hover);
+            return 0;
+        case WM_MOUSEMOVE: {
+            const int index =
+                hitItem(g_popup.items, hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            if (index != g_popup.hover) {
+                g_popup.hover = index;
+                g_popup.suppressed = -1;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (index >= 0 && index != g_popup.suppressed &&
+                !g_popup.items[static_cast<std::size_t>(index)].children.empty()) {
+                openSubmenu(index);
+            } else if (index >= 0 && g_popup.openIndex != index) {
+                destroySubmenu();
+            } else if (index < 0 && g_popup.openIndex >= 0) {
+                // 移到分隔线/空白处：子菜单跟着收起
+                destroySubmenu();
+            }
+            return 0;
+        }
+        case WM_LBUTTONDOWN: {
             // 按下即选中：菜单项不需要“按住拖动”
-            const int index = hitItem(hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-            finish(index >= 0 ? g_popup.items[static_cast<std::size_t>(index)].id : 0);
+            const int index =
+                hitItem(g_popup.items, hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            if (index < 0) {
+                finish(0);
+                return 0;
+            }
+            const Item& item = g_popup.items[static_cast<std::size_t>(index)];
+            if (!item.children.empty()) {
+                openSubmenu(index);
+                return 0;
+            }
+            finish(item.id);
             return 0;
         }
         case WM_KEYDOWN: {
             if (wp == VK_ESCAPE) {
-                finish(0);
+                // Esc 分两级：先收子菜单，再关整个菜单
+                if (g_popup.child) {
+                    g_popup.suppressed = g_popup.openIndex;
+                    destroySubmenu();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                } else {
+                    finish(0);
+                }
+                return 0;
+            }
+            if (wp == VK_RIGHT) {
+                if (g_popup.hover >= 0 &&
+                    !g_popup.items[static_cast<std::size_t>(g_popup.hover)].children.empty()) {
+                    openSubmenu(g_popup.hover);
+                    g_popup.suppressed = -1;
+                    if (g_popup.child) {
+                        moveChildHover(1);
+                        InvalidateRect(g_popup.child, nullptr, FALSE);
+                    }
+                }
+                return 0;
+            }
+            if (wp == VK_LEFT) {
+                if (g_popup.child) {
+                    g_popup.suppressed = g_popup.openIndex;
+                    destroySubmenu();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
                 return 0;
             }
             if (wp == VK_RETURN || wp == VK_SPACE) {
-                if (g_popup.hover >= 0)
-                    finish(g_popup.items[static_cast<std::size_t>(g_popup.hover)].id);
+                if (g_popup.child && g_popup.childHover >= 0) {
+                    finish(g_popup.childItems[static_cast<std::size_t>(g_popup.childHover)].id);
+                    return 0;
+                }
+                if (g_popup.hover >= 0) {
+                    const Item& item = g_popup.items[static_cast<std::size_t>(g_popup.hover)];
+                    if (!item.children.empty()) {
+                        openSubmenu(g_popup.hover);
+                        if (g_popup.child) {
+                            moveChildHover(1);
+                            InvalidateRect(g_popup.child, nullptr, FALSE);
+                        }
+                    } else {
+                        finish(item.id);
+                    }
+                }
                 return 0;
             }
-            if (wp == VK_DOWN) {
-                moveHover(1);
-                InvalidateRect(hwnd, nullptr, FALSE);
-                return 0;
-            }
-            if (wp == VK_UP) {
-                moveHover(-1);
-                InvalidateRect(hwnd, nullptr, FALSE);
+            if (wp == VK_DOWN || wp == VK_UP) {
+                const int step = wp == VK_DOWN ? 1 : -1;
+                if (g_popup.child) {
+                    moveChildHover(step);
+                    InvalidateRect(g_popup.child, nullptr, FALSE);
+                } else {
+                    moveHover(step);
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    // 键盘走过带子菜单的项时跟着展开，和鼠标悬停保持一致
+                    if (g_popup.hover >= 0 &&
+                        !g_popup.items[static_cast<std::size_t>(g_popup.hover)].children.empty()) {
+                        openSubmenu(g_popup.hover);
+                    } else {
+                        destroySubmenu();
+                    }
+                }
                 return 0;
             }
             if (wp == VK_HOME || wp == VK_END) {
+                if (g_popup.child) {
+                    g_popup.childHover = wp == VK_HOME ? -1 : 0;
+                    moveChildHover(wp == VK_HOME ? 1 : -1);
+                    InvalidateRect(g_popup.child, nullptr, FALSE);
+                    return 0;
+                }
                 g_popup.hover = wp == VK_HOME ? -1 : 0;
                 moveHover(wp == VK_HOME ? 1 : -1);
                 InvalidateRect(hwnd, nullptr, FALSE);
+                if (g_popup.hover >= 0 &&
+                    !g_popup.items[static_cast<std::size_t>(g_popup.hover)].children.empty()) {
+                    openSubmenu(g_popup.hover);
+                } else {
+                    destroySubmenu();
+                }
                 return 0;
             }
             return 0;
@@ -3201,6 +3417,9 @@ int run(HWND owner, POINT screenPt, const std::vector<Item>& items) {
         wc.lpszClassName = kPopupClass;
         wc.style = CS_DROPSHADOW;
         RegisterClassExW(&wc);
+        wc.lpfnWndProc = submenuProc;
+        wc.lpszClassName = kSubmenuClass;
+        RegisterClassExW(&wc);
         registered = true;
     }
     if (items.empty()) return 0;
@@ -3209,16 +3428,8 @@ int run(HWND owner, POINT screenPt, const std::vector<Item>& items) {
     g_popup.items = items;
 
     HDC dc = GetDC(owner ? owner : nullptr);
-    int textW = 0;
-    int shortcutW = 0;
-    for (const Item& item : items) {
-        if (item.separator) continue;
-        textW = std::max(textW, textWidth(dc, item.text, g_app.uiFont));
-        shortcutW = std::max(shortcutW, textWidth(dc, item.shortcut, g_app.tinyFont));
-    }
+    const int width = menuWidth(dc, items);
     ReleaseDC(owner, dc);
-
-    const int width = std::max(dp(200), dp(30) + textW + (shortcutW > 0 ? shortcutW + dp(28) : 0));
     const int height = contentHeight(items);
 
     MONITORINFO mi{};
@@ -3250,6 +3461,7 @@ int run(HWND owner, POINT screenPt, const std::vector<Item>& items) {
     // 先把结果取出来再销毁窗口：销毁会触发 WM_ACTIVATE(WA_INACTIVE) 走一遍清场逻辑，
     // 提前取走才不会被这次清场覆盖成 0。
     const int result = g_popup.result;
+    destroySubmenu();
     if (IsWindow(window)) DestroyWindow(window);
     g_popup.hwnd = nullptr;
     if (owner && IsWindow(owner)) SetForegroundWindow(owner);
@@ -8488,56 +8700,97 @@ void vaultCommand() {
     InvalidateRect(g_app.main, nullptr, FALSE);
 }
 
-void openMainMenu(HWND hwnd) {
+// ☰ 主菜单的内容：顶层只放分组，具体命令收进二级菜单。
+// 拆成独立函数是为了让探针能直接检查分组结构（不用真的弹出窗口跑消息循环）。
+std::vector<popup::Item> buildMainMenu() {
     const bool connected = g_app.shell->running();
     const bool busy = g_app.connecting;
 
-    std::vector<popup::Item> items;
-    auto add = [&items](int id, const wchar_t* text, const wchar_t* shortcut = L"",
-                        bool enabled = true, bool danger = false) {
+    auto leaf = [](int id, const wchar_t* text, const wchar_t* shortcut = L"",
+                   bool enabled = true, bool danger = false) {
         popup::Item item;
         item.id = id;
         item.text = text;
         item.shortcut = shortcut;
         item.enabled = enabled;
         item.danger = danger;
-        items.push_back(std::move(item));
+        return item;
     };
-    auto sep = [&items]() {
+    auto sep = []() {
         popup::Item item;
         item.separator = true;
-        items.push_back(std::move(item));
+        return item;
+    };
+    auto group = [](const wchar_t* text, std::vector<popup::Item> children) {
+        popup::Item item;
+        item.text = text;
+        item.children = std::move(children);
+        return item;
     };
 
-    add(IDM_OPEN, L"会话管理…", L"Ctrl+O");
-    add(IDM_RECONNECT, L"重新连接", L"Ctrl+Shift+R", !connected && !busy && selectedSession());
-    add(IDM_CONNECT, connected ? L"断开连接" : L"连接…",
-        connected ? L"" : L"Enter", connected || !busy, connected);
-    add(IDM_NEW_TAB, L"新建标签", L"Ctrl+T");
-    add(IDM_CLOSE_TAB, L"关闭当前标签", L"Ctrl+Shift+W");
-    add(IDM_AI_PANEL, L"AI 助手", L"Ctrl+J");
-    sep();
-    add(IDM_NEW, L"新建会话…", L"Ctrl+N");
-    add(IDM_EDIT, L"编辑当前会话…", L"", !busy);
-    add(IDM_DELETE, L"删除当前会话…", L"", !busy);
-    sep();
-    add(IDM_VAULT, vaultMenuLabel().c_str());
-    sep();
-    add(IDM_COPY, L"复制", L"Ctrl+Shift+C");
-    add(IDM_PASTE, L"粘贴", L"Ctrl+V");
-    add(IDM_SELECT_ALL, L"全选", L"Ctrl+Shift+A");
-    add(IDM_SEARCH, L"搜索终端历史…", L"Ctrl+Shift+F");
-    sep();
-    add(IDM_ZOOM_IN, L"放大字体", L"Ctrl++");
-    add(IDM_ZOOM_OUT, L"缩小字体", L"Ctrl+-");
-    add(IDM_ZOOM_RESET, L"重置字体", L"Ctrl+0");
-    sep();
-    add(IDM_CHECK_UPDATE, L"检查更新…");
-    add(IDM_TOGGLE_UPDATE_CHECK,
-        g_app.updateCheckOnStart ? L"启动时自动检查更新（已开）" : L"启动时自动检查更新（已关）");
-    sep();
-    add(IDM_ABOUT, L"关于 rshell");
-    add(IDM_EXIT, L"退出");
+    // ---- 会话：连接、会话管理和凭据
+    std::vector<popup::Item> session;
+    session.push_back(leaf(IDM_OPEN, L"打开会话管理…", L"Ctrl+O"));
+    session.push_back(
+        leaf(IDM_RECONNECT, L"重新连接", L"Ctrl+Shift+R", !connected && !busy && selectedSession()));
+    session.push_back(leaf(IDM_CONNECT, connected ? L"断开连接" : L"连接…",
+                           connected ? L"" : L"Enter", connected || !busy, connected));
+    session.push_back(sep());
+    session.push_back(leaf(IDM_NEW, L"新建会话…", L"Ctrl+N"));
+    session.push_back(leaf(IDM_EDIT, L"编辑当前会话…", L"", !busy));
+    session.push_back(leaf(IDM_DELETE, L"删除当前会话…", L"", !busy));
+    session.push_back(sep());
+    session.push_back(leaf(IDM_VAULT, vaultMenuLabel().c_str()));
+
+    // ---- 标签
+    std::vector<popup::Item> tabs;
+    tabs.push_back(leaf(IDM_NEW_TAB, L"新建标签", L"Ctrl+T"));
+    tabs.push_back(leaf(IDM_CLOSE_TAB, L"关闭当前标签", L"Ctrl+Shift+W"));
+    tabs.push_back(sep());
+    tabs.push_back(leaf(IDM_NEXT_TAB, L"下一个标签", L"Ctrl+Tab"));
+    tabs.push_back(leaf(IDM_PREV_TAB, L"上一个标签", L"Ctrl+Shift+Tab"));
+
+    // ---- 编辑
+    std::vector<popup::Item> edit;
+    edit.push_back(leaf(IDM_COPY, L"复制", L"Ctrl+Shift+C"));
+    edit.push_back(leaf(IDM_PASTE, L"粘贴", L"Ctrl+V"));
+    edit.push_back(leaf(IDM_SELECT_ALL, L"全选", L"Ctrl+Shift+A"));
+    edit.push_back(sep());
+    edit.push_back(leaf(IDM_SEARCH, L"搜索终端历史…", L"Ctrl+Shift+F"));
+
+    // ---- 视图
+    std::vector<popup::Item> view;
+    view.push_back(leaf(IDM_AI_PANEL, L"AI 助手", L"Ctrl+J"));
+    view.push_back(sep());
+    view.push_back(leaf(IDM_ZOOM_IN, L"放大字体", L"Ctrl++"));
+    view.push_back(leaf(IDM_ZOOM_OUT, L"缩小字体", L"Ctrl+-"));
+    view.push_back(leaf(IDM_ZOOM_RESET, L"重置字体", L"Ctrl+0"));
+
+    // ---- 工具
+    std::vector<popup::Item> tools;
+    tools.push_back(leaf(IDM_CHECK_UPDATE, L"检查更新…"));
+    tools.push_back(leaf(IDM_TOGGLE_UPDATE_CHECK,
+                         g_app.updateCheckOnStart ? L"启动时自动检查更新（已开）"
+                                                  : L"启动时自动检查更新（已关）"));
+
+    // ---- 帮助
+    std::vector<popup::Item> help;
+    help.push_back(leaf(IDM_ABOUT, L"关于 rshell"));
+
+    std::vector<popup::Item> items;
+    items.push_back(group(L"会话", std::move(session)));
+    items.push_back(group(L"标签", std::move(tabs)));
+    items.push_back(group(L"编辑", std::move(edit)));
+    items.push_back(group(L"视图", std::move(view)));
+    items.push_back(group(L"工具", std::move(tools)));
+    items.push_back(group(L"帮助", std::move(help)));
+    items.push_back(sep());
+    items.push_back(leaf(IDM_EXIT, L"退出"));
+    return items;
+}
+
+void openMainMenu(HWND hwnd) {
+    const std::vector<popup::Item> items = buildMainMenu();
 
     const RECT& anchor = g_app.titleButtons[0];
     POINT pt{anchor.left, anchor.bottom + dp(4)};

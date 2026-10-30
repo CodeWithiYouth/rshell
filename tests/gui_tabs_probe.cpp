@@ -726,6 +726,30 @@ void fsCollapseRegression() {
     check(visible(g_app.list), "file list is back");
 }
 
+// 粘贴/复制/全选之后焦点必须回到终端：从菜单触发时弹窗拿走了焦点，
+// 不还回去用户就得先点一下终端才能按回车。
+void pasteFocusRegression() {
+    // 测试会动剪贴板，先把原来的文本存下来，完事再放回去
+    std::wstring previous;
+    const bool hadText = clipboardText(previous);
+
+    check(copyTextToClipboard(L"rshell-focus-probe"), "clipboard accepts text for the focus test");
+    SetFocus(g_app.main);
+    doPaste();
+    check(GetFocus() == g_app.term, "pasting hands focus back to the terminal");
+
+    SetFocus(g_app.main);
+    doSelectAll();
+    check(GetFocus() == g_app.term, "select-all hands focus back to the terminal");
+    check(g_app.hasSelection, "select-all still selects the screen");
+
+    SetFocus(g_app.main);
+    doCopy();
+    check(GetFocus() == g_app.term, "copy hands focus back to the terminal");
+
+    if (hadText && !previous.empty()) copyTextToClipboard(previous);
+}
+
 // ☰ 主菜单改成二级菜单后：顶层只有分组，命令一个都不能丢
 void mainMenuRegression() {
     const auto items = buildMainMenu();
@@ -891,6 +915,7 @@ int main(int argc, char** argv) {
         fsLoadingRegression();
         splitterRegression();
         fsCollapseRegression();
+        pasteFocusRegression();
         mainMenuRegression();
         updateCheckRegression();
         titleAiButtonRegression();

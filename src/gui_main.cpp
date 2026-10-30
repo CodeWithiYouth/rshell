@@ -1639,7 +1639,15 @@ bool clipboardText(std::wstring& out) {
     return false;
 }
 
+// 复制 / 粘贴 / 全选都是对终端做的：做完把键盘焦点交回终端。
+// 从菜单（☰ 或右键）触发时，弹窗关闭后焦点落在主窗口上，
+// 不还回去的话粘贴完按回车没有任何反应，得先点一下终端。
+void focusTerminal() {
+    if (g_app.term && IsWindow(g_app.term)) SetFocus(g_app.term);
+}
+
 void doCopy() {
+    focusTerminal();
     if (!g_app.hasSelection) return;
     std::string text = g_app.termData.textRange(g_app.selStartLine, g_app.selStartCol,
                                                 g_app.selEndLine, g_app.selEndCol);
@@ -1652,6 +1660,7 @@ void doCopy() {
 }
 
 void doPaste() {
+    focusTerminal();
     std::wstring text;
     if (!clipboardText(text)) {
         setStatus(L"剪贴板里没有文本内容");
@@ -1674,6 +1683,7 @@ void doPaste() {
 }
 
 void doSelectAll() {
+    focusTerminal();
     const std::size_t history = g_app.termData.scrollbackCount();
     g_app.selStartLine = history;
     g_app.selStartCol = 0;
@@ -3427,6 +3437,10 @@ int run(HWND owner, POINT screenPt, const std::vector<Item>& items) {
     g_popup = State();
     g_popup.items = items;
 
+    // 记下打开菜单前谁有焦点（终端或文件列表）。弹窗自己会拿走焦点，
+    // 关闭后必须还回去，否则键盘会落在主窗口上——从菜单里粘贴完按回车没反应。
+    HWND focusBefore = GetFocus();
+
     HDC dc = GetDC(owner ? owner : nullptr);
     const int width = menuWidth(dc, items);
     ReleaseDC(owner, dc);
@@ -3465,6 +3479,14 @@ int run(HWND owner, POINT screenPt, const std::vector<Item>& items) {
     if (IsWindow(window)) DestroyWindow(window);
     g_popup.hwnd = nullptr;
     if (owner && IsWindow(owner)) SetForegroundWindow(owner);
+    // 焦点还给菜单打开前的那个控件；只有确认它仍属于 owner 时才还，
+    // 免得把焦点送回一个已经关掉的标签
+    if (focusBefore && IsWindow(focusBefore) &&
+        (focusBefore == owner || (owner && IsChild(owner, focusBefore)))) {
+        SetFocus(focusBefore);
+    } else if (owner && IsWindow(owner)) {
+        SetFocus(owner);
+    }
     return result;
 }
 

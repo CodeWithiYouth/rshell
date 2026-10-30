@@ -669,7 +669,7 @@ void ChatPanel::drawHeader(HDC dc) {
 
     // 目标主机：点击在已连接的主机之间轮换
     historyRect_ = RECT{};
-    if (!host_.empty()) {
+    if (!host_.empty() && historyAvailable_) {
         const int available = std::max(60, secondRight - left);
         const int chipW = std::min(textWidth(dc, host_, fonts_.caption) + 18, available);
         RECT chip{left, secondTop, left + chipW, secondBottom};

@@ -633,6 +633,9 @@ AI 面板全局面板只有一份，工具的目标主机跟着当前标签走�
 - 对话记录只存在远端，本机不写；没有连接时读不到历史，按钮也不会出现。
 - 模型可以用本地工具 `name_session(title, tags)` 给对话起名打标签（读级、免审批、不发任何远程命令）；
   没起名时用第一句用户消息兜底，保证列表里认得出。
+- 设置页有「把对话存到远端 ~/.rshell/sessions（历史会话）」开关，默认开，存 `ai.ini` 的
+  `save_sessions`；关掉后每轮不再写远端，「历史」按钮仍可翻阅已有文件。
+- 「历史」只在 SFTP 就绪时出现（`ChatPanel::setHistoryAvailable`），不会摆一个点不出东西的按钮。
 - 远端读写走 SFTP 的同步接口（`RemoteFs::listDirSync/readFileSync/writeFileSync/mkdirSync`），
   不在这里发命令：libssh2 会话不能同时被两个线程用，后台线程发 exec 会和界面的采样/文件面板撞车。
   读写期间用 `AiHostInfo::keepAlive`（`RemoteFs` 的 shared_ptr）兜住生命周期，标签被关掉也不会悬空。

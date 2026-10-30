@@ -34,6 +34,8 @@ struct AiSettings {
     bool redactSecrets = true;   // 回灌模型前隐藏疑似凭据
     // 自动审批：低风险写操作直接执行，只有高风险（删除/不可逆/敏感路径）才让用户确认
     bool autoApprove = false;
+    // 每轮结束把对话存到远端 ~/.rshell/sessions/（历史会话功能）。默认开
+    bool saveSessions = true;
     int maxSteps = 16;           // 单轮工具调用上限
 };
 

@@ -84,6 +84,8 @@ public:
     void setModelName(const std::wstring& name);
     // 目标主机：可点击时表示还有别的主机可切
     void setHostLabel(std::wstring label, bool clickable);
+    // 「历史」按钮只在能读到远端历史时出现（面板自己不知道连没连上）
+    void setHistoryAvailable(bool available) { historyAvailable_ = available; }
     void setInputEnabled(bool enabled);
     // 停靠 / 全屏：只影响头部按钮文字
     void setFullScreen(bool full);
@@ -191,6 +193,7 @@ private:
     std::wstring model_;
     std::wstring host_;
     bool hostClickable_ = false;
+    bool historyAvailable_ = false;
     bool fullScreen_ = false;
     std::wstring welcomeTitle_;
     std::wstring welcomeSubtitle_;

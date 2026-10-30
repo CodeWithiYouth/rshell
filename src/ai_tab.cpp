@@ -60,7 +60,9 @@ constexpr int kFetchW = 88;
 // 自动审批勾选框放在模型字段和按钮之间
 constexpr int kAutoTop = kFieldTop + kFieldGap * 2 + kEditOffset + kEditHeight + 16;
 constexpr int kAutoH = 26;
-constexpr int kButtonTop = kAutoTop + kAutoH + 14;
+// 「把对话存到远端」勾选框紧跟在自动审批下面
+constexpr int kSaveSessionTop = kAutoTop + kAutoH + 8;
+constexpr int kButtonTop = kSaveSessionTop + kAutoH + 14;
 constexpr int kButtonHeight = 34;
 
 struct ModelFetchPayload {
@@ -323,6 +325,7 @@ struct AiTab::Impl {
     std::mutex metaMutex;            // 标题/标签/文件名
     std::thread loader;              // 读历史（自动接上 / 历史按钮）
     std::atomic<bool> loading{false};
+    // 「把对话存到远端」开关：工作线程每轮结束要读，用原子量避免和设置页抢
     std::string sessionDirPath;      // 缓存的 <home>/.rshell/sessions
     std::uintptr_t sessionDirHost = 0;
     std::string sessionFile;         // 当前对话的文件名（空 = 还没存过）
@@ -331,6 +334,7 @@ struct AiTab::Impl {
     std::int64_t sessionCreated = 0;
     // 自动载入只对每台主机做一次；清空对话后保持同一个 id，避免刚清掉又被载回来
     std::uintptr_t autoLoadHost = 0;
+    std::atomic<bool> saveSessionsOn{true};
 
     // 设置视图
     HWND editBase = nullptr;
@@ -345,6 +349,8 @@ struct AiTab::Impl {
     RECT cancelRect{};
     RECT autoRect{};          // 自动审批勾选框
     bool draftAutoApprove = false;
+    RECT saveSessionRect{};   // 「把对话存到远端」勾选框
+    bool draftSaveSessions = true;
 };
 
 AiTab* AiTab::create(HWND parent, AiTabContext context) {
@@ -448,6 +454,7 @@ void AiTab::initialize(HWND) {
 
     impl_->settings = loadAiSettings();
     impl_->applyAutoApprove();
+    impl_->saveSessionsOn = impl_->settings.saveSessions;
     // name_session 只做本地记账：模型给这段对话起名字/打标签，历史列表里用
     impl_->registry.setSessionNamer(
         [this](const std::string& title, const std::vector<std::string>& tags, std::string& error) {
@@ -525,6 +532,8 @@ void AiTab::updateHostLabel() {
     // 面板是全局的：标题上显示「当前标签」对应的主机，多个标签时点一下也没得切，
     // 换主机就是换标签，所以这里不再做成可点击。
     panel_.setHostLabel(currentHostLabel(), false);
+    // 连上（SFTP 就绪）才有历史可读，没连上就别摆出一个点不动的按钮
+    panel_.setHistoryAvailable(hostStore(activeHostId()) != nullptr);
 }
 
 void AiTab::refreshHost() {
@@ -960,6 +969,7 @@ void AiTab::onPanelApproval(std::size_t index, bool allowed) {
 // 历史列表里顺序稳定（文件名就是创建时间）。
 void AiTab::saveSessionSnapshot(std::uintptr_t hostId, const std::wstring& hostLabel) {
     if (hostId == 0 || impl_->closing) return;
+    if (!impl_->saveSessionsOn.load()) return;  // 设置里关掉了：不写远端
     // 后台写盘期间标签可能被关掉：抓着后端与保活句柄，别让它们提前析构
     const std::shared_ptr<ToolBackend> store = hostStore(hostId);
     if (!store) return;
@@ -1162,6 +1172,7 @@ void AiTab::startSettings(bool unlockOnly) {
     createSettingsControls();
     impl_->draftProvider = impl_->settings.provider;
     impl_->draftAutoApprove = impl_->settings.autoApprove;
+    impl_->draftSaveSessions = impl_->settings.saveSessions;
     impl_->fetchStatus.clear();
     SetWindowTextW(impl_->editBase, toWideText(impl_->settings.baseUrl).c_str());
     SetWindowTextW(impl_->editKey, L"");
@@ -1227,6 +1238,7 @@ void AiTab::layoutSettings() {
     MoveWindow(impl_->modelCombo, left, comboTop, width - kFetchW - 8, 240, TRUE);
 
     impl_->autoRect = RECT{left, kAutoTop, left + width, kAutoTop + kAutoH};
+    impl_->saveSessionRect = RECT{left, kSaveSessionTop, left + width, kSaveSessionTop + kAutoH};
     impl_->saveRect = RECT{left, kButtonTop, left + 96, kButtonTop + kButtonHeight};
     impl_->cancelRect = RECT{left + 108, kButtonTop, left + 108 + 96,
                              kButtonTop + kButtonHeight};
@@ -1293,6 +1305,7 @@ void AiTab::finishSettings(bool save) {
         settings.provider = impl_->draftProvider;
         settings.model = trim(readText(impl_->modelCombo));
         settings.autoApprove = impl_->draftAutoApprove;
+        settings.saveSessions = impl_->draftSaveSessions;
         if (settings.baseUrl.empty() || settings.model.empty()) {
             panel_.addNotice(L"API 地址和模型都不能为空", true);
             return;
@@ -1304,6 +1317,7 @@ void AiTab::finishSettings(bool save) {
         }
         impl_->settings = settings;
         impl_->applyAutoApprove();
+        impl_->saveSessionsOn = settings.saveSessions;
         const std::string key = trim(readText(impl_->editKey));
         if (!key.empty()) {
             if (!context_.vault || !saveApiKey(*context_.vault, key, &error)) {
@@ -1593,6 +1607,11 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(window_, nullptr, FALSE);
                     return 0;
                 }
+                if (PtInRect(&impl_->saveSessionRect, pt)) {
+                    impl_->draftSaveSessions = !impl_->draftSaveSessions;
+                    InvalidateRect(window_, nullptr, FALSE);
+                    return 0;
+                }
                 if (PtInRect(&impl_->saveRect, pt)) {
                     finishSettings(true);
                     return 0;
@@ -1721,28 +1740,31 @@ void AiTab::paint(HDC dc) {
     button(impl_->fetchRect, impl_->fetching ? L"获取中…" : L"获取模型",
            impl_->fetching ? ui::bgCard : ui::bgCard, ui::accent);
 
-    // 自动审批：勾上之后低风险写操作直接执行，高风险（删除/不可逆/敏感路径）仍然要确认
-    {
-        const RECT& row = impl_->autoRect;
+    // 两个勾选框共用一段绘制：状态位 + 一行说明
+    auto checkbox = [&](const RECT& row, bool on, const wchar_t* label) {
         const int box = 16;
-        RECT check{row.left, row.top + (row.bottom - row.top - box) / 2,
-                   row.left + box, row.top + (row.bottom - row.top - box) / 2 + box};
-        HBRUSH boxBrush = CreateSolidBrush(
-            toColorRef(impl_->draftAutoApprove ? ui::action : ui::bgApp));
+        RECT check{row.left, row.top + (row.bottom - row.top - box) / 2, row.left + box,
+                   row.top + (row.bottom - row.top - box) / 2 + box};
+        HBRUSH boxBrush = CreateSolidBrush(toColorRef(on ? ui::action : ui::bgApp));
         FillRect(dc, &check, boxBrush);
         DeleteObject(boxBrush);
-        HBRUSH boxBorder = CreateSolidBrush(
-            toColorRef(impl_->draftAutoApprove ? ui::action : ui::borderSoft));
+        HBRUSH boxBorder = CreateSolidBrush(toColorRef(on ? ui::action : ui::borderSoft));
         FrameRect(dc, &check, boxBorder);
         DeleteObject(boxBorder);
-        if (impl_->draftAutoApprove) {
+        if (on) {
             drawText(dc, L"✓", check, 0xFFFFFF, context_.captionFont,
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        drawText(dc, L"自动审批：低风险操作直接执行，删除/不可逆/敏感路径仍需确认",
-                 RECT{check.right + 8, row.top, row.right, row.bottom}, ui::text,
+        drawText(dc, label, RECT{check.right + 8, row.top, row.right, row.bottom}, ui::text,
                  context_.captionFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-    }
+    };
+
+    // 自动审批：勾上之后低风险写操作直接执行，高风险（删除/不可逆/敏感路径）仍然要确认
+    checkbox(impl_->autoRect, impl_->draftAutoApprove,
+             L"自动审批：低风险操作直接执行，删除/不可逆/敏感路径仍需确认");
+    // 会话历史：关掉后每轮不再写远端，历史按钮仍然能翻旧对话
+    checkbox(impl_->saveSessionRect, impl_->draftSaveSessions,
+             L"把对话存到远端 ~/.rshell/sessions（历史会话）");
     button(impl_->saveRect, L"保存", ui::action, 0xFFFFFF);
     button(impl_->cancelRect, L"取消", ui::bgCard, ui::textDim);
 

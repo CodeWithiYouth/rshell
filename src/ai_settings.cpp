@@ -86,6 +86,10 @@ AiSettings loadAiSettings(const std::string& path) {
                                      iequals(value, "no"));
         } else if (key == "max_steps" || key == "maxsteps") {
             settings.maxSteps = parseInt(value, settings.maxSteps);
+        } else if (key == "save_sessions" || key == "savesessions") {
+            // 默认开：只有明确写成 0/false/no 才关
+            settings.saveSessions = !(value == "0" || iequals(value, "false") ||
+                                      iequals(value, "no"));
         }
     }
     return settings;
@@ -115,6 +119,7 @@ bool saveAiSettings(const AiSettings& settings, std::string* error, const std::s
     out << "model=" << settings.model << "\n";
     out << "redact_secrets=" << (settings.redactSecrets ? "1" : "0") << "\n";
     out << "auto_approve=" << (settings.autoApprove ? "1" : "0") << "\n";
+    out << "save_sessions=" << (settings.saveSessions ? "1" : "0") << "\n";
     out << "max_steps=" << settings.maxSteps << "\n";
     if (!out.good()) {
         if (error) *error = "写入配置文件失败：" + file;

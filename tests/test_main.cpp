@@ -2678,6 +2678,7 @@ void testAiSettings() {
     CHECK(!defaults.model.empty());
     CHECK(defaults.redactSecrets);
     CHECK(!defaults.autoApprove);  // 自动审批默认关
+    CHECK(defaults.saveSessions);  // 会话保存默认开
     CHECK_EQ(defaults.maxSteps, 16);
 
     // 写入会顺带建目录
@@ -2686,6 +2687,7 @@ void testAiSettings() {
     settings.model = "deepseek-chat";
     settings.redactSecrets = false;
     settings.autoApprove = true;
+    settings.saveSessions = false;
     settings.maxSteps = 8;
     std::string error;
     CHECK(ai::saveAiSettings(settings, &error, file.string()));
@@ -2706,6 +2708,7 @@ void testAiSettings() {
     CHECK_EQ(loaded.model, std::string("deepseek-chat"));
     CHECK(!loaded.redactSecrets);
     CHECK(loaded.autoApprove);
+    CHECK(!loaded.saveSessions);
     CHECK_EQ(loaded.maxSteps, 8);
 
     // 手工写的配置：注释、CRLF、未知键、非法数字都要能容忍
@@ -2723,6 +2726,7 @@ void testAiSettings() {
     CHECK_EQ(manual.baseUrl, std::string("http://127.0.0.1:11434/v1"));
     CHECK_EQ(manual.maxSteps, 16);  // 非法值回退默认
     CHECK(manual.redactSecrets);    // 缺失字段保持默认
+    CHECK(manual.saveSessions);     // 老配置没有这个键：默认开
 
     fs::remove_all(dir, ec);
 }

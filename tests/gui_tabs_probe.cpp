@@ -927,8 +927,9 @@ void mainMenuRegression() {
           "connect/disconnect label follows the connection state");
     const auto& tools = items[4].children;
     check(tools.size() == 2 && tools[0].id == IDM_CHECK_UPDATE, "tools keeps the update commands");
-    check(tools[1].text == (g_app.updateCheckOnStart ? L"启动时检查更新 · 开"
-                                                     : L"启动时检查更新 · 关"),
+    check(tools[0].text == L"立即检查更新…", "the manual check is labelled as immediate");
+    check(tools[1].text == (g_app.updateCheckOnStart ? L"启动时检查更新 · 已开启"
+                                                     : L"启动时检查更新 · 已关闭"),
           "the startup check toggle shows its state");
 }
 
@@ -964,6 +965,56 @@ void submenuHoverRegression() {
 
     popup::g_popup = saved;
     DestroyWindow(window);
+}
+
+// 开关本身和它写到状态栏的提示：文案必须明确是“更新检查”，并且停留够久
+void updateToggleRegression() {
+    const bool before = g_app.updateCheckOnStart;
+    SendMessageW(g_app.main, WM_COMMAND, MAKEWPARAM(IDM_TOGGLE_UPDATE_CHECK, 0), 0);
+    check(g_app.updateCheckOnStart != before, "the startup check toggle flips the setting");
+    check(g_app.statusText == (g_app.updateCheckOnStart ? L"启动更新检查：开"
+                                                        : L"启动更新检查：关"),
+          "the toggle reports a clear update-check message");
+    check(statusNoticeActive(GetTickCount64()), "the toggle message is active");
+    check(g_app.statusUntil > GetTickCount64() + 6000, "the toggle message stays long enough");
+    {
+        // 最小窗口宽度下，这条提示也必须放得下，不能被状态栏两侧的固定块挤没
+        const RECT narrow{0, 0, dp(760), dp(460)};
+        const auto layout = statusGeometry(narrow);
+        HDC dc = GetDC(g_app.main);
+        const int textW = textWidth(dc, g_app.statusText, g_app.uiFont);
+        ReleaseDC(g_app.main, dc);
+        check(layout.content.right - layout.content.left >= textW,
+              "the toggle message fits the status bar at the minimum window width");
+    }
+    {
+        // 光有状态文本还不够：真正画一遍状态栏，确认中间区域确实有文字像素
+        RECT client{};
+        GetClientRect(g_app.main, &client);
+        const int h = g_app.statusH;
+        check(h > 0, "the status bar has a height");
+        HDC screen = GetDC(nullptr);
+        HDC mem = CreateCompatibleDC(screen);
+        HBITMAP bmp = CreateCompatibleBitmap(screen, client.right, h);
+        HGDIOBJ old = SelectObject(mem, bmp);
+        paintStatusBar(mem, RECT{0, 0, client.right, h});
+        const RECT content = statusGeometry(RECT{0, 0, client.right, h}).content;
+        int bright = 0;
+        for (int y = content.top; y < content.bottom; y += 2) {
+            for (int x = content.left; x < content.right; x += 2) {
+                const COLORREF c = GetPixel(mem, x, y);
+                if (GetRValue(c) + GetGValue(c) + GetBValue(c) > 300) ++bright;
+            }
+        }
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(nullptr, screen);
+        check(bright > 0, "the toggle message is painted in the status bar");
+    }
+    SendMessageW(g_app.main, WM_COMMAND, MAKEWPARAM(IDM_TOGGLE_UPDATE_CHECK, 0), 0);
+    check(g_app.updateCheckOnStart == before, "toggling twice restores the setting");
+    setStatus(L"");
 }
 
 // 绘制耗时基线：RSHELL_AI_PAINT_BENCH=1 时跑一次，只打印数字，不做断言。
@@ -1355,6 +1406,7 @@ int main(int argc, char** argv) {
         aiPanelPartialPaintRegression();
         mainMenuRegression();
         submenuHoverRegression();
+        updateToggleRegression();
         updateCheckRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();

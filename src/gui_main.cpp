@@ -552,11 +552,11 @@ bool ensureVaultUnlocked();
 // 主菜单的保险库入口：没有文件就新建，有文件且锁定就解锁，已解锁则锁定。
 void vaultCommand();
 
-void setStatus(const std::wstring& text, bool error = false) {
+void setStatus(const std::wstring& text, bool error = false, ULONGLONG durationMs = 4000) {
     if (foregroundSession()) hideStatusHint();
     g_app.statusText = text;
     g_app.statusError = error && !text.empty();
-    g_app.statusUntil = !error && !text.empty() ? GetTickCount64() + 4000 : 0;
+    g_app.statusUntil = !error && !text.empty() ? GetTickCount64() + durationMs : 0;
     if (foregroundSession() && g_app.status) SetWindowTextW(g_app.status, text.c_str());
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
 }
@@ -8842,10 +8842,10 @@ std::vector<popup::Item> buildMainMenu() {
 
     // ---- 工具
     std::vector<popup::Item> tools;
-    tools.push_back(leaf(IDM_CHECK_UPDATE, L"检查更新…"));
+    tools.push_back(leaf(IDM_CHECK_UPDATE, L"立即检查更新…"));
     tools.push_back(leaf(IDM_TOGGLE_UPDATE_CHECK,
-                         g_app.updateCheckOnStart ? L"启动时检查更新 · 开"
-                                                  : L"启动时检查更新 · 关"));
+                         g_app.updateCheckOnStart ? L"启动时检查更新 · 已开启"
+                                                  : L"启动时检查更新 · 已关闭"));
 
     // ---- 帮助
     std::vector<popup::Item> help;
@@ -9800,8 +9800,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_TOGGLE_UPDATE_CHECK:
                     g_app.updateCheckOnStart = !g_app.updateCheckOnStart;
                     saveUiLayout();
-                    setStatus(g_app.updateCheckOnStart ? L"启动检查：开"
-                                                      : L"启动检查：关");
+                    // 8 秒：设置页/菜单刚关闭时，用户可能还在看菜单，4 秒太短
+                    setStatus(g_app.updateCheckOnStart ? L"启动更新检查：开"
+                                                      : L"启动更新检查：关",
+                              false, 8000);
                     return 0;
                 case IDM_ABOUT:
                     messageInfo(L"关于 rshell",

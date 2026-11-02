@@ -552,11 +552,11 @@ bool ensureVaultUnlocked();
 // 主菜单的保险库入口：没有文件就新建，有文件且锁定就解锁，已解锁则锁定。
 void vaultCommand();
 
-void setStatus(const std::wstring& text, bool error = false) {
+void setStatus(const std::wstring& text, bool error = false, ULONGLONG durationMs = 4000) {
     if (foregroundSession()) hideStatusHint();
     g_app.statusText = text;
     g_app.statusError = error && !text.empty();
-    g_app.statusUntil = !error && !text.empty() ? GetTickCount64() + 4000 : 0;
+    g_app.statusUntil = !error && !text.empty() ? GetTickCount64() + durationMs : 0;
     if (foregroundSession() && g_app.status) SetWindowTextW(g_app.status, text.c_str());
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
 }
@@ -3033,6 +3033,10 @@ State g_popup;
 
 constexpr wchar_t kPopupClass[] = L"RshellPopupMenu";
 constexpr wchar_t kSubmenuClass[] = L"RshellPopupSubmenu";
+// 鼠标离开菜单项、穿过内边距划向二级菜单时，延迟关闭子菜单；
+// 鼠标进入子菜单会取消这个定时器。
+constexpr UINT_PTR kSubmenuCloseTimer = 1;
+constexpr UINT kSubmenuCloseDelayMs = 220;
 
 int itemHeight() { return dp(30); }
 int separatorHeight() { return dp(11); }
@@ -3079,6 +3083,21 @@ int hitItem(const std::vector<Item>& items, HWND hwnd, POINT pt) {
         const RECT rc = itemRect(items, client, i);
         if (PtInRect(&rc, pt)) return i;
     }
+    return -1;
+}
+
+// 二级菜单打开时，把当前项左右的内边距也算作该项。
+// 否则鼠标从菜单项划向二级菜单、经过 6dp 内边距时，hitItem 会返回 -1，
+// 子菜单被当成“移到空白处”立刻关掉，表现为有时划不进二级菜单。
+int hitParentItem(const std::vector<Item>& items, HWND hwnd, POINT pt) {
+    const int index = hitItem(items, hwnd, pt);
+    if (index >= 0 || g_popup.openIndex < 0) return index;
+
+    RECT client{};
+    GetClientRect(hwnd, &client);
+    if (pt.x < client.left || pt.x >= client.right) return -1;
+    const RECT openRc = itemRect(items, client, g_popup.openIndex);
+    if (pt.y >= openRc.top && pt.y < openRc.bottom) return g_popup.openIndex;
     return -1;
 }
 
@@ -3179,6 +3198,7 @@ void paintMenu(HWND hwnd, const std::vector<Item>& items, int hover) {
 }
 
 void destroySubmenu() {
+    if (g_popup.hwnd) KillTimer(g_popup.hwnd, kSubmenuCloseTimer);
     if (g_popup.child && IsWindow(g_popup.child)) DestroyWindow(g_popup.child);
     g_popup.child = nullptr;
     g_popup.childItems.clear();
@@ -3193,6 +3213,7 @@ void openSubmenu(int index) {
         destroySubmenu();
         return;
     }
+    if (g_popup.hwnd) KillTimer(g_popup.hwnd, kSubmenuCloseTimer);
     if (index == g_popup.openIndex && g_popup.child) return;
 
     destroySubmenu();
@@ -3217,8 +3238,10 @@ void openSubmenu(int index) {
     mi.cbSize = sizeof(mi);
     GetMonitorInfoW(MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST), &mi);
 
-    int x = parent.right + dp(2);
-    if (x + width > mi.rcWork.right) x = parent.left - width - dp(2);
+    // 和父菜单重叠 1dp，不留缝隙：鼠标从菜单项划向二级菜单时不会掉进空隙。
+    const int overlap = dp(1);
+    int x = parent.right - overlap;
+    if (x + width > mi.rcWork.right) x = parent.left - width + overlap;
     int y = pt.y;
     if (y + height > mi.rcWork.bottom) y = mi.rcWork.bottom - height;
     x = std::max<int>(x, mi.rcWork.left);
@@ -3245,6 +3268,8 @@ LRESULT CALLBACK submenuProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             paintMenu(hwnd, g_popup.childItems, g_popup.childHover);
             return 0;
         case WM_MOUSEMOVE: {
+            // 进入二级菜单即取消父菜单的延迟关闭
+            if (g_popup.hwnd) KillTimer(g_popup.hwnd, kSubmenuCloseTimer);
             const int index = hitItem(g_popup.childItems, hwnd,
                                       POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             if (index != g_popup.childHover) {
@@ -3278,8 +3303,10 @@ LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             paintMenu(hwnd, g_popup.items, g_popup.hover);
             return 0;
         case WM_MOUSEMOVE: {
-            const int index =
-                hitItem(g_popup.items, hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+            // 指针还在父菜单里移动：先撤销可能挂起的“延迟关闭”
+            KillTimer(hwnd, kSubmenuCloseTimer);
+            const POINT local{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            const int index = hitParentItem(g_popup.items, hwnd, local);
             if (index != g_popup.hover) {
                 g_popup.hover = index;
                 g_popup.suppressed = -1;
@@ -3291,15 +3318,38 @@ LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (index >= 0 && g_popup.openIndex != index) {
                 destroySubmenu();
             } else if (index < 0 && g_popup.openIndex >= 0) {
-                // 移到分隔线/空白处：子菜单跟着收起
-                destroySubmenu();
+                // 移到分隔线/空白处：不要立刻收，给鼠标一点时间穿过内边距
+                // 进入二级菜单；进入后子菜单会 KillTimer。
+                SetTimer(hwnd, kSubmenuCloseTimer, kSubmenuCloseDelayMs, nullptr);
             }
             return 0;
         }
+        case WM_TIMER:
+            if (wp == kSubmenuCloseTimer) {
+                KillTimer(hwnd, kSubmenuCloseTimer);
+                bool keep = false;
+                POINT pt{};
+                if (g_popup.child && IsWindow(g_popup.child) && GetCursorPos(&pt)) {
+                    RECT childRect{};
+                    GetWindowRect(g_popup.child, &childRect);
+                    if (PtInRect(&childRect, pt)) keep = true;
+                    if (!keep) {
+                        POINT local = pt;
+                        ScreenToClient(hwnd, &local);
+                        keep = hitParentItem(g_popup.items, hwnd, local) == g_popup.openIndex;
+                    }
+                }
+                if (!keep) {
+                    destroySubmenu();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+                return 0;
+            }
+            break;
         case WM_LBUTTONDOWN: {
             // 按下即选中：菜单项不需要“按住拖动”
             const int index =
-                hitItem(g_popup.items, hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+                hitParentItem(g_popup.items, hwnd, POINT{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
             if (index < 0) {
                 finish(0);
                 return 0;
@@ -3476,6 +3526,7 @@ int run(HWND owner, POINT screenPt, const std::vector<Item>& items) {
     // 先把结果取出来再销毁窗口：销毁会触发 WM_ACTIVATE(WA_INACTIVE) 走一遍清场逻辑，
     // 提前取走才不会被这次清场覆盖成 0。
     const int result = g_popup.result;
+    KillTimer(window, kSubmenuCloseTimer);
     destroySubmenu();
     if (IsWindow(window)) DestroyWindow(window);
     g_popup.hwnd = nullptr;
@@ -8791,10 +8842,10 @@ std::vector<popup::Item> buildMainMenu() {
 
     // ---- 工具
     std::vector<popup::Item> tools;
-    tools.push_back(leaf(IDM_CHECK_UPDATE, L"检查更新…"));
+    tools.push_back(leaf(IDM_CHECK_UPDATE, L"立即检查更新…"));
     tools.push_back(leaf(IDM_TOGGLE_UPDATE_CHECK,
-                         g_app.updateCheckOnStart ? L"启动时自动检查更新（已开）"
-                                                  : L"启动时自动检查更新（已关）"));
+                         g_app.updateCheckOnStart ? L"启动时检查更新 · 已开启"
+                                                  : L"启动时检查更新 · 已关闭"));
 
     // ---- 帮助
     std::vector<popup::Item> help;
@@ -9749,8 +9800,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_TOGGLE_UPDATE_CHECK:
                     g_app.updateCheckOnStart = !g_app.updateCheckOnStart;
                     saveUiLayout();
-                    setStatus(g_app.updateCheckOnStart ? L"启动时会自动检查更新"
-                                                      : L"已关闭启动时自动检查更新");
+                    // 8 秒：设置页/菜单刚关闭时，用户可能还在看菜单，4 秒太短
+                    setStatus(g_app.updateCheckOnStart ? L"启动更新检查：开"
+                                                      : L"启动更新检查：关",
+                              false, 8000);
                     return 0;
                 case IDM_ABOUT:
                     messageInfo(L"关于 rshell",

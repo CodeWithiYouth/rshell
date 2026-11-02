@@ -1099,6 +1099,72 @@ void markdownCacheRegression() {
     ReleaseDC(nullptr, screen);
 }
 
+// 流式平滑：假服务器每 350ms 推一批 25 字，界面必须分很多小步展示。
+// 由 tests/ai_stream_e2e.py 设置环境变量后触发，平时跳过。
+void aiStreamSmoothingRegression() {
+    if (!std::getenv("RSHELL_AI_STREAM_TEST")) return;
+
+    ProbeSessionBackend store;
+    ai::AiTabContext context;
+    context.uiFont = g_app.uiFont;
+    context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font;
+    context.captionFont = g_app.tinyFont;
+    context.hosts = [&store]() {
+        ai::AiHostInfo host;
+        host.id = 7;
+        host.label = L"stream-probe";
+        host.backend = &store;  // 假模型不调用工具，不会被当成 RemoteFs 用
+        return std::vector<ai::AiHostInfo>{host};
+    };
+    context.activeHostId = []() { return static_cast<std::uintptr_t>(7); };
+    context.apiKeyOverride = "test-key";
+
+    ai::AiTab* tab = ai::AiTab::create(g_app.main, context);
+    check(tab != nullptr, "stream panel is created");
+    tab->setBounds(RECT{0, 0, 520, 760});
+    tab->show(true);
+    tab->sendMessage(L"验证平滑输出");
+
+    std::size_t last = 0;
+    int steps = 0;
+    ULONGLONG lastChange = GetTickCount64();
+    const ULONGLONG deadline = GetTickCount64() + 30000;
+    while (GetTickCount64() < deadline) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        Sleep(5);
+
+        const ai::ChatItem* assistant = nullptr;
+        for (const auto& item : tab->transcript())
+            if (item.kind == ai::ItemKind::Assistant) assistant = &item;
+        const std::size_t size = assistant ? assistant->body.size() : 0;
+        const bool streaming = assistant ? assistant->streaming : true;
+        if (size != last) {
+            last = size;
+            ++steps;
+            lastChange = GetTickCount64();
+        }
+        if (!streaming && last > 0 && GetTickCount64() - lastChange > 600) break;
+    }
+
+    const char* expectedEnv = std::getenv("RSHELL_AI_EXPECT");
+    const std::size_t expected =
+        expectedEnv ? static_cast<std::size_t>(std::strtoull(expectedEnv, nullptr, 10)) : 0;
+    std::cout << "STREAM steps=" << steps << " chars=" << last << " expected=" << expected << "\n";
+    for (const auto& item : tab->transcript()) {
+        std::string body(item.body.begin(), item.body.end());
+        if (body.size() > 120) body.resize(120);
+        std::cout << "  item kind=" << static_cast<int>(item.kind) << " body=" << body << "\n";
+    }
+    check(expected > 0 && last == expected, "every streamed character reaches the panel");
+    check(steps >= 20, "text is revealed in many small steps, not one jump per batch");
+    ai::AiTab::destroy(tab);
+}
+
 // 局部重绘：只画最后一个气泡的区域时，其余条目要跳过但不能出错
 void aiPanelPartialPaintRegression() {
     ai::ChatPanel panel;
@@ -1250,6 +1316,7 @@ int main(int argc, char** argv) {
         fsCollapseRegression();
         pasteFocusRegression();
         aiPanelPaintBench();
+        aiStreamSmoothingRegression();
         markdownCacheRegression();
         aiPanelPartialPaintRegression();
         mainMenuRegression();

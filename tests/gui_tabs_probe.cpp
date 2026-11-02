@@ -904,7 +904,7 @@ void mainMenuRegression() {
             ids.push_back(child.id);
         }
     }
-    check(leaves == 23, "every command of the old flat menu is still reachable");
+    check(leaves == 24, "every command of the old flat menu is still reachable");
     check(std::find(ids.begin(), ids.end(), 0) == ids.end(), "no reachable row is a placeholder id");
     std::sort(ids.begin(), ids.end());
     check(std::adjacent_find(ids.begin(), ids.end()) == ids.end(), "no command appears twice");
@@ -926,11 +926,15 @@ void mainMenuRegression() {
     check(session[2].id == IDM_CONNECT && session[2].text == L"连接…",
           "connect/disconnect label follows the connection state");
     const auto& tools = items[4].children;
-    check(tools.size() == 2 && tools[0].id == IDM_CHECK_UPDATE, "tools keeps the update commands");
+    check(tools.size() == 3 && tools[0].id == IDM_CHECK_UPDATE, "tools keeps the update commands");
     check(tools[0].text == L"立即检查更新…", "the manual check is labelled as immediate");
     check(tools[1].text == (g_app.updateCheckOnStart ? L"启动时检查更新 · 已开启"
                                                      : L"启动时检查更新 · 已关闭"),
           "the startup check toggle shows its state");
+    check(tools[2].id == IDM_FS_EDITOR &&
+              tools[2].text == (g_app.editorPath.empty() ? L"选择文本编辑器…"
+                                                         : L"更换文本编辑器…"),
+          "the editor setting follows whether an editor was chosen");
 }
 
 // 二级菜单的悬停修正：父项左右内边距仍然算“还在这一项上”，
@@ -966,6 +970,121 @@ void submenuHoverRegression() {
     popup::g_popup = saved;
     DestroyWindow(window);
 }
+
+// 远端文件编辑：右键入口、本地副本命名、文本判定和回传状态机
+void fileEditRegression() {
+    const bool savedReady = g_app.fsReady;
+    const std::vector<RemoteEntry> savedEntries = g_app.fsEntries;
+    const int savedSel = g_app.fsSel;
+    const std::wstring savedEditor = g_app.editorPath;
+    const std::vector<App::EditedFile> savedEdits = g_app.editedFiles;
+    const std::wstring savedStatus = g_app.statusText;
+    const bool savedStatusError = g_app.statusError;
+    const ULONGLONG savedStatusUntil = g_app.statusUntil;
+
+    g_app.fsReady = true;
+    RemoteEntry file;
+    file.name = "main.c";
+    file.path = "/srv/app/main.c";
+    file.mode = LIBSSH2_SFTP_S_IFREG;
+    file.size = 120;
+    RemoteEntry folder;
+    folder.name = "build";
+    folder.path = "/srv/app/build";
+    folder.mode = LIBSSH2_SFTP_S_IFDIR;
+    g_app.fsEntries = {file, folder};
+    g_app.fsSel = 0;
+    g_app.editorPath.clear();
+
+    auto findItem = [](const std::vector<popup::Item>& items, int id) -> const popup::Item* {
+        for (const auto& item : items)
+            if (item.id == id) return &item;
+        return nullptr;
+    };
+    auto items = buildFileContextMenu();
+    const popup::Item* edit = findItem(items, IDM_FS_EDIT);
+    check(edit && edit->text == L"编辑" && edit->enabled, "a selected file can be edited");
+    check(findItem(items, IDM_FS_EDITOR) != nullptr, "the editor picker is always reachable");
+    check(findItem(items, IDM_FS_EDIT_SYSTEM) == nullptr,
+          "the system-default entry only appears after an editor is configured");
+
+    g_app.editorPath = L"C:\\Tools\\Notepad++.exe";
+    items = buildFileContextMenu();
+    check(findItem(items, IDM_FS_EDIT_SYSTEM) != nullptr,
+          "a configured editor still leaves a system-default escape hatch");
+    check(findItem(items, IDM_FS_EDITOR)->text == L"更换文本编辑器…",
+          "the menu offers to change the configured editor");
+
+    g_app.fsSel = 1;
+    items = buildFileContextMenu();
+    check(!findItem(items, IDM_FS_EDIT)->enabled, "directories cannot be edited as text");
+
+    // 本地副本：不同目录的同名文件分开放，Windows 非法字符会被替换
+    check(editLocalName("/srv/a/con.txt") == L"_con.txt", "reserved device names are escaped");
+    check(editLocalName("/srv/a/we:ird?.txt") == L"we_ird_.txt",
+          "Windows-illegal characters are replaced");
+    check(editLocalPathFor("/srv/a/notes.txt") != editLocalPathFor("/srv/b/notes.txt"),
+          "same-named files from different directories do not overwrite each other");
+    check(editLocalPathFor("/srv/a/notes.txt") == editLocalPathFor("/srv/a/notes.txt"),
+          "the local copy path is stable for the same remote file");
+
+    // 文本判定：NUL 字节当二进制；普通文本可编辑
+    const fs::path root = std::filesystem::temp_directory_path() /
+        ("rshell-edit-" + std::to_string(GetCurrentProcessId()) + "-" +
+         std::to_string(GetTickCount64()));
+    std::error_code ec;
+    fs::create_directories(root, ec);
+    const fs::path textFile = root / "text.txt";
+    const fs::path binaryFile = root / "binary.bin";
+    {
+        std::ofstream out(textFile, std::ios::binary);
+        out << "hello\nworld\n";
+    }
+    {
+        std::ofstream out(binaryFile, std::ios::binary);
+        const char data[] = {'a', 'b', '\0', 'c', 'd'};
+        out.write(data, sizeof(data));
+    }
+    check(looksLikeTextFile(textFile), "plain text is accepted for editing");
+    check(!looksLikeTextFile(binaryFile), "binary content is rejected before opening an editor");
+
+    // 回传状态机：成功更新基线；失败保留 dirty 并安排重试
+    std::uint64_t size = 0;
+    FILETIME write{};
+    check(readLocalFileState(textFile.wstring(), size, write), "read the local edit copy state");
+    g_app.editedFiles.clear();
+    App::EditedFile entry;
+    entry.connectionId = g_app.connectionId;
+    entry.remote = "/srv/app/main.c";
+    entry.local = textFile.wstring();
+    entry.name = L"main.c";
+    entry.uploading = true;
+    entry.uploadSize = size;
+    entry.uploadWrite = write;
+    entry.syncedSize = size;
+    entry.syncedWrite = write;
+    g_app.editedFiles.push_back(entry);
+    check(finishEditUpload(entry.remote, true), "an active edit upload is completed");
+    check(!g_app.editedFiles.back().uploading && !g_app.editedFiles.back().dirty,
+          "a successful upload becomes the new baseline");
+    g_app.editedFiles.back().uploading = true;
+    check(finishEditUpload(entry.remote, false), "a failed upload is still owned by the edit session");
+    check(g_app.editedFiles.back().dirty &&
+              g_app.editedFiles.back().retryAt > GetTickCount64(),
+          "a failed upload keeps the local change and schedules a retry");
+
+    g_app.editedFiles.clear();
+    fs::remove_all(root, ec);
+    g_app.editedFiles = savedEdits;
+    g_app.editorPath = savedEditor;
+    g_app.fsEntries = savedEntries;
+    g_app.fsSel = savedSel;
+    g_app.fsReady = savedReady;
+    g_app.statusText = savedStatus;
+    g_app.statusError = savedStatusError;
+    g_app.statusUntil = savedStatusUntil;
+}
+
 
 // 开关本身和它写到状态栏的提示：文案必须明确是“更新检查”，并且停留够久
 void updateToggleRegression() {
@@ -1407,6 +1526,7 @@ int main(int argc, char** argv) {
         mainMenuRegression();
         submenuHoverRegression();
         updateToggleRegression();
+        fileEditRegression();
         updateCheckRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();

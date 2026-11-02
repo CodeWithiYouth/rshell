@@ -926,9 +926,43 @@ void mainMenuRegression() {
           "connect/disconnect label follows the connection state");
     const auto& tools = items[4].children;
     check(tools.size() == 2 && tools[0].id == IDM_CHECK_UPDATE, "tools keeps the update commands");
-    check(tools[1].text == (g_app.updateCheckOnStart ? L"启动时自动检查更新（已开）"
-                                                     : L"启动时自动检查更新（已关）"),
+    check(tools[1].text == (g_app.updateCheckOnStart ? L"启动时检查更新 · 开"
+                                                     : L"启动时检查更新 · 关"),
           "the startup check toggle shows its state");
+}
+
+// 二级菜单的悬停修正：父项左右内边距仍然算“还在这一项上”，
+// 鼠标划向子菜单时不会因为经过内边距被判定为空白而把子菜单关掉。
+void submenuHoverRegression() {
+    HWND window = CreateWindowExW(0, L"STATIC", L"", WS_POPUP, 0, 0, 220, 120,
+                                  g_app.main, nullptr, g_app.inst, nullptr);
+    check(window != nullptr, "create submenu hover probe window");
+
+    const popup::State saved = popup::g_popup;
+    popup::g_popup = popup::State();
+    popup::g_popup.hwnd = window;
+
+    popup::Item group;
+    group.text = L"工具";
+    group.children.push_back(popup::Item{});
+    popup::g_popup.items.push_back(group);
+    popup::g_popup.openIndex = 0;
+
+    RECT client{};
+    GetClientRect(window, &client);
+    const RECT row = popup::itemRect(popup::g_popup.items, client, 0);
+    const int midY = (row.top + row.bottom) / 2;
+    check(popup::hitParentItem(popup::g_popup.items, window, POINT{dp(2), midY}) == 0,
+          "left padding counts as the open row");
+    check(popup::hitParentItem(popup::g_popup.items, window,
+                               POINT{client.right - dp(2), midY}) == 0,
+          "right padding counts as the open row");
+    check(popup::hitParentItem(popup::g_popup.items, window,
+                               POINT{dp(2), row.bottom + dp(2)}) == -1,
+          "outside the open row is not hover");
+
+    popup::g_popup = saved;
+    DestroyWindow(window);
 }
 
 // 绘制耗时基线：RSHELL_AI_PAINT_BENCH=1 时跑一次，只打印数字，不做断言。
@@ -1174,6 +1208,7 @@ int main(int argc, char** argv) {
         aiPanelPaintBench();
         aiPanelPartialPaintRegression();
         mainMenuRegression();
+        submenuHoverRegression();
         updateCheckRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();

@@ -9840,6 +9840,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             hideStatusHint();
             if (!IsRectEmpty(&g_app.updateChip) && PtInRect(&g_app.updateChip, pt)) {
+                guiLog("点击更新提示：" + g_app.updateUrl);
                 openInBrowser(g_app.updateUrl);
                 return 0;
             }

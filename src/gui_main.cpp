@@ -9357,6 +9357,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const bool updateHover = !IsRectEmpty(&g_app.updateChip) && PtInRect(&g_app.updateChip, pt);
             if (updateHover != g_app.hoverUpdateChip) {
                 g_app.hoverUpdateChip = updateHover;
+                // 悬停时在底栏说明一下，避免只看颜色不知道能点
+                if (updateHover && !g_app.updateTag.empty()) {
+                    setStatus(L"点击打开 " + toWide(g_app.updateTag) + L" 的 Release 页面");
+                }
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             // 下载胶囊 / 列表里的悬停状态

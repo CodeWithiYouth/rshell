@@ -4,7 +4,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <fstream>
 #include <random>
 #include <condition_variable>
 #include <memory>
@@ -64,6 +67,56 @@ constexpr int kAutoH = 26;
 constexpr int kSaveSessionTop = kAutoTop + kAutoH + 8;
 constexpr int kButtonTop = kSaveSessionTop + kAutoH + 14;
 constexpr int kButtonHeight = 34;
+
+// RSHELL_AI_PERF=1 时把流式节奏写进 ~/.rshell/ai-perf.log：
+// 每次收到多少字、距上次多久、每一帧画了多久。用来区分「网络一段一段给」
+// 和「界面画得慢」，只写界面线程，不需要加锁。
+std::mutex& perfMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::string nowStamp();  // 定义在下面
+
+bool perfEnabled() {
+    static const bool enabled = std::getenv("RSHELL_AI_PERF") != nullptr;
+    return enabled;
+}
+
+// 真正写文件：调用方已经持有 perfMutex()
+void perfWrite(const std::string& line) {
+    std::ofstream out(utf8ToPath(homeDirectory() + "/.rshell/ai-perf.log"),
+                      std::ios::binary | std::ios::app);
+    if (!out) return;
+    out << line << "\n";
+}
+
+void perfLog(const std::string& line) {
+    if (!perfEnabled()) return;
+    std::lock_guard<std::mutex> lock(perfMutex());
+    perfWrite(line);
+}
+
+// SSE 每个增量到达的时刻（工作线程调用），用来区分「上游攒批」和「界面慢」
+void perfLogDelta(std::size_t chars) {
+    if (!perfEnabled()) return;
+    std::lock_guard<std::mutex> lock(perfMutex());
+    static ULONGLONG lastTick = 0;
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG gap = lastTick ? (now - lastTick) : 0;
+    lastTick = now;
+    perfWrite(nowStamp() + " delta chars=" + std::to_string(chars) + " gap=" +
+              std::to_string(gap) + "ms");
+}
+
+std::string nowStamp() {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char buffer[32]{};
+    std::snprintf(buffer, sizeof(buffer), "%02d:%02d:%03d", st.wMinute, st.wSecond,
+                  st.wMilliseconds);
+    return buffer;
+}
 
 struct ModelFetchPayload {
     std::vector<std::string> ids;
@@ -312,6 +365,9 @@ struct AiTab::Impl {
     RECT dirty{};              // 待重绘区域（客户区坐标）
     bool dirtyFull = true;     // 整块都要重画（结构变化/尺寸变化/首次）
     int lastPaintMs = 0;       // 上一帧耗时，用来决定下一帧间隔
+    ULONGLONG lastFlushTick = 0;  // 上一次把文本交给面板的时刻（perf 日志用）
+    // 平滑展示：收到的字先进这里，每帧吐一小片，避免一秒一次的整段蹦出
+    std::wstring revealBuffer;
 
     // 双缓冲：直接画到窗口 DC 会先刷底色再描字，流式时肉眼可见闪烁
     HDC backDc = nullptr;
@@ -440,6 +496,7 @@ void AiTab::initialize(HWND) {
         impl_->agent.reset();
         panel_.clear();
         impl_->assistantIndex = static_cast<std::size_t>(-1);
+        impl_->revealBuffer.clear();
         {
             // 「新建」= 开一段新对话：清面板与上下文，标题/标签/文件名重置，
             // 但保留 autoLoadHost，否则刚放下的这段会被「自动接上」立刻载回来；
@@ -492,7 +549,9 @@ void AiTab::initialize(HWND) {
     // Agent 的流式回调 → 界面线程事件
     AgentCallbacks callbacks;
     callbacks.onText = [this](const std::string& chunk) {
-        if (!chunk.empty()) postEvent(EventKind::Text, toWideText(chunk));
+        if (chunk.empty()) return;
+        perfLogDelta(chunk.size());
+        postEvent(EventKind::Text, toWideText(chunk));
     };
     callbacks.onReasoning = [this](const std::string& chunk) {
         if (!chunk.empty()) postEvent(EventKind::Reasoning, toWideText(chunk));
@@ -505,6 +564,9 @@ void AiTab::initialize(HWND) {
     impl_->agent.setCallbacks(std::move(callbacks));
 
     if (context_.vault) loadApiKey(*context_.vault, impl_->apiKey);
+    // 宿主直接给的 Key 优先（自动化测试用；生产是保险库里的）
+    if (impl_->apiKey.empty() && !context_.apiKeyOverride.empty())
+        impl_->apiKey = context_.apiKeyOverride;
     updateHostLabel();
     updateWelcome();  // 空状态里已经带「打开设置」，不再重复加一条提示
 
@@ -716,6 +778,7 @@ void AiTab::sendMessage(const std::wstring& text) {
         return;
     }
 
+    impl_->revealBuffer.clear();  // 上一轮的字不该漏到这一轮
     // 锁定这一轮的目标标签：中途切标签也不会把命令打到别的机器上
     turnHostId = activeHostId();
 
@@ -846,6 +909,65 @@ void AiTab::requestRepaint() {
     scheduleRepaint();
 }
 
+// 每帧从展示缓冲里吐一小片：按积压的 1/12 追赶（约 6~8 帧，150 字 ≈ 120~190ms），
+// 积压很少时直接吐完，避免小批也要等好几帧。
+void AiTab::pumpReveal() {
+    if (impl_->revealBuffer.empty()) return;
+    const std::size_t backlog = impl_->revealBuffer.size();
+    std::size_t take = backlog <= 6 ? backlog : std::max<std::size_t>(2, backlog / 12);
+    take = std::min(take, backlog);
+    take = std::min<std::size_t>(take, 260);  // 单帧上限，别把一大段瞬间弹出来
+    if (impl_->assistantIndex == static_cast<std::size_t>(-1))
+        impl_->assistantIndex = panel_.beginAssistant();
+    panel_.appendAssistant(impl_->assistantIndex, impl_->revealBuffer.substr(0, take));
+    impl_->revealBuffer.erase(0, take);
+    requestChatRepaint();
+}
+
+// 一轮结束/取消时把剩下的直接倒出来，不让文字卡在缓冲里
+void AiTab::revealAll() {
+    if (impl_->revealBuffer.empty()) return;
+    if (impl_->assistantIndex == static_cast<std::size_t>(-1))
+        impl_->assistantIndex = panel_.beginAssistant();
+    panel_.appendAssistant(impl_->assistantIndex, impl_->revealBuffer);
+    impl_->revealBuffer.clear();
+}
+
+// 把工作线程攒下的文本并进面板。flush 消息和「一轮结束」都会调用：
+// 结束时若最后一小段还卡在 pendingText 里（消息被合并了），这里补上，别丢字。
+void AiTab::drainPendingStream() {
+    std::wstring text;
+    std::wstring reasoning;
+    {
+        std::lock_guard<std::mutex> lock(impl_->textMutex);
+        text.swap(impl_->pendingText);
+        reasoning.swap(impl_->pendingReasoning);
+    }
+    impl_->flushPosted = false;
+
+    const std::size_t none = static_cast<std::size_t>(-1);
+    if (!reasoning.empty()) {
+        if (impl_->assistantIndex != none) {
+            panel_.finishAssistant(impl_->assistantIndex, true);
+            impl_->assistantIndex = none;
+        }
+        panel_.appendReasoning(reasoning);
+    }
+    if (!text.empty()) {
+        // 上游常常一秒才推一批（150+ 字）：先进缓冲，由 pumpReveal 每帧吐一点，
+        // 观感才是逐行往下推，而不是整段蹦出来。
+        impl_->revealBuffer += text;
+        pumpReveal();
+    }
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG gap = impl_->lastFlushTick ? (now - impl_->lastFlushTick) : 0;
+    impl_->lastFlushTick = now;
+    if (!text.empty() || !reasoning.empty()) {
+        perfLog(nowStamp() + " flush chars=" + std::to_string(text.size()) + " gap=" +
+                std::to_string(gap) + "ms");
+    }
+}
+
 // 追加流式文本：只有最后一个气泡会变，脏区从它顶部算到底部。
 // 但内容超过一屏且贴着底部时，整段列表会随新行一起上移，这时必须重画整个消息区。
 void AiTab::requestChatRepaint() {
@@ -918,6 +1040,7 @@ void AiTab::handleEvent(Event& event) {
             return;
         }
         case EventKind::Tool: {
+            revealAll();  // 先把还没吐完的文字显示完，卡片才会排在它后面
             if (impl_->assistantIndex != none) {
                 panel_.finishAssistant(impl_->assistantIndex, true);
                 impl_->assistantIndex = none;
@@ -927,6 +1050,7 @@ void AiTab::handleEvent(Event& event) {
             return;
         }
         case EventKind::Approval: {
+            revealAll();
             if (impl_->assistantIndex != none) {
                 panel_.finishAssistant(impl_->assistantIndex, true);
                 impl_->assistantIndex = none;
@@ -940,6 +1064,8 @@ void AiTab::handleEvent(Event& event) {
             return;
         }
         case EventKind::TurnDone: {
+            drainPendingStream();  // 收尾：别把最后一小段落在缓冲里
+            revealAll();
             if (impl_->assistantIndex != none) {
                 panel_.finishAssistant(impl_->assistantIndex, event.ok);
                 impl_->assistantIndex = none;
@@ -1502,27 +1628,7 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
 
         case kAiFlushMessage: {
-            std::wstring text;
-            std::wstring reasoning;
-            {
-                std::lock_guard<std::mutex> lock(impl_->textMutex);
-                text.swap(impl_->pendingText);
-                reasoning.swap(impl_->pendingReasoning);
-            }
-            impl_->flushPosted = false;
-
-            const std::size_t none = static_cast<std::size_t>(-1);
-            if (!reasoning.empty()) {
-                if (impl_->assistantIndex != none) {
-                    panel_.finishAssistant(impl_->assistantIndex, true);
-                    impl_->assistantIndex = none;
-                }
-                panel_.appendReasoning(reasoning);
-            }
-            if (!text.empty()) {
-                if (impl_->assistantIndex == none) impl_->assistantIndex = panel_.beginAssistant();
-                panel_.appendAssistant(impl_->assistantIndex, text);
-            }
+            drainPendingStream();
             requestChatRepaint();
             return 0;
         }
@@ -1597,6 +1703,9 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                            area.bottom - area.top, impl_->backDc, area.left, area.top, SRCCOPY);
                 }
                 impl_->lastPaintMs = static_cast<int>(GetTickCount64() - started);
+                perfLog(nowStamp() + " paint ms=" + std::to_string(impl_->lastPaintMs) +
+                        " full=" + std::to_string(full ? 1 : 0) +
+                        " items=" + std::to_string(panel_.items().size()));
                 SelectObject(impl_->backDc, old);
             } else {
                 paint(dc);
@@ -1685,6 +1794,7 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             if (wParam == kRepaintTimer) {
                 KillTimer(window_, kRepaintTimer);
                 impl_->repaintPending = false;
+                pumpReveal();  // 缓冲里还有字就继续吐，并自动排下一帧
                 const bool full = impl_->dirtyFull || IsRectEmpty(&impl_->dirty);
                 RECT area = impl_->dirty;
                 impl_->dirty = RECT{};

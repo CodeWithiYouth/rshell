@@ -467,7 +467,9 @@ int ChatPanel::itemHeight(HDC dc, const ChatItem& item, int width) const {    co
             return labelFont + 4 + wrappedHeight(dc, item.body, fonts_.ui, width - 20) + 16;
 
         case ItemKind::Assistant: {
-            const int body = md::layout(dc, 0, 0, width, item.body, markdownStyle(dc), false);
+            // 走缓存：同一份文本只需要排一次版，之后一直是重放
+            if (!item.mdCache) item.mdCache = std::make_shared<md::LayoutCache>();
+            const int body = item.mdCache->build(dc, width, item.body, markdownStyle(dc));
             return labelFont + 4 + std::max(body, bodyFont) + 8;
         }
 
@@ -830,8 +832,10 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
                          accent, fonts_.caption, DT_LEFT | DT_TOP | DT_SINGLELINE);
             }
             RECT bodyRect{textLeft, rc.top + cap + 4, rc.right, rc.bottom};
-            md::layout(dc, bodyRect.left, bodyRect.top, bodyRect.right - bodyRect.left,
-                        item.body, markdownStyle(dc), true);
+            if (!item.mdCache) item.mdCache = std::make_shared<md::LayoutCache>();
+            item.mdCache->build(dc, bodyRect.right - bodyRect.left, item.body, markdownStyle(dc));
+            const RECT view = viewRect();
+            item.mdCache->draw(dc, bodyRect.left, bodyRect.top, &view);
             return;
         }
 

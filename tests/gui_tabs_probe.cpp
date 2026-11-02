@@ -1,5 +1,6 @@
 // GUI 状态回归使用隐藏窗口，不发送真实键鼠输入，不读取用户的会话配置。
 #include "../src/gui_main.cpp"
+#include "../src/md_render.h"
 #include <iostream>
 #include <stdexcept>
 
@@ -1074,6 +1075,29 @@ void aiPanelPaintBench() {
     run("long ", 60, longBody, 4);
     run("short", 12, shortBody, 1);
 
+    // 排版器本身：build 与 draw 分开计时（160KB 的极端文本）
+    {
+        md::Style style;
+        style.normal = g_app.uiFont;
+        style.bold = g_app.uiFontBold;
+        style.italic = g_app.uiFont;
+        style.mono = g_app.font;
+        for (auto& font : style.heading) font = g_app.uiFontBold;
+        style.bodyHeight = 20;
+
+        std::wstring big;
+        for (int i = 0; i < 40; ++i) big += longBody;
+        md::LayoutCache cache;
+        ULONGLONG t0 = GetTickCount64();
+        const int h = cache.build(dc, 420, big, style);
+        const ULONGLONG buildMs = GetTickCount64() - t0;
+        t0 = GetTickCount64();
+        for (int i = 0; i < 5; ++i) cache.draw(dc, 0, 0);
+        const double drawMs = static_cast<double>(GetTickCount64() - t0) / 5;
+        std::cout << "BENCH md build=" << buildMs << "ms draw=" << drawMs
+                  << "ms height=" << h << " bytes=" << (big.size() / 1024) << "KB\n";
+    }
+
     // 单条回答随长度增长时的单帧成本（流式时最关键的一条曲线）
     {
         ai::ChatPanel panel;
@@ -1104,6 +1128,126 @@ void aiPanelPaintBench() {
     DeleteObject(bmp);
     DeleteDC(dc);
     ReleaseDC(nullptr, screen);
+}
+
+// Markdown 排版缓存：增量喂入与一次性排版的最终结果必须一致
+void markdownCacheRegression() {
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 420, 600);
+    HGDIOBJ old = SelectObject(dc, bmp);
+
+    md::Style style;
+    style.normal = g_app.uiFont;
+    style.bold = g_app.uiFontBold;
+    style.italic = g_app.uiFont;
+    style.mono = g_app.font;
+    for (auto& font : style.heading) font = g_app.uiFontBold;
+    style.bodyHeight = 20;
+
+    std::wstring text =
+        L"先看一下服务状态，端口是否在听。\n\n"
+        L"- 第一项：**加粗** 与 `code`\n"
+        L"- 第二项：普通文字\n\n"
+        L"```bash\nsystemctl status nginx\nss -lntp | grep 8080\n```\n\n"
+        L"最后一段收尾，用来验证多次追加后的高度和一次排完一致。\n";
+
+    md::LayoutCache whole;
+    const int expected = whole.build(dc, 380, text, style);
+    check(expected > 0, "markdown layout reports a height");
+
+    // 同一份内容再 build 一次：不应重新折行
+    check(whole.build(dc, 380, text, style) == expected, "rebuild with the same text keeps the height");
+    check(whole.lastRebuiltBlocks() == 0, "unchanged text rebuilds no blocks");
+
+    // 模拟流式：每次追加几个字符，块级缓存应当只重排变化的块
+    md::LayoutCache incremental;
+    int maxRebuilt = 0;
+    for (std::size_t cut = 1; cut <= text.size(); cut += 7) {
+        const std::wstring prefix = text.substr(0, cut);
+        incremental.build(dc, 380, prefix, style);
+        maxRebuilt = std::max(maxRebuilt, static_cast<int>(incremental.lastRebuiltBlocks()));
+    }
+    incremental.build(dc, 380, text, style);
+    check(incremental.height() == expected, "incremental layout matches a single pass");
+    check(maxRebuilt <= 4, "streaming rebuilds only the changed tail blocks");
+
+    // 换宽度必须重排
+    const int narrow = incremental.build(dc, 300, text, style);
+    check(narrow >= expected, "narrower width never shrinks the text");
+    check(incremental.lastRebuiltBlocks() > 0, "a width change rebuilds every block");
+    check(incremental.height() == narrow, "height follows the width change");
+
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+}
+
+// 流式平滑：假服务器每 350ms 推一批 25 字，界面必须分很多小步展示。
+// 由 tests/ai_stream_e2e.py 设置环境变量后触发，平时跳过。
+void aiStreamSmoothingRegression() {
+    if (!std::getenv("RSHELL_AI_STREAM_TEST")) return;
+
+    ProbeSessionBackend store;
+    ai::AiTabContext context;
+    context.uiFont = g_app.uiFont;
+    context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font;
+    context.captionFont = g_app.tinyFont;
+    context.hosts = [&store]() {
+        ai::AiHostInfo host;
+        host.id = 7;
+        host.label = L"stream-probe";
+        host.backend = &store;  // 假模型不调用工具，不会被当成 RemoteFs 用
+        return std::vector<ai::AiHostInfo>{host};
+    };
+    context.activeHostId = []() { return static_cast<std::uintptr_t>(7); };
+    context.apiKeyOverride = "test-key";
+
+    ai::AiTab* tab = ai::AiTab::create(g_app.main, context);
+    check(tab != nullptr, "stream panel is created");
+    tab->setBounds(RECT{0, 0, 520, 760});
+    tab->show(true);
+    tab->sendMessage(L"验证平滑输出");
+
+    std::size_t last = 0;
+    int steps = 0;
+    ULONGLONG lastChange = GetTickCount64();
+    const ULONGLONG deadline = GetTickCount64() + 30000;
+    while (GetTickCount64() < deadline) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        Sleep(5);
+
+        const ai::ChatItem* assistant = nullptr;
+        for (const auto& item : tab->transcript())
+            if (item.kind == ai::ItemKind::Assistant) assistant = &item;
+        const std::size_t size = assistant ? assistant->body.size() : 0;
+        const bool streaming = assistant ? assistant->streaming : true;
+        if (size != last) {
+            last = size;
+            ++steps;
+            lastChange = GetTickCount64();
+        }
+        if (!streaming && last > 0 && GetTickCount64() - lastChange > 600) break;
+    }
+
+    const char* expectedEnv = std::getenv("RSHELL_AI_EXPECT");
+    const std::size_t expected =
+        expectedEnv ? static_cast<std::size_t>(std::strtoull(expectedEnv, nullptr, 10)) : 0;
+    std::cout << "STREAM steps=" << steps << " chars=" << last << " expected=" << expected << "\n";
+    for (const auto& item : tab->transcript()) {
+        std::string body(item.body.begin(), item.body.end());
+        if (body.size() > 120) body.resize(120);
+        std::cout << "  item kind=" << static_cast<int>(item.kind) << " body=" << body << "\n";
+    }
+    check(expected > 0 && last == expected, "every streamed character reaches the panel");
+    check(steps >= 20, "text is revealed in many small steps, not one jump per batch");
+    ai::AiTab::destroy(tab);
 }
 
 // 局部重绘：只画最后一个气泡的区域时，其余条目要跳过但不能出错
@@ -1257,6 +1401,8 @@ int main(int argc, char** argv) {
         fsCollapseRegression();
         pasteFocusRegression();
         aiPanelPaintBench();
+        aiStreamSmoothingRegression();
+        markdownCacheRegression();
         aiPanelPartialPaintRegression();
         mainMenuRegression();
         submenuHoverRegression();

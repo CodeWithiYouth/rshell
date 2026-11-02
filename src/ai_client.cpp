@@ -4,7 +4,9 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <mutex>
 
 #include "util.h"
 
@@ -15,6 +17,43 @@
 #endif
 
 namespace rshell::ai {
+
+namespace {
+
+// RSHELL_AI_PERF=1 时记录每次 WinHttpReadData 的时间与字节数，
+// 用来判断「流式是不是被传输层攒批了」。生产开着也只是多几行日志。
+void perfMark(const char* tag) {
+    static const bool enabled = std::getenv("RSHELL_AI_PERF") != nullptr;
+    if (!enabled) return;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char line[128]{};
+    std::snprintf(line, sizeof(line), "%02d:%02d:%03d mark %s\n", st.wMinute, st.wSecond,
+                  st.wMilliseconds, tag);
+    std::ofstream out(utf8ToPath(homeDirectory() + "/.rshell/ai-perf.log"),
+                      std::ios::binary | std::ios::app);
+    if (out) out << line;
+}
+
+void readLog(DWORD got) {
+    static const bool enabled = std::getenv("RSHELL_AI_PERF") != nullptr;
+    if (!enabled) return;
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char line[96]{};
+    std::snprintf(line, sizeof(line), "%02d:%02d:%03d read bytes=%lu\n", st.wMinute, st.wSecond,
+                  st.wMilliseconds, static_cast<unsigned long>(got));
+    std::ofstream out(utf8ToPath(homeDirectory() + "/.rshell/ai-perf.log"),
+                      std::ios::binary | std::ios::app);
+    if (out) out << line;
+}
+
+}  // namespace
+
 
 // ------------------------------------------------------------------ SSE 解码
 
@@ -246,7 +285,8 @@ bool isLoopbackHost(const std::string& authority) {
 
 // Win7 没有 AUTOMATIC_PROXY(4)，失败必须回退 DEFAULT_PROXY(0)。
 // TLS 1.3 标志在 Win7 上会被拒绝，失败只保留 TLS 1.2。
-Handle openSession(const ApiConfig& config) {    constexpr DWORD kAccessAutomaticProxy = 4;  // WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY，Win8.1+
+Handle openSession(const ApiConfig& config) {
+    constexpr DWORD kAccessAutomaticProxy = 4;  // WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY（Win8.1+）
     constexpr DWORD kAccessDefaultProxy = 0;    // WINHTTP_ACCESS_TYPE_DEFAULT_PROXY
 
     const std::wstring agent = toWide(config.userAgent);
@@ -277,11 +317,18 @@ std::string readAll(HINTERNET request) {
     std::string out;
     char buffer[8192];
     for (;;) {
-        DWORD got = 0;
-        if (!WinHttpReadData(request, buffer, sizeof(buffer), &got)) break;
-        if (got == 0) break;
-        out.append(buffer, got);
-        if (out.size() > 1024u * 1024u) break;  // 模型列表比错误体重，给 1 MB
+        // 先问可用字节数：直接盲读会一直等到缓冲区填满或连接关闭，
+        // 服务端保持长连接时就会卡到超时
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request, &available) || available == 0) break;
+        while (available > 0) {
+            const DWORD want = std::min<DWORD>(available, sizeof(buffer));
+            DWORD got = 0;
+            if (!WinHttpReadData(request, buffer, want, &got) || got == 0) return out;
+            out.append(buffer, got);
+            if (out.size() > 1024u * 1024u) return out;
+            available = (got >= available) ? 0 : available - got;
+        }
     }
     return out;
 }
@@ -386,7 +433,8 @@ ModelCatalog listModels(const ApiConfig& config, const std::string& url) {
             result.error = "发送请求失败：" + lastErrorText();
             return result;
         }
-        if (!WinHttpReceiveResponse(request.get(), nullptr)) {
+        perfMark("sent");
+    if (!WinHttpReceiveResponse(request.get(), nullptr)) {
             result.error = "读取响应失败：" + lastErrorText();
             return result;
         }
@@ -598,6 +646,7 @@ ChatResult Client::chat(const std::vector<Message>& messages, const std::vector<
         headers += L"x-opencode-session: " + toWide(config_.sessionId) + L"\r\n";
     }
 
+    perfMark("send");
     if (!WinHttpSendRequest(request.get(), headers.c_str(), static_cast<DWORD>(headers.size()),
                             const_cast<char*>(body.data()), static_cast<DWORD>(body.size()),
                             static_cast<DWORD>(body.size()), 0)) {
@@ -607,6 +656,7 @@ ChatResult Client::chat(const std::vector<Message>& messages, const std::vector<
         throw Error("读取 AI 响应失败：" + lastErrorText());
     }
 
+    perfMark("received");
     DWORD status = 0;
     DWORD statusSize = sizeof(status);
     WinHttpQueryHeaders(request.get(), WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
@@ -633,23 +683,39 @@ ChatResult Client::chat(const std::vector<Message>& messages, const std::vector<
     });
 
     bool cancelled = false;
+    // 先问「现在有多少字节」再按实际长度读：直接按 16 KB 盲读时，
+    // WinHTTP 会一直等到缓冲区填满或连接关闭，流式就变成「整段一次性到达」。
     char buffer[16384];
     for (;;) {
         if (shouldCancel && shouldCancel()) {
             cancelled = true;
             break;
         }
-        DWORD got = 0;
-        if (!WinHttpReadData(request.get(), buffer, sizeof(buffer), &got)) {
-            // 取消时句柄可能已被外部关闭，不把这种情况当错误上报
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(request.get(), &available)) {
             if (shouldCancel && shouldCancel()) {
                 cancelled = true;
                 break;
             }
             throw Error("读取 AI 响应失败：" + lastErrorText());
         }
-        if (got == 0) break;
-        decoder.feed(std::string_view(buffer, got));
+        if (available == 0) break;  // 响应结束
+        while (available > 0) {
+            const DWORD want = std::min<DWORD>(available, sizeof(buffer));
+            DWORD got = 0;
+            if (!WinHttpReadData(request.get(), buffer, want, &got)) {
+                if (shouldCancel && shouldCancel()) {
+                    cancelled = true;
+                    break;
+                }
+                throw Error("读取 AI 响应失败：" + lastErrorText());
+            }
+            if (got == 0) break;
+            readLog(got);
+            decoder.feed(std::string_view(buffer, got));
+            available = (got >= available) ? 0 : available - got;
+        }
+        if (cancelled) break;
     }
     decoder.finish();
 

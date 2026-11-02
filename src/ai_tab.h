@@ -62,6 +62,8 @@ struct AiTabContext {
     // 宿主弹一个自绘列表让用户挑（历史会话）。pt 是屏幕坐标，
     // 返回选中下标，-1 表示取消。没有提供时，「历史」只提示不弹窗。
     std::function<int(POINT, const std::vector<std::wstring>&)> pickFromList;
+    // 直接指定 API Key（不写保险库）。生产走 vault，这里只给自动化测试和宿主预置用。
+    std::string apiKeyOverride;
 };
 
 class AiTab {
@@ -91,6 +93,9 @@ public:
     void startSettings(bool unlockOnly = false);
     // 设置表单是否展开（回归测试用：取消解锁时不能打开）
     bool settingsOpen() const { return settingsOpen_; }
+    // 宿主也可以直接发一条（命令行入口、自动化测试）
+    void sendMessage(const std::wstring& text);
+    void cancelTurn();
 
 private:
     AiTab() = default;
@@ -101,8 +106,6 @@ private:
 
     void initialize(HWND parent);
     void applyTheme();
-    void sendMessage(const std::wstring& text);
-    void cancelTurn();
     void finishSettings(bool save);
     void createSettingsControls();
     void layoutSettings();
@@ -132,6 +135,9 @@ private:
         bool flag = false;
         std::shared_ptr<void> payload;  // 审批用的等待槽
     };
+    void drainPendingStream();      // 把工作线程攒的文本并进展示缓冲
+    void pumpReveal();              // 每帧吐一小片，做平滑展示
+    void revealAll();               // 收尾时把缓冲一次倒完
     void requestRepaint();          // 整块重绘（结构变化）
     void requestChatRepaint();      // 只脏流式气泡（追加文本）
     void scheduleRepaint();         // 合并到下一帧，按上帧耗时自适应间隔

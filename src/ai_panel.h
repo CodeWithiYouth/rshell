@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cstddef>
+#include <memory>
 #include <functional>
 #include <string>
 #include <vector>
@@ -16,7 +17,7 @@
 #endif
 
 namespace rshell {
-namespace md { struct Style; }
+namespace md { struct Style; class LayoutCache; }
 }  // namespace rshell
 
 namespace rshell::ai {
@@ -45,6 +46,8 @@ struct ChatItem {
     bool awaitApproval = false;
     bool decided = false;
     bool approved = false;
+    // 助手消息的排版缓存：内容不变时只重放，流式时只重排变化的块
+    mutable std::shared_ptr<md::LayoutCache> mdCache;
 };
 
 struct PanelFonts {

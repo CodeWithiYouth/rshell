@@ -1,5 +1,6 @@
 // GUI 状态回归使用隐藏窗口，不发送真实键鼠输入，不读取用户的会话配置。
 #include "../src/gui_main.cpp"
+#include "../src/md_render.h"
 #include <iostream>
 #include <stdexcept>
 
@@ -989,6 +990,29 @@ void aiPanelPaintBench() {
     run("long ", 60, longBody, 4);
     run("short", 12, shortBody, 1);
 
+    // 排版器本身：build 与 draw 分开计时（160KB 的极端文本）
+    {
+        md::Style style;
+        style.normal = g_app.uiFont;
+        style.bold = g_app.uiFontBold;
+        style.italic = g_app.uiFont;
+        style.mono = g_app.font;
+        for (auto& font : style.heading) font = g_app.uiFontBold;
+        style.bodyHeight = 20;
+
+        std::wstring big;
+        for (int i = 0; i < 40; ++i) big += longBody;
+        md::LayoutCache cache;
+        ULONGLONG t0 = GetTickCount64();
+        const int h = cache.build(dc, 420, big, style);
+        const ULONGLONG buildMs = GetTickCount64() - t0;
+        t0 = GetTickCount64();
+        for (int i = 0; i < 5; ++i) cache.draw(dc, 0, 0);
+        const double drawMs = static_cast<double>(GetTickCount64() - t0) / 5;
+        std::cout << "BENCH md build=" << buildMs << "ms draw=" << drawMs
+                  << "ms height=" << h << " bytes=" << (big.size() / 1024) << "KB\n";
+    }
+
     // 单条回答随长度增长时的单帧成本（流式时最关键的一条曲线）
     {
         ai::ChatPanel panel;
@@ -1014,6 +1038,60 @@ void aiPanelPaintBench() {
         }
         panel.finishAssistant(index, true);
     }
+
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+}
+
+// Markdown 排版缓存：增量喂入与一次性排版的最终结果必须一致
+void markdownCacheRegression() {
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 420, 600);
+    HGDIOBJ old = SelectObject(dc, bmp);
+
+    md::Style style;
+    style.normal = g_app.uiFont;
+    style.bold = g_app.uiFontBold;
+    style.italic = g_app.uiFont;
+    style.mono = g_app.font;
+    for (auto& font : style.heading) font = g_app.uiFontBold;
+    style.bodyHeight = 20;
+
+    std::wstring text =
+        L"先看一下服务状态，端口是否在听。\n\n"
+        L"- 第一项：**加粗** 与 `code`\n"
+        L"- 第二项：普通文字\n\n"
+        L"```bash\nsystemctl status nginx\nss -lntp | grep 8080\n```\n\n"
+        L"最后一段收尾，用来验证多次追加后的高度和一次排完一致。\n";
+
+    md::LayoutCache whole;
+    const int expected = whole.build(dc, 380, text, style);
+    check(expected > 0, "markdown layout reports a height");
+
+    // 同一份内容再 build 一次：不应重新折行
+    check(whole.build(dc, 380, text, style) == expected, "rebuild with the same text keeps the height");
+    check(whole.lastRebuiltBlocks() == 0, "unchanged text rebuilds no blocks");
+
+    // 模拟流式：每次追加几个字符，块级缓存应当只重排变化的块
+    md::LayoutCache incremental;
+    int maxRebuilt = 0;
+    for (std::size_t cut = 1; cut <= text.size(); cut += 7) {
+        const std::wstring prefix = text.substr(0, cut);
+        incremental.build(dc, 380, prefix, style);
+        maxRebuilt = std::max(maxRebuilt, static_cast<int>(incremental.lastRebuiltBlocks()));
+    }
+    incremental.build(dc, 380, text, style);
+    check(incremental.height() == expected, "incremental layout matches a single pass");
+    check(maxRebuilt <= 4, "streaming rebuilds only the changed tail blocks");
+
+    // 换宽度必须重排
+    const int narrow = incremental.build(dc, 300, text, style);
+    check(narrow >= expected, "narrower width never shrinks the text");
+    check(incremental.lastRebuiltBlocks() > 0, "a width change rebuilds every block");
+    check(incremental.height() == narrow, "height follows the width change");
 
     SelectObject(dc, old);
     DeleteObject(bmp);
@@ -1172,6 +1250,7 @@ int main(int argc, char** argv) {
         fsCollapseRegression();
         pasteFocusRegression();
         aiPanelPaintBench();
+        markdownCacheRegression();
         aiPanelPartialPaintRegression();
         mainMenuRegression();
         updateCheckRegression();

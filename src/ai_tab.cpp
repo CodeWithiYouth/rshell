@@ -4,7 +4,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
+#include <fstream>
 #include <random>
 #include <condition_variable>
 #include <memory>
@@ -64,6 +67,27 @@ constexpr int kAutoH = 26;
 constexpr int kSaveSessionTop = kAutoTop + kAutoH + 8;
 constexpr int kButtonTop = kSaveSessionTop + kAutoH + 14;
 constexpr int kButtonHeight = 34;
+
+// RSHELL_AI_PERF=1 时把流式节奏写进 ~/.rshell/ai-perf.log：
+// 每次收到多少字、距上次多久、每一帧画了多久。用来区分「网络一段一段给」
+// 和「界面画得慢」，只写界面线程，不需要加锁。
+void perfLog(const std::string& line) {
+    static const bool enabled = std::getenv("RSHELL_AI_PERF") != nullptr;
+    if (!enabled) return;
+    std::ofstream out(utf8ToPath(homeDirectory() + "/.rshell/ai-perf.log"),
+                      std::ios::binary | std::ios::app);
+    if (!out) return;
+    out << line << "\n";
+}
+
+std::string nowStamp() {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char buffer[32]{};
+    std::snprintf(buffer, sizeof(buffer), "%02d:%02d:%03d", st.wMinute, st.wSecond,
+                  st.wMilliseconds);
+    return buffer;
+}
 
 struct ModelFetchPayload {
     std::vector<std::string> ids;
@@ -312,6 +336,7 @@ struct AiTab::Impl {
     RECT dirty{};              // 待重绘区域（客户区坐标）
     bool dirtyFull = true;     // 整块都要重画（结构变化/尺寸变化/首次）
     int lastPaintMs = 0;       // 上一帧耗时，用来决定下一帧间隔
+    ULONGLONG lastFlushTick = 0;  // 上一次把文本交给面板的时刻（perf 日志用）
 
     // 双缓冲：直接画到窗口 DC 会先刷底色再描字，流式时肉眼可见闪烁
     HDC backDc = nullptr;
@@ -846,6 +871,39 @@ void AiTab::requestRepaint() {
     scheduleRepaint();
 }
 
+// 把工作线程攒下的文本并进面板。flush 消息和「一轮结束」都会调用：
+// 结束时若最后一小段还卡在 pendingText 里（消息被合并了），这里补上，别丢字。
+void AiTab::drainPendingStream() {
+    std::wstring text;
+    std::wstring reasoning;
+    {
+        std::lock_guard<std::mutex> lock(impl_->textMutex);
+        text.swap(impl_->pendingText);
+        reasoning.swap(impl_->pendingReasoning);
+    }
+    impl_->flushPosted = false;
+
+    const std::size_t none = static_cast<std::size_t>(-1);
+    if (!reasoning.empty()) {
+        if (impl_->assistantIndex != none) {
+            panel_.finishAssistant(impl_->assistantIndex, true);
+            impl_->assistantIndex = none;
+        }
+        panel_.appendReasoning(reasoning);
+    }
+    if (!text.empty()) {
+        if (impl_->assistantIndex == none) impl_->assistantIndex = panel_.beginAssistant();
+        panel_.appendAssistant(impl_->assistantIndex, text);
+    }
+    const ULONGLONG now = GetTickCount64();
+    const ULONGLONG gap = impl_->lastFlushTick ? (now - impl_->lastFlushTick) : 0;
+    impl_->lastFlushTick = now;
+    if (!text.empty() || !reasoning.empty()) {
+        perfLog(nowStamp() + " flush chars=" + std::to_string(text.size()) + " gap=" +
+                std::to_string(gap) + "ms");
+    }
+}
+
 // 追加流式文本：只有最后一个气泡会变，脏区从它顶部算到底部。
 // 但内容超过一屏且贴着底部时，整段列表会随新行一起上移，这时必须重画整个消息区。
 void AiTab::requestChatRepaint() {
@@ -940,6 +998,7 @@ void AiTab::handleEvent(Event& event) {
             return;
         }
         case EventKind::TurnDone: {
+            drainPendingStream();  // 收尾：别把最后一小段落在缓冲里
             if (impl_->assistantIndex != none) {
                 panel_.finishAssistant(impl_->assistantIndex, event.ok);
                 impl_->assistantIndex = none;
@@ -1502,27 +1561,7 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
 
         case kAiFlushMessage: {
-            std::wstring text;
-            std::wstring reasoning;
-            {
-                std::lock_guard<std::mutex> lock(impl_->textMutex);
-                text.swap(impl_->pendingText);
-                reasoning.swap(impl_->pendingReasoning);
-            }
-            impl_->flushPosted = false;
-
-            const std::size_t none = static_cast<std::size_t>(-1);
-            if (!reasoning.empty()) {
-                if (impl_->assistantIndex != none) {
-                    panel_.finishAssistant(impl_->assistantIndex, true);
-                    impl_->assistantIndex = none;
-                }
-                panel_.appendReasoning(reasoning);
-            }
-            if (!text.empty()) {
-                if (impl_->assistantIndex == none) impl_->assistantIndex = panel_.beginAssistant();
-                panel_.appendAssistant(impl_->assistantIndex, text);
-            }
+            drainPendingStream();
             requestChatRepaint();
             return 0;
         }
@@ -1597,6 +1636,9 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                            area.bottom - area.top, impl_->backDc, area.left, area.top, SRCCOPY);
                 }
                 impl_->lastPaintMs = static_cast<int>(GetTickCount64() - started);
+                perfLog(nowStamp() + " paint ms=" + std::to_string(impl_->lastPaintMs) +
+                        " full=" + std::to_string(full ? 1 : 0) +
+                        " items=" + std::to_string(panel_.items().size()));
                 SelectObject(impl_->backDc, old);
             } else {
                 paint(dc);

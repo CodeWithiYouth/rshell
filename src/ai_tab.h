@@ -132,6 +132,7 @@ private:
         bool flag = false;
         std::shared_ptr<void> payload;  // 审批用的等待槽
     };
+    void drainPendingStream();      // 把工作线程攒的文本并进面板
     void requestRepaint();          // 整块重绘（结构变化）
     void requestChatRepaint();      // 只脏流式气泡（追加文本）
     void scheduleRepaint();         // 合并到下一帧，按上帧耗时自适应间隔

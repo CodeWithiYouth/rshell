@@ -1194,6 +1194,65 @@ void aiPanelPaintBench() {
     run("long ", 60, longBody, 4);
     run("short", 12, shortBody, 1);
 
+    // 思考过程（默认展开）：以前每帧整段 DrawText 重排，思考一多窗口就拖不动。
+    // 这里测两种情况：静态多条目全量重绘、流式追加逐帧重绘。
+    {
+        auto makePanel = [&](ai::ChatPanel& panel) {
+            ai::PanelFonts fonts;
+            fonts.ui = g_app.uiFont;
+            fonts.bold = g_app.uiFontBold;
+            fonts.mono = g_app.font;
+            fonts.caption = g_app.tinyFont;
+            panel.setFonts(fonts);
+            panel.setBounds(RECT{0, 0, 460, 760});
+        };
+
+        ai::ChatPanel panel;
+        makePanel(panel);
+        for (int i = 0; i < 20; ++i) {
+            panel.addUser(L"思考 " + std::to_wstring(i + 1));
+            for (int k = 0; k < 6; ++k) panel.appendReasoning(longBody);
+            panel.addTool(L"读取", L"", true, L"");  // 工具会结束当前思考段，下一段重新开始
+            const std::size_t index = panel.beginAssistant();
+            panel.appendAssistant(index, shortBody);
+            panel.finishAssistant(index, true);
+        }
+        auto nowMs = []() {
+            LARGE_INTEGER c{}, f{};
+            QueryPerformanceCounter(&c);
+            QueryPerformanceFrequency(&f);
+            return static_cast<double>(c.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
+        };
+        panel.paint(dc);
+        constexpr int kRounds = 50;
+        double t0 = nowMs();
+        for (int i = 0; i < kRounds; ++i) panel.paint(dc);
+        const double reasoningFull = (nowMs() - t0) / kRounds;
+        t0 = nowMs();
+        for (int i = 0; i < kRounds; ++i) {
+            const RECT area = panel.lastItemRect();
+            panel.paint(dc, &area);
+        }
+        const double reasoningPart = (nowMs() - t0) / kRounds;
+        std::cout << "BENCH reason-static items=100 full=" << reasoningFull
+                  << "ms partial=" << reasoningPart << "ms\n";
+
+        // 流式：一条思考边追加边画，共 2000 次小追加（每次只重绘最后一块）
+        ai::ChatPanel stream;
+        makePanel(stream);
+        stream.addUser(L"流式思考");
+        constexpr int kChunks = 2000;
+        const double s0 = nowMs();
+        for (int i = 0; i < kChunks; ++i) {
+            stream.appendReasoning(longBody.substr((i % 8) * 10, 10));
+            const RECT area = stream.lastItemRect();
+            stream.paint(dc, IsRectEmpty(&area) ? nullptr : &area);
+        }
+        const double reasoningStream = (nowMs() - s0) / kChunks;
+        std::cout << "BENCH reason-stream chunks=" << kChunks << " avg=" << reasoningStream
+                  << "ms\n";
+    }
+
     // 排版器本身：build 与 draw 分开计时（160KB 的极端文本）
     {
         md::Style style;
@@ -1303,6 +1362,70 @@ void markdownCacheRegression() {
     ReleaseDC(nullptr, screen);
 }
 
+// 思考过程：长文本在流式追加时只切最后一行，内容没变时重绘完全不重新排版。
+// 以前这里是每帧 DrawText 整段重排，思考一长窗口就拖不动（100 条长思考单帧 45ms，
+// 流式每帧平均 1.2s），所以用切行计数把"增量"行为锁住。
+void reasoningWrapRegression() {
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 440, 620);
+    HGDIOBJ old = SelectObject(dc, bmp);
+
+    ai::ChatPanel panel;
+    ai::PanelFonts fonts;
+    fonts.ui = g_app.uiFont;
+    fonts.bold = g_app.uiFontBold;
+    fonts.mono = g_app.font;
+    fonts.caption = g_app.tinyFont;
+    panel.setFonts(fonts);
+    panel.setBounds(RECT{0, 0, 440, 620});
+
+    const std::wstring paragraph =
+        L"先确认端口在听，再看进程是不是还活着。\n"
+        L"如果 ss 没有输出，说明服务根本没起来，先看 systemctl status。\n\n";
+
+    std::wstring body;
+    for (int i = 0; i < 40; ++i) body += paragraph;
+
+    const std::size_t beforeFirst = panel.reasoningLinesCut();
+    panel.appendReasoning(body);
+    panel.paint(dc);
+    check(panel.reasoningLinesCut() > beforeFirst, "a long reasoning block gets wrapped");
+
+    // 文本没变时重绘：不应再切任何行
+    const std::size_t beforeRepaint = panel.reasoningLinesCut();
+    for (int i = 0; i < 5; ++i) panel.paint(dc);
+    check(panel.reasoningLinesCut() == beforeRepaint,
+          "repainting unchanged reasoning cuts no lines");
+
+    // 流式追加一小段：只重切最后一行（加上新增的那行），前面几十行必须复用
+    const std::size_t beforeAppend = panel.reasoningLinesCut();
+    panel.appendReasoning(L"再补一句结论。\n");
+    panel.paint(dc);
+    const std::size_t appended = panel.reasoningLinesCut() - beforeAppend;
+    check(appended <= 2,
+          ("appending a small chunk only cuts the tail, got " + std::to_string(appended)).c_str());
+
+    // 高度在重复重绘之间保持稳定
+    const int height = panel.contentHeight();
+    panel.paint(dc);
+    check(panel.contentHeight() == height, "reasoning height stays stable across repaints");
+
+    // 增量切行得到的高度，必须和"同样内容一次性排版"完全一致
+    ai::ChatPanel once;
+    once.setFonts(fonts);
+    once.setBounds(RECT{0, 0, 440, 620});
+    once.appendReasoning(body + L"再补一句结论。\n");
+    once.paint(dc);
+    check(once.contentHeight() == height,
+          "incremental reasoning wrapping matches a single pass");
+
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+}
+
 // 流式平滑：假服务器每 350ms 推一批 25 字，界面必须分很多小步展示。
 // 由 tests/ai_stream_e2e.py 设置环境变量后触发，平时跳过。
 void aiStreamSmoothingRegression() {
@@ -1367,6 +1490,153 @@ void aiStreamSmoothingRegression() {
     check(expected > 0 && last == expected, "every streamed character reaches the panel");
     check(steps >= 20, "text is revealed in many small steps, not one jump per batch");
     ai::AiTab::destroy(tab);
+}
+
+// 超长思考过程：假服务器每 50ms 推 500 字 reasoning_content。
+// 以前面板每帧把它整段重排，拖动窗口会卡死（单帧 1 秒以上）；
+// 现在应该稳定在一帧几十毫秒内，而且文字完整。
+void reasoningStreamRegression() {
+    if (!std::getenv("RSHELL_AI_REASON_TEST")) return;
+
+    ProbeSessionBackend store;
+    ai::AiTabContext context;
+    context.uiFont = g_app.uiFont;
+    context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font;
+    context.captionFont = g_app.tinyFont;
+    context.hosts = [&store]() {
+        ai::AiHostInfo host;
+        host.id = 7;
+        host.label = L"reason-probe";
+        host.backend = &store;
+        return std::vector<ai::AiHostInfo>{host};
+    };
+    context.activeHostId = []() { return static_cast<std::uintptr_t>(7); };
+    context.apiKeyOverride = "test-key";
+
+    ai::AiTab* tab = ai::AiTab::create(g_app.main, context);
+    check(tab != nullptr, "reasoning panel is created");
+    tab->setBounds(RECT{0, 0, 520, 760});
+    tab->show(true);
+    tab->sendMessage(L"先想一下再回答");
+
+    // 隐藏的测试窗口收不到 WM_PAINT，直接画到内存 DC，走的是同一个 paint()
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 520, 760);
+    HGDIOBJ oldBmp = SelectObject(dc, bmp);
+
+    std::size_t last = 0;
+    int steps = 0;
+    double worstPaint = 0;
+    double paintTotal = 0;
+    int paintCount = 0;
+    ULONGLONG lastChange = GetTickCount64();
+    const ULONGLONG deadline = GetTickCount64() + 60000;
+    while (GetTickCount64() < deadline) {
+        MSG message{};
+        while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+        Sleep(5);
+
+        std::size_t size = 0;
+        bool streaming = true;
+        for (const auto& item : tab->transcript()) {
+            if (item.kind == ai::ItemKind::Reasoning) {
+                size = item.body.size();
+                streaming = item.streaming;
+            }
+        }
+        if (size != last) {
+            last = size;
+            ++steps;
+            // 追加之后这一帧的真实耗时（全量重绘，最坏情况）
+            const double painted = tab->paintForTest(dc);
+            worstPaint = std::max(worstPaint, painted);
+            paintTotal += painted;
+            ++paintCount;
+            lastChange = GetTickCount64();
+        }
+        if (!streaming && last > 0 && GetTickCount64() - lastChange > 800) break;
+    }
+
+    const char* expectedEnv = std::getenv("RSHELL_AI_EXPECT_REASONING");
+    const std::size_t expected =
+        expectedEnv ? static_cast<std::size_t>(std::strtoull(expectedEnv, nullptr, 10)) : 0;
+    const double average = paintCount > 0 ? paintTotal / paintCount : 0.0;
+    std::cout << "REASON steps=" << steps << " chars=" << last << " expected=" << expected
+              << " paints=" << paintCount << " avgPaint=" << average << "ms worstPaint="
+              << worstPaint << "ms\n";
+    check(expected > 0 && last == expected, "every streamed reasoning character reaches the panel");
+    check(steps >= 10, "reasoning arrives in many chunks, not one final blob");
+    // 旧实现是每帧整段 DrawText，20000 字时单帧 1 秒以上；这里给一个宽松上界
+    check(paintCount > 0 && worstPaint < 150,
+          ("reasoning paint stays under 150ms, got " +
+           std::to_string(static_cast<int>(worstPaint))).c_str());
+    check(average < 45, ("reasoning paint averages under 45ms, got " +
+                         std::to_string(static_cast<int>(average))).c_str());
+
+    SelectObject(dc, oldBmp);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+    ai::AiTab::destroy(tab);
+}
+
+// 头部「全屏 / 暂停」按钮：点一下要切换，面板变宽后按钮跟着走、还能点回来。
+// （用户报过“全屏按钮失效”，实际是长思考时一帧几百毫秒，点击排不上队。）
+void aiPanelFullButtonRegression() {
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 1200, 700);
+    HGDIOBJ old = SelectObject(dc, bmp);
+
+    ai::ChatPanel panel;
+    ai::PanelFonts fonts;
+    fonts.ui = g_app.uiFont;
+    fonts.bold = g_app.uiFontBold;
+    fonts.mono = g_app.font;
+    fonts.caption = g_app.tinyFont;
+    panel.setFonts(fonts);
+    panel.setBounds(RECT{0, 0, 440, 620});
+
+    int toggles = 0;
+    ai::PanelActions actions;
+    actions.onToggleFullScreen = [&]() {
+        ++toggles;
+        panel.setFullScreen(!panel.fullScreen());
+    };
+    panel.setCallbacks(actions);
+
+    // 按钮排在关闭按钮左边：14(内边距) + 32(关闭) + 6 + 48*2 + 6*2，中心距右边 184
+    auto clickFull = [&](int width) {
+        const POINT pt{width - 184, 17};
+        panel.onMouseDown(pt);
+        panel.onMouseUp(pt);
+    };
+
+    panel.paint(dc);
+    clickFull(440);
+    check(toggles == 1 && panel.fullScreen(), "the header fullscreen button switches to full");
+    check(panel.fullScreen(), "panel reports full screen after the click");
+
+    // 全屏后面板变宽，按钮跟着移动；再点一次要能回来
+    panel.setBounds(RECT{0, 0, 1200, 700});
+    panel.paint(dc);
+    clickFull(1200);
+    check(toggles == 2 && !panel.fullScreen(), "the same button brings the panel back to docked");
+
+    // 点空白处不应该触发
+    panel.onMouseDown(POINT{200, 300});
+    panel.onMouseUp(POINT{200, 300});
+    check(toggles == 2, "clicking the message area does not toggle full screen");
+
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
 }
 
 // 局部重绘：只画最后一个气泡的区域时，其余条目要跳过但不能出错
@@ -1521,7 +1791,10 @@ int main(int argc, char** argv) {
         pasteFocusRegression();
         aiPanelPaintBench();
         aiStreamSmoothingRegression();
+        reasoningStreamRegression();
+        aiPanelFullButtonRegression();
         markdownCacheRegression();
+        reasoningWrapRegression();
         aiPanelPartialPaintRegression();
         mainMenuRegression();
         submenuHoverRegression();

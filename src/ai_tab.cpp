@@ -578,6 +578,21 @@ void AiTab::setFullScreen(bool full) {
     InvalidateRect(window_, nullptr, FALSE);
 }
 
+int AiTab::lastPaintMs() const {
+    return impl_->lastPaintMs;
+}
+
+double AiTab::paintForTest(HDC dc, const RECT* dirty) {
+    LARGE_INTEGER freq{}, start{};
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+    paint(dc, dirty);
+    LARGE_INTEGER end{};
+    QueryPerformanceCounter(&end);
+    return static_cast<double>(end.QuadPart - start.QuadPart) * 1000.0 /
+           static_cast<double>(freq.QuadPart);
+}
+
 void AiTab::setBounds(const RECT& bounds) {
     if (!window_) return;
     MoveWindow(window_, bounds.left, bounds.top, bounds.right - bounds.left,

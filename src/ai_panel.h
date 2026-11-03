@@ -22,6 +22,9 @@ namespace md { struct Style; class LayoutCache; }
 
 namespace rshell::ai {
 
+// 思考过程的换行缓存：流式追加时只从"最后一个未完成行"继续切，
+// 绘制变成逐行 TextOut（见 ai_panel.cpp）。
+struct WrapCache;
 
 enum class ItemKind {
     User,
@@ -48,6 +51,8 @@ struct ChatItem {
     bool approved = false;
     // 助手消息的排版缓存：内容不变时只重放，流式时只重排变化的块
     mutable std::shared_ptr<md::LayoutCache> mdCache;
+    // 思考过程的换行缓存：默认展开的长文本如果每帧重排整段，拖动窗口会卡死
+    mutable std::shared_ptr<WrapCache> wrapCache;
 };
 
 struct PanelFonts {
@@ -85,6 +90,10 @@ public:
     RECT composerRect() const;
     RECT lastItemRect() const;
     // 内容是否超过一屏（超过且贴底时，新行会让整段上移）
+    // 诊断 / 回归测试：所有思考条目累计切了多少行。
+    // 文本没变化时重绘不应再增加（防止退回"每帧整段重排"）。
+    std::size_t reasoningLinesCut() const;
+    // 面板内容是否超过一屏（用于切换滚动条显示）
     bool contentOverflows() const { return contentHeight_ > viewportHeight_; }
     int contentHeight() const { return contentHeight_; }
 

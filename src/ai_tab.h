@@ -82,6 +82,11 @@ public:
     std::wstring hostLabel() const { return currentHostLabel(); }
     // 供回归测试观察对话内容与「历史」按钮位置
     const std::vector<ChatItem>& transcript() const { return panel_.items(); }
+    // 上一帧绘制耗时（毫秒）；流式/长文本的性能回归用它观察有没有卡帧
+    int lastPaintMs() const;
+    // 回归测试：把整个面板画到给定 DC 上并返回耗时（毫秒，QPC 精度）。
+    // 走的就是 WM_PAINT 里的那个 paint()，只是测量更可控（隐藏窗口不会有 WM_PAINT）。
+    double paintForTest(HDC dc, const RECT* dirty = nullptr);
     RECT historyButton() const { return panel_.historyRect(); }
     // 回归测试用：按会话名解析工具后端，走的是和工具调用完全相同的路径
     void* resolveHostForTest(const std::string& name) const {

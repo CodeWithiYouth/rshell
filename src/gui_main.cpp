@@ -128,6 +128,9 @@ ID_BTN_FS_TOGGLE,   // 文件面板：折叠 / 展开
     IDM_FS_REFRESH,
     IDM_FS_COPY_PATH,
     IDM_FS_GOTO,  // 转到目录…（路径条也能点）
+    IDM_FS_EDIT,         // 下载到本地副本并用编辑器打开
+    IDM_FS_EDIT_SYSTEM,  // 忽略已设置的编辑器，用系统默认程序打开
+    IDM_FS_EDITOR,       // 选择 / 更换文本编辑器
     // 密码保险库：新建 / 解锁 / 锁定同一个入口，标签随状态变
     IDM_VAULT = 2201,
 };
@@ -227,6 +230,35 @@ struct App : SessionState {
     bool hoverUpdateChip = false;
     bool updateCheckManual = false;
     bool updateCheckOnStart = true;
+    // 远端文件的本地编辑副本：下载到 ~/.rshell/edit，编辑器保存后自动回传。
+    // editorPath 为空表示用系统默认程序打开。
+    std::wstring editorPath;
+    struct EditedFile {
+        UINT_PTR connectionId = 0;
+        std::string remote;
+        std::wstring local;
+        std::wstring name;
+        std::weak_ptr<RemoteFs> fs;  // 标签关闭后自动失效，别把连接吊在后台
+        bool downloading = false;
+        bool uploading = false;
+        bool dirty = false;  // 本地副本与上次同步的内容不一致
+        bool failed = false;
+        bool observed = false;
+        // 基线：最近一次与远端一致时本地文件的大小/时间
+        std::uint64_t syncedSize = 0;
+        FILETIME syncedWrite{};
+        // 最近观察到的本地状态：用来判断编辑器是否已经停止写入
+        std::uint64_t seenSize = 0;
+        FILETIME seenWrite{};
+        // 本次上传开始时的快照：传完发现文件又变了就再排一次
+        std::uint64_t uploadSize = 0;
+        FILETIME uploadWrite{};
+        ULONGLONG changedAt = 0;
+        ULONGLONG lastScan = 0;
+        ULONGLONG retryAt = 0;
+        std::shared_ptr<std::atomic<bool>> cancel;
+    };
+    std::vector<EditedFile> editedFiles;
     int splitDrag = 0;     // 0=没在拖 1=文件面板 2=AI 面板
     int splitStartX = 0;
     int splitStartW = 0;
@@ -469,7 +501,13 @@ void setAiPanelFull(bool full);
 bool askHostKey(const std::string& host, const std::string& keyType,
                 const std::string& fingerprint, UINT_PTR connectionId = 0);
 void openSessionManager(bool startBlank = false);
+void saveUiLayout();
 void openFileContextMenu(HWND hwnd, POINT screenPt);
+// 远端文件编辑：下载本地副本、启动编辑器、监视保存并自动回传
+void fsEditSelected(bool systemDefault);
+void chooseEditor();
+void pollEditedFiles();
+void dropEditedFiles(UINT_PTR connectionId);
 // 传输任务（状态栏列表）：新增、取消、清理已完成、展开高度
 void addDownloadTask(const std::string& remote, const std::wstring& name, std::uint64_t total,
                      bool drag, std::shared_ptr<std::atomic<bool>> cancel,
@@ -2418,6 +2456,8 @@ bool sendCwdHookScript() {
 void disconnectSession() {
     stopCwdHook();
     cancelAutoReconnect(true);
+    // 连接没了，本地编辑副本无法回传；停止跟踪（文件仍留在 ~/.rshell/edit）
+    dropEditedFiles(g_app.connectionId);
     g_app.connectionId = g_nextConnectionId++;
     if (g_app.shell->running() || g_app.connecting) {
         if (g_app.connecting) g_app.shell = std::make_shared<SshShell>();
@@ -2466,6 +2506,8 @@ void connectToSession(const Session& session, const std::wstring& password,
     stopCwdHook();
     g_app.shellGotOutput = false;
     g_app.lastShellOutputTick = g_app.lastKeyTick = 0;
+    // 上一轮连接可能还留着编辑跟踪；新连接不一定还是同一台主机
+    dropEditedFiles(g_app.connectionId);
     g_app.connectionId = g_nextConnectionId++;
     const UINT_PTR connectionId = g_app.connectionId;
     g_app.shell->close();  // 等旧工作线程结束后才能替换回调。
@@ -6115,6 +6157,347 @@ void fsDeleteSelected() {
     setStatus(L"正在删除 " + toWide(entry->name) + L" …");
 }
 
+// ---------------------------------------------------------------- 远端文件编辑
+//
+// 流程：右键「编辑」→ 下载到 ~/.rshell/edit/<路径哈希>/<文件名> → 用编辑器打开 →
+// 定时比较本地大小/时间，编辑器停手约 1 秒后自动传回远端。
+// 本地目录按远端完整路径哈希分桶，不同目录下的同名文件不会互相覆盖。
+
+constexpr std::uint64_t kMaxEditableBytes = 8ull * 1024 * 1024;
+constexpr ULONGLONG kEditScanMs = 900;    // 多久看一次本地副本
+constexpr ULONGLONG kEditQuietMs = 900;   // 编辑器停手多久才回传，避免写一半就上传
+constexpr ULONGLONG kEditRetryMs = 15000; // 回传失败后的自动重试间隔
+
+std::string editPathHash(const std::string& path) {
+    // FNV-1a：只用来给本地目录分桶，不涉及安全
+    std::uint64_t hash = 1469598103934665603ull;
+    for (unsigned char byte : path) {
+        hash ^= byte;
+        hash *= 1099511628211ull;
+    }
+    char text[17];
+    std::snprintf(text, sizeof(text), "%016llx", static_cast<unsigned long long>(hash));
+    return text;
+}
+
+// 远端文件名不能直接当 Windows 文件名：斜杠、冒号、保留名都要换掉
+std::wstring editLocalName(const std::string& remotePath) {
+    std::wstring name = toWide(remoteBaseName(remotePath));
+    if (name.empty() || name == L"." || name == L"..") name = L"remote-file";
+    for (wchar_t& ch : name) {
+        if (ch < 32 || wcschr(L"<>:\\\"/|?*", ch) != nullptr) ch = L'_';
+    }
+    const std::string stem = toLower(toUtf8(name.substr(0, name.find(L'.'))));
+    static const char* const reserved[] = {"con",  "prn",  "aux",  "nul",  "com1", "com2",
+                                          "com3", "com4", "com5", "com6", "com7", "com8",
+                                          "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5",
+                                          "lpt6", "lpt7", "lpt8", "lpt9"};
+    for (const char* item : reserved) {
+        if (stem == item) {
+            name = L"_" + name;
+            break;
+        }
+    }
+    if (name.size() > 96) {
+        const std::size_t dot = name.find_last_of(L'.');
+        const std::wstring ext =
+            (dot != std::wstring::npos && name.size() - dot <= 12) ? name.substr(dot) : L"";
+        name = name.substr(0, 96 - ext.size()) + ext;
+    }
+    return name;
+}
+
+std::wstring editLocalPathFor(const std::string& remotePath) {
+    const fs::path dir = utf8ToPath(homeDirectory()) / L".rshell" / L"edit" /
+                         toWide(editPathHash(remotePath));
+    return (dir / editLocalName(remotePath)).wstring();
+}
+
+bool sameFileTime(const FILETIME& a, const FILETIME& b) {
+    return a.dwLowDateTime == b.dwLowDateTime && a.dwHighDateTime == b.dwHighDateTime;
+}
+
+bool readLocalFileState(const std::wstring& path, std::uint64_t& size, FILETIME& write) {
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) return false;
+    size = (static_cast<std::uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    write = data.ftLastWriteTime;
+    return true;
+}
+
+// 下载完成后的粗判：开头一小段有 NUL 就当二进制，别把它塞进文本编辑器
+bool looksLikeTextFile(const fs::path& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char buffer[8192];
+    in.read(buffer, sizeof(buffer));
+    const std::streamsize count = in.gcount();
+    if (count <= 0) return true;
+    const auto* bytes = reinterpret_cast<const unsigned char*>(buffer);
+    if (count >= 2 && ((bytes[0] == 0xFF && bytes[1] == 0xFE) ||
+                       (bytes[0] == 0xFE && bytes[1] == 0xFF))) {
+        return true;  // UTF-16 BOM：NUL 是正常的
+    }
+    if (count >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF) {
+        return std::memchr(buffer + 3, '\0', static_cast<std::size_t>(count - 3)) == nullptr;
+    }
+    return std::memchr(buffer, '\0', static_cast<std::size_t>(count)) == nullptr;
+}
+
+std::wstring editorDisplayName() {
+    if (g_app.editorPath.empty()) return L"系统默认程序";
+    const std::wstring name = fs::path(g_app.editorPath).filename().wstring();
+    return name.empty() ? g_app.editorPath : name;
+}
+
+App::EditedFile* findEditedFile(UINT_PTR connectionId, const std::string& remote) {
+    for (auto& edit : g_app.editedFiles) {
+        if (edit.connectionId == connectionId && edit.remote == remote) return &edit;
+    }
+    return nullptr;
+}
+
+void dropEditedFiles(UINT_PTR connectionId) {
+    for (auto& edit : g_app.editedFiles) {
+        if (edit.connectionId == connectionId && edit.cancel) edit.cancel->store(true);
+    }
+    g_app.editedFiles.erase(
+        std::remove_if(g_app.editedFiles.begin(), g_app.editedFiles.end(),
+                       [connectionId](const App::EditedFile& edit) {
+                           return edit.connectionId == connectionId;
+                       }),
+        g_app.editedFiles.end());
+}
+
+bool launchEditorFor(const std::wstring& local, bool systemDefault) {
+    INT_PTR result = 0;
+    if (!systemDefault && !g_app.editorPath.empty()) {
+        const std::wstring arguments = L"\"" + local + L"\"";
+        result = reinterpret_cast<INT_PTR>(ShellExecuteW(g_app.main, L"open",
+                                                         g_app.editorPath.c_str(),
+                                                         arguments.c_str(), nullptr,
+                                                         SW_SHOWNORMAL));
+    } else {
+        result = reinterpret_cast<INT_PTR>(
+            ShellExecuteW(g_app.main, L"open", local.c_str(), nullptr, nullptr, SW_SHOWNORMAL));
+    }
+    return result > 32;
+}
+
+// 下载结束（成功 / 失败 / 取消）后统一收尾；返回 true 表示这次事件属于编辑流程
+bool finishEditDownload(const std::string& remote, bool ok) {
+    App::EditedFile* edit = findEditedFile(g_app.connectionId, remote);
+    if (!edit || !edit->downloading) return false;
+    edit->downloading = false;
+    if (!ok) {
+        const std::wstring name = edit->name;
+        g_app.editedFiles.erase(g_app.editedFiles.begin() +
+                                (edit - g_app.editedFiles.data()));
+        setStatus(L"无法下载 " + name + L" 用于编辑", true);
+        return true;
+    }
+
+    const std::wstring name = edit->name;
+    const std::wstring local = edit->local;
+    if (!looksLikeTextFile(utf8ToPath(toUtf8(local)))) {
+        std::error_code ec;
+        fs::remove(utf8ToPath(toUtf8(local)), ec);
+        g_app.editedFiles.erase(g_app.editedFiles.begin() +
+                                (edit - g_app.editedFiles.data()));
+        setStatus(name + L" 看起来是二进制文件，未打开编辑器", true);
+        if (foregroundSession()) {
+            messageWarn(L"无法编辑此文件",
+                        L"「" + name +
+                            L"」看起来不是文本文件。\n可以先用右键菜单里的「下载到本地…」保存，再用其它程序打开。");
+        }
+        return true;
+    }
+
+    std::uint64_t size = 0;
+    FILETIME write{};
+    if (readLocalFileState(local, size, write)) {
+        edit->syncedSize = edit->seenSize = size;
+        edit->syncedWrite = edit->seenWrite = write;
+        edit->observed = true;
+    }
+    edit->dirty = false;
+    edit->failed = false;
+    edit->retryAt = 0;
+
+    if (launchEditorFor(local, false)) {
+        setStatus(L"已打开 " + name + L"，保存后会自动上传到远端", false, 8000);
+    } else {
+        setStatus(L"无法启动编辑器：" + editorDisplayName(), true);
+        if (foregroundSession()) {
+            messageError(L"无法启动编辑器",
+                         L"请确认编辑器还在原来的位置，或在文件面板右键「选择文本编辑器…」重新指定。",
+                         g_app.editorPath.empty() ? L"系统默认程序没有打开这个文件。"
+                                                  : g_app.editorPath);
+        }
+    }
+    return true;
+}
+
+// 回传结束：成功就把当前状态记成新基线；失败保留本地修改并延后重试
+bool finishEditUpload(const std::string& remote, bool ok) {
+    App::EditedFile* edit = findEditedFile(g_app.connectionId, remote);
+    if (!edit || !edit->uploading) return false;
+    edit->uploading = false;
+    edit->cancel.reset();
+    if (!ok) {
+        edit->failed = true;
+        edit->dirty = true;
+        edit->retryAt = GetTickCount64() + kEditRetryMs;
+        return true;
+    }
+
+    edit->syncedSize = edit->uploadSize;
+    edit->syncedWrite = edit->uploadWrite;
+    edit->failed = false;
+    edit->retryAt = 0;
+    // 上传期间编辑器可能又写了一次：保持 dirty，等下一轮再传
+    std::uint64_t size = 0;
+    FILETIME write{};
+    if (readLocalFileState(edit->local, size, write) &&
+        (size != edit->syncedSize || !sameFileTime(write, edit->syncedWrite))) {
+        edit->seenSize = size;
+        edit->seenWrite = write;
+        edit->observed = true;
+        edit->dirty = true;
+        edit->changedAt = GetTickCount64();
+    } else {
+        edit->dirty = false;
+    }
+    setStatus(L"已把 " + edit->name + L" 的修改保存到远端", false, 6000);
+    return true;
+}
+
+void pollEditedFiles() {
+    if (g_app.editedFiles.empty()) return;
+    const ULONGLONG now = GetTickCount64();
+    for (auto it = g_app.editedFiles.begin(); it != g_app.editedFiles.end();) {
+        if (it->downloading || it->uploading) {
+            ++it;
+            continue;
+        }
+        if (now - it->lastScan < kEditScanMs) {
+            ++it;
+            continue;
+        }
+        it->lastScan = now;
+        std::shared_ptr<RemoteFs> remote = it->fs.lock();
+        if (!remote) {
+            it = g_app.editedFiles.erase(it);
+            continue;
+        }
+        std::uint64_t size = 0;
+        FILETIME write{};
+        if (!readLocalFileState(it->local, size, write)) {
+            // 本地副本被删掉了（用户手动清理或编辑器改名），停止跟踪
+            it = g_app.editedFiles.erase(it);
+            continue;
+        }
+        if (!it->observed || size != it->seenSize || !sameFileTime(write, it->seenWrite)) {
+            it->seenSize = size;
+            it->seenWrite = write;
+            it->observed = true;
+            if (size != it->syncedSize || !sameFileTime(write, it->syncedWrite)) {
+                it->dirty = true;
+                it->changedAt = now;
+            } else {
+                it->dirty = false;
+            }
+        }
+        if (!it->dirty || now - it->changedAt < kEditQuietMs || now < it->retryAt) {
+            ++it;
+            continue;
+        }
+
+        it->uploading = true;
+        it->uploadSize = it->seenSize;
+        it->uploadWrite = it->seenWrite;
+        it->cancel = std::make_shared<std::atomic<bool>>(false);
+        if (foregroundSession() && it->connectionId == g_app.connectionId) {
+            setStatus(L"正在把 " + it->name + L" 的修改保存到远端…");
+        }
+        remote->upload(toUtf8(it->local), it->remote, it->cancel);
+        ++it;
+    }
+}
+
+void fsEditSelected(bool systemDefault) {
+    const RemoteEntry* entry = selectedFileEntry();
+    if (!entry || !entry->isFile()) {
+        setStatus(L"请先选择一个文件再编辑", true);
+        return;
+    }
+    if (!g_app.fsReady) {
+        messageWarn(L"SFTP 未就绪", L"文件通道还没连上，请稍后再试。");
+        return;
+    }
+
+    // 已经在编辑同一个文件：直接重新打开本地副本，别再下载一次覆盖未保存的修改
+    if (App::EditedFile* open = findEditedFile(g_app.connectionId, entry->path)) {
+        if (open->downloading) {
+            setStatus(L"文件还在下载，完成后会自动打开编辑器…", false, 6000);
+            return;
+        }
+        if (launchEditorFor(open->local, systemDefault)) {
+            setStatus(L"已打开 " + open->name + L"，保存后会自动上传到远端", false, 8000);
+        } else {
+            setStatus(L"无法启动编辑器：" + editorDisplayName(), true);
+        }
+        return;
+    }
+
+    if (entry->size > kMaxEditableBytes) {
+        messageWarn(L"文件太大",
+                    L"「" + toWide(entry->name) + L"」有 " + toWide(formatBytes(entry->size)) +
+                        L"，超过在线编辑上限 8 MB。\n请先用右键菜单里的「下载到本地…」保存。");
+        return;
+    }
+
+    const std::wstring local = editLocalPathFor(entry->path);
+    std::error_code ec;
+    fs::create_directories(utf8ToPath(toUtf8(local)).parent_path(), ec);
+    fs::remove(utf8ToPath(toUtf8(local)), ec);  // 清掉上次遗留的副本，免得和这次下载混在一起
+
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    App::EditedFile edit;
+    edit.connectionId = g_app.connectionId;
+    edit.remote = entry->path;
+    edit.local = local;
+    edit.name = toWide(entry->name);
+    edit.fs = g_app.fs;
+    edit.downloading = true;
+    edit.cancel = cancel;
+    g_app.editedFiles.push_back(std::move(edit));
+
+    addDownloadTask(entry->path, toWide(entry->name), entry->size, false, cancel);
+    g_app.fs->download(entry->path, toUtf8(local), cancel);
+    setStatus(L"正在下载 " + toWide(entry->name) + L" 以便编辑…");
+}
+
+void chooseEditor() {
+    std::vector<wchar_t> path(4096, L'\0');
+    if (!g_app.editorPath.empty()) {
+        wcsncpy_s(path.data(), path.size(), g_app.editorPath.c_str(), _TRUNCATE);
+    }
+    OPENFILENAMEW ofn{};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_app.main;
+    ofn.lpstrFile = path.data();
+    ofn.nMaxFile = static_cast<DWORD>(path.size());
+    ofn.lpstrFilter = L"程序 (*.exe)\0*.exe\0所有文件\0*.*\0\0";
+    ofn.lpstrTitle = L"选择文本编辑器";
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+    if (!GetOpenFileNameW(&ofn)) return;
+
+    g_app.editorPath = path.data();
+    saveUiLayout();
+    setStatus(L"文本编辑器已设置为 " + editorDisplayName(), false, 8000);
+}
+
 // ---------------------------------------------------------------- 单行输入对话框
 
 struct TextPromptState {
@@ -6748,11 +7131,12 @@ void beginDragOut(HWND hwnd) {
 }
 
 
-// 文件面板右键菜单：上传 / 新建文件夹 / 下载 / 删除 / 复制路径 / 刷新 / 断开
-void openFileContextMenu(HWND hwnd, POINT screenPt) {
+// 文件面板右键菜单：上传 / 新建文件夹 / 下载 / 编辑 / 删除 / 复制路径 / 刷新 / 断开
+std::vector<popup::Item> buildFileContextMenu() {
     const RemoteEntry* entry = selectedFileEntry();
     const bool ready = g_app.fsReady;
     const bool connected = g_app.shell->running() || g_app.connecting;
+    const bool editable = ready && entry != nullptr && entry->isFile();
 
     std::vector<popup::Item> items;
     auto add = [&items](int id, const wchar_t* text, const wchar_t* shortcut = L"",
@@ -6774,15 +7158,24 @@ void openFileContextMenu(HWND hwnd, POINT screenPt) {
     add(IDM_FS_UPLOAD, L"上传文件…", L"", ready);
     add(IDM_FS_MKDIR, L"新建文件夹…", L"", ready);
     sep();
-    add(IDM_FS_DOWNLOAD, L"下载到本地…", L"", ready && entry != nullptr && entry->isFile());
+    add(IDM_FS_DOWNLOAD, L"下载到本地…", L"", editable);
+    add(IDM_FS_EDIT, L"编辑", L"", editable);
+    // 已经设置过编辑器时，额外给一个不走自定义编辑器的入口
+    if (!g_app.editorPath.empty()) add(IDM_FS_EDIT_SYSTEM, L"用系统默认程序编辑", L"", editable);
     add(IDM_FS_DELETE, L"删除", L"Delete", ready && entry != nullptr, true);
     add(IDM_FS_COPY_PATH, L"复制路径", L"", entry != nullptr);
     sep();
     add(IDM_FS_GOTO, L"转到目录…", L"Ctrl+L", ready);
     add(IDM_FS_REFRESH, L"刷新", L"F5", ready);
     sep();
+    add(IDM_FS_EDITOR,
+        g_app.editorPath.empty() ? L"选择文本编辑器…" : L"更换文本编辑器…");
     add(IDM_DISCONNECT, L"断开连接", L"", connected, true);
+    return items;
+}
 
+void openFileContextMenu(HWND hwnd, POINT screenPt) {
+    const std::vector<popup::Item> items = buildFileContextMenu();
     (void)hwnd;
     const int id = popup::run(g_app.main, screenPt, items);
     if (id > 0) SendMessageW(g_app.main, WM_COMMAND, MAKEWPARAM(id, 0), 0);
@@ -7111,6 +7504,8 @@ void handleFsEvent(const FsEvent& event) {
         return;
     }
     if (event.kind == FsEventKind::Cancelled) {
+        if (event.upload) finishEditUpload(event.path, false);
+        else finishEditDownload(event.path, false);
         if (App::DownloadTask* task = findDownloadTask(event.path, event.upload)) {
             task->state = App::DownloadState::Cancelled;
             setStatus((task->upload ? L"已取消上传 " : L"已取消下载 ") + task->name);
@@ -7167,31 +7562,40 @@ void handleFsEvent(const FsEvent& event) {
         }
         case FsEventKind::Done: {
             if (g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
+            // 编辑流程先收尾：成功回传要把本地状态记成新基线，下载成功才启动编辑器
+            const bool edited = event.upload ? finishEditUpload(event.path, true)
+                                             : finishEditDownload(event.path, true);
             App::DownloadTask* task = findDownloadTask(event.path, event.upload);
             if (task) {
                 task->state = App::DownloadState::Done;
                 if (task->total > 0) task->done = task->total;
                 // 拖动下载不知道最终落盘路径（由资源管理器决定），文案要区分开
-                setStatus(task->drag ? task->name + L" 已保存到拖放位置"
-                                     : toWide(event.message));
+                if (!edited) {
+                    setStatus(task->drag ? task->name + L" 已保存到拖放位置"
+                                         : toWide(event.message));
+                }
                 syncDownloadLayout();
-            } else {
+            } else if (!edited) {
                 setStatus(toWide(event.message));
             }
             // 批量上传时只在全部完成后刷新一次，避免队列里堆一串 listDir
             if ((!task || event.upload) && g_app.fsPendingUploads == 0) fsRefresh();
             break;
         }
-        case FsEventKind::Error:
+        case FsEventKind::Error: {
             g_app.fsLoading = false;
             if (g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
+            const bool editFailed = event.upload ? finishEditUpload(event.path, false)
+                                                 : finishEditDownload(event.path, false);
+            const std::wstring retryHint =
+                editFailed && event.upload ? L"；本地修改已保留，15 秒后自动重试" : L"";
             if (App::DownloadTask* task = findDownloadTask(event.path, event.upload)) {
                 task->state = App::DownloadState::Failed;
-                setStatus(toWide(event.message), true);
+                setStatus(toWide(event.message) + retryHint, true);
                 syncDownloadLayout();
                 break;
             }
-            setStatus(toWide(event.message), true);
+            setStatus(toWide(event.message) + retryHint, true);
             // 终端跟随 / 路径框跳转失败（没有权限、目录已删除）只在面板里提示，
             // 不弹模态框：用户可能只是 cd 进了一个进不去的目录，提示够用
             if (!g_app.fsQuietPath.empty() && event.path == g_app.fsQuietPath) {
@@ -7202,6 +7606,7 @@ void handleFsEvent(const FsEvent& event) {
             }
             if (foregroundSession()) messageError(L"远端操作失败", L"操作没有完成。", toWide(event.message));
             break;
+        }
     }
     if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
@@ -7225,7 +7630,14 @@ void loadUiLayout() {
         const auto eq = line.find('=');
         if (eq == std::string::npos) continue;
         const std::string key = trim(line.substr(0, eq));
-        const int value = std::atoi(line.c_str() + eq + 1);
+        const std::string raw = line.substr(eq + 1);
+        // 编辑器是字符串路径（可能带中文），不能走下面的 atoi
+        if (key == "editor") {
+            const std::string path = trim(raw);
+            if (!path.empty()) g_app.editorPath = toWide(path);
+            continue;
+        }
+        const int value = std::atoi(raw.c_str());
         if (value <= 0) continue;
         if (key == "sidebar") g_app.sidebarWanted = static_cast<int>(value * scale);
         else if (key == "aidock") g_app.aiDockWanted = static_cast<int>(value * scale);
@@ -7253,6 +7665,7 @@ void saveUiLayout() {
     out << "aidock=" << aiLogical << "\n";
     out << "fscollapsed=" << (g_app.fsCollapsed ? 1 : 0) << "\n";
     out << "updatecheck=" << (g_app.updateCheckOnStart ? 1 : 0) << "\n";
+    if (!g_app.editorPath.empty()) out << "editor=" << toUtf8(g_app.editorPath) << "\n";
 }
 
 // 拖拽中的分隔条：1=文件面板 2=AI 面板 0=没有
@@ -8846,6 +9259,9 @@ std::vector<popup::Item> buildMainMenu() {
     tools.push_back(leaf(IDM_TOGGLE_UPDATE_CHECK,
                          g_app.updateCheckOnStart ? L"启动时检查更新 · 已开启"
                                                   : L"启动时检查更新 · 已关闭"));
+    tools.push_back(leaf(IDM_FS_EDITOR,
+                         g_app.editorPath.empty() ? L"选择文本编辑器…"
+                                                  : L"更换文本编辑器…"));
 
     // ---- 帮助
     std::vector<popup::Item> help;
@@ -9174,6 +9590,7 @@ void setAiPanelFull(bool full) {
 void disposeSessionState(SessionState& state) {
     for (UINT_PTR timer = kCwdHookTimer1; timer <= kCwdHookTimer4; ++timer)
         KillTimer(g_app.main, state.tabId * 8 + timer);
+    dropEditedFiles(state.connectionId);
     state.connectionId = g_nextConnectionId++;
     for (auto& task : state.downloads) if (task.cancel) task.cancel->store(true);
     state.fs->stop();
@@ -9583,6 +10000,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (g_app.term) InvalidateRect(g_app.term, nullptr, FALSE);
                 // 列目录还没回来时让「正在加载」的三个点动起来
                 if (g_app.fsLoading && g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
+                // 编辑器的保存没有通知：靠本地文件大小/时间判断是否该回传
+                pollEditedFiles();
             } else if (wp == kUpdateCheckTimer) {
                 KillTimer(hwnd, kUpdateCheckTimer);
                 startUpdateCheck(false);
@@ -9755,6 +10174,15 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case IDM_FS_DOWNLOAD:
                     fsOpenEntry(g_app.fsSel);
+                    return 0;
+                case IDM_FS_EDIT:
+                    fsEditSelected(false);
+                    return 0;
+                case IDM_FS_EDIT_SYSTEM:
+                    fsEditSelected(true);
+                    return 0;
+                case IDM_FS_EDITOR:
+                    chooseEditor();
                     return 0;
                 case IDM_FS_DELETE:
                     fsDeleteSelected();

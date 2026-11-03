@@ -997,8 +997,11 @@ void fileEditRegression() {
     g_app.editorPath.clear();
 
     auto findItem = [](const std::vector<popup::Item>& items, int id) -> const popup::Item* {
-        for (const auto& item : items)
+        for (const auto& item : items) {
             if (item.id == id) return &item;
+            for (const auto& child : item.children)
+                if (child.id == id) return &child;
+        }
         return nullptr;
     };
     auto items = buildFileContextMenu();
@@ -1007,6 +1010,34 @@ void fileEditRegression() {
     check(findItem(items, IDM_FS_EDITOR) != nullptr, "the editor picker is always reachable");
     check(findItem(items, IDM_FS_EDIT_SYSTEM) == nullptr,
           "the system-default entry only appears after an editor is configured");
+
+    // 新建文件 / 新建文件夹共用一个二级菜单，顶层不再各占一行
+    const popup::Item* createGroup = nullptr;
+    bool topLevelNewFile = false;
+    for (const auto& item : items) {
+        if (item.text == L"新建" && !item.children.empty()) createGroup = &item;
+        if (item.id == IDM_FS_NEW_FILE) topLevelNewFile = true;
+        check(item.id != IDM_FS_MKDIR, "the old folder command is no longer top-level");
+    }
+    check(!topLevelNewFile, "new file only lives in the create submenu");
+    check(createGroup != nullptr, "the create submenu exists");
+    check(createGroup->children.size() == 2, "the create submenu has both commands");
+    check(createGroup->children[0].id == IDM_FS_NEW_FILE &&
+              createGroup->children[0].text == L"新建文件…" &&
+              createGroup->children[0].enabled,
+          "new file is the first create command");
+    check(createGroup->children[1].id == IDM_FS_MKDIR &&
+              createGroup->children[1].text == L"新建文件夹…" &&
+              createGroup->children[1].enabled,
+          "new folder follows new file in the same submenu");
+
+    g_app.fsReady = false;
+    items = buildFileContextMenu();
+    const popup::Item* disabledNewFile = findItem(items, IDM_FS_NEW_FILE);
+    check(disabledNewFile != nullptr && !disabledNewFile->enabled,
+          "new file waits for the SFTP channel");
+    g_app.fsReady = true;
+    items = buildFileContextMenu();
 
     g_app.editorPath = L"C:\\Tools\\Notepad++.exe";
     items = buildFileContextMenu();
@@ -1414,6 +1445,9 @@ void aiPanelPartialPaintRegression() {
 
 // 检查更新：发现新版本时，标题栏出现可点击的提示胶囊
 void updateCheckRegression() {
+    check(!g_app.updateTag.empty(), "the title bar exposes the current version");
+    check(!g_app.updateNewer, "the current version is not marked as an update");
+
     ReleaseInfo newer;
     newer.ok = true;
     newer.tag = "v99.9.9";
@@ -1423,6 +1457,7 @@ void updateCheckRegression() {
     handleUpdateResult(newer);
     check(g_app.updateTag == "v99.9.9", "a newer release is remembered");
     check(g_app.updateUrl == "https://example.invalid/rshell", "its page url is remembered");
+    check(g_app.updateNewer, "a newer release is highlighted");
     {
         // 提示胶囊是在 paintTitleBar 里算出来的，探针窗口不显示，得自己画一次
         RECT client{};
@@ -1437,20 +1472,33 @@ void updateCheckRegression() {
     check(g_app.updateChip.left > 0 && g_app.updateChip.right < g_app.titleAi.left,
           "the update chip sits left of the AI button");
 
-    // 同版本不提示
+    // 同版本也保留版本胶囊，只是不再标成“有新版”，仍然能点进发布页
     g_app.updateTag.clear();
     g_app.updateUrl.clear();
     ReleaseInfo same;
     same.ok = true;
     same.tag = std::string("v") + appVersion();
     handleUpdateResult(same);
-    check(g_app.updateTag.empty(), "the same version does not raise a chip");
+    check(g_app.updateTag == same.tag && !g_app.updateNewer,
+          "the same version still exposes a release link");
+    check(g_app.updateUrl == "https://github.com/CodeWithiYouth/rshell/releases",
+          "the same version falls back to the releases page");
+    {
+        RECT client{};
+        GetClientRect(g_app.main, &client);
+        HDC screen = GetDC(nullptr);
+        HDC dc = CreateCompatibleDC(screen);
+        paintTitleBar(dc, RECT{0, 0, client.right, g_app.titleH});
+        DeleteDC(dc);
+        ReleaseDC(nullptr, screen);
+    }
+    check(!IsRectEmpty(&g_app.updateChip), "the current version chip stays visible");
 
-    // 请求失败只在日志里记一笔
+    // 请求失败只在日志里记一笔，保留上一次的版本胶囊
     ReleaseInfo failed;
     failed.error = "network down";
     handleUpdateResult(failed);
-    check(g_app.updateTag.empty(), "a failed check keeps the UI quiet");
+    check(g_app.updateTag == same.tag, "a failed check keeps the last known version");
 }
 
 void titleAiButtonRegression() {

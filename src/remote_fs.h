@@ -113,6 +113,8 @@ public:
     // 以下都是异步入队，结果通过 onEvent 返回
     void listDir(const std::string& path);
     void mkdir(const std::string& path);
+    // 新建空文件；同名文件已存在时失败，不覆盖原文件
+    void createFile(const std::string& path);
     void remove(const std::string& path, bool isDir);
     void rename(const std::string& from, const std::string& to);
     // cancel 非空时，传输会在每块数据前检查它，置 true 即中断并删掉半截本地文件

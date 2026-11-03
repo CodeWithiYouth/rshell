@@ -9769,8 +9769,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT client{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(hwnd, &client);
 
-            // 自绘按钮区域交回客户区处理
-            if (hitTitleButton(client) >= 0 || hitAiButton(client) || hitButton(client) >= 0) return HTCLIENT;
+            // 自绘按钮区域交回客户区处理。版本胶囊也在这里：否则标题栏会把
+            // 它当成 HTCAPTION，点击变成拖动窗口，永远收不到 WM_LBUTTONDOWN。
+            if (hitTitleButton(client) >= 0 || hitAiButton(client) || hitButton(client) >= 0 ||
+                (!IsRectEmpty(&g_app.updateChip) && PtInRect(&g_app.updateChip, client))) {
+                return HTCLIENT;
+            }
 
             // 去掉非客户区后，缩放边缘要自己判定
             if (!IsZoomed(hwnd)) {

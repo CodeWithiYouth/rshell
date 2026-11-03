@@ -1471,6 +1471,15 @@ void updateCheckRegression() {
     check(!IsRectEmpty(&g_app.updateChip), "the title bar shows an update chip");
     check(g_app.updateChip.left > 0 && g_app.updateChip.right < g_app.titleAi.left,
           "the update chip sits left of the AI button");
+    {
+        // 标题栏默认走 HTCAPTION；版本胶囊必须命中客户区，否则点击会被当成拖动窗口
+        POINT center{(g_app.updateChip.left + g_app.updateChip.right) / 2,
+                     (g_app.updateChip.top + g_app.updateChip.bottom) / 2};
+        ClientToScreen(g_app.main, &center);
+        const LRESULT hit = SendMessageW(g_app.main, WM_NCHITTEST, 0,
+                                         MAKELPARAM(center.x, center.y));
+        check(hit == HTCLIENT, "the version chip is hit-tested as client area");
+    }
 
     // 同版本也保留版本胶囊，只是不再标成“有新版”，仍然能点进发布页
     g_app.updateTag.clear();

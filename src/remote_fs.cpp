@@ -206,6 +206,25 @@ void RemoteFs::mkdir(const std::string& path) {
     });
 }
 
+void RemoteFs::createFile(const std::string& path) {
+    post([this, path]() {
+        FsEvent event;
+        event.kind = FsEventKind::Done;
+        event.path = path;
+        try {
+            if (!sftp_) throw Error("SFTP 尚未就绪");
+            // 新建只允许创建不存在的路径，避免手滑覆盖远端已有文件
+            if (sftp_->exists(path)) throw Error("同名文件已存在：" + remoteBaseName(path));
+            sftp_->writeFileContent(path, std::string());
+            event.message = "已创建 " + remoteBaseName(path);
+        } catch (const std::exception& ex) {
+            event.kind = FsEventKind::Error;
+            event.message = std::string("新建文件失败：") + ex.what();
+        }
+        if (callbacks_.onEvent) callbacks_.onEvent(event);
+    });
+}
+
 void RemoteFs::remove(const std::string& path, bool isDir) {
     post([this, path, isDir]() {
         FsEvent event;

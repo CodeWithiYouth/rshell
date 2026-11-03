@@ -123,6 +123,7 @@ ID_BTN_FS_TOGGLE,   // 文件面板：折叠 / 展开
     // 文件面板右键菜单（都在 popup::Item 里，走同一个 WM_COMMAND 分发）
     IDM_FS_UPLOAD = 2101,
     IDM_FS_MKDIR,
+    IDM_FS_NEW_FILE,  // 在当前目录新建空文件
     IDM_FS_DOWNLOAD,
     IDM_FS_DELETE,
     IDM_FS_REFRESH,
@@ -226,6 +227,7 @@ struct App : SessionState {
     // 新版本提示：标签栏右侧的小胶囊
     std::string updateTag;
     std::string updateUrl;
+    bool updateNewer = false;  // true = 该版本比当前新；false = 只是当前发布的版本链接
     RECT updateChip{};
     bool hoverUpdateChip = false;
     bool updateCheckManual = false;
@@ -6605,20 +6607,45 @@ bool promptTextDialog(const std::wstring& title, const std::wstring& label,
     return g_textPrompt.ok;
 }
 
+// 新建文件/目录共用：只接受当前目录下的单层名称
+bool readNewEntryName(const wchar_t* title, const wchar_t* label, std::wstring& name) {
+    std::wstring input;
+    if (!promptTextDialog(title, label, input)) return false;
+    const std::string utf8 = trim(toUtf8(input));
+    if (utf8.empty()) return false;
+    if (utf8.find('/') != std::string::npos || utf8 == "." || utf8 == "..") {
+        messageWarn(L"名称无效", L"名称不能包含 /，也不能是 . 或 ..。");
+        return false;
+    }
+    try {
+        validateRemotePath(utf8);
+    } catch (const std::exception& ex) {
+        messageWarn(L"名称无效", toWide(ex.what()));
+        return false;
+    }
+    name = toWide(utf8);
+    return true;
+}
+
 void fsMkdirDialog() {
     if (!g_app.fsReady) {
         messageWarn(L"SFTP 未就绪", L"文件通道还没连上，请稍后再试。");
         return;
     }
     std::wstring name;
-    if (!promptTextDialog(L"新建目录", L"在当前目录下创建的目录名", name)) return;
-    const std::string dirName = trim(toUtf8(name));
-    if (dirName.empty()) return;
-    if (dirName.find('/') != std::string::npos) {
-        messageWarn(L"名称无效", L"目录名不能包含 /。");
+    if (!readNewEntryName(L"新建目录", L"在当前目录下创建的目录名", name)) return;
+    g_app.fs->mkdir(remoteJoin(g_app.fsPath, toUtf8(name)));
+    setStatus(L"正在创建 " + name + L" …");
+}
+
+void fsNewFileDialog() {
+    if (!g_app.fsReady) {
+        messageWarn(L"SFTP 未就绪", L"文件通道还没连上，请稍后再试。");
         return;
     }
-    g_app.fs->mkdir(remoteJoin(g_app.fsPath, dirName));
+    std::wstring name;
+    if (!readNewEntryName(L"新建文件", L"在当前目录下创建的文件名", name)) return;
+    g_app.fs->createFile(remoteJoin(g_app.fsPath, toUtf8(name)));
     setStatus(L"正在创建 " + name + L" …");
 }
 
@@ -7156,7 +7183,20 @@ std::vector<popup::Item> buildFileContextMenu() {
     };
 
     add(IDM_FS_UPLOAD, L"上传文件…", L"", ready);
-    add(IDM_FS_MKDIR, L"新建文件夹…", L"", ready);
+    // 新建文件 / 新建文件夹收进二级菜单，右键菜单顶层保持精简
+    popup::Item createGroup;
+    createGroup.text = L"新建";
+    popup::Item newFile;
+    newFile.id = IDM_FS_NEW_FILE;
+    newFile.text = L"新建文件…";
+    newFile.enabled = ready;
+    createGroup.children.push_back(std::move(newFile));
+    popup::Item newFolder;
+    newFolder.id = IDM_FS_MKDIR;
+    newFolder.text = L"新建文件夹…";
+    newFolder.enabled = ready;
+    createGroup.children.push_back(std::move(newFolder));
+    items.push_back(std::move(createGroup));
     sep();
     add(IDM_FS_DOWNLOAD, L"下载到本地…", L"", editable);
     add(IDM_FS_EDIT, L"编辑", L"", editable);
@@ -7692,7 +7732,7 @@ void startUpdateCheck(bool manual) {
     }).detach();
 }
 
-// 收到检查结果：自动检查只在有新版时提示；手动检查总要给个答复
+// 收到检查结果：版本胶囊始终指向最新发布；有新版时额外用强调色并提示一次
 void handleUpdateResult(const ReleaseInfo& info) {
     const std::wstring current = toWide(appVersion());
     const bool manual = g_app.updateCheckManual;
@@ -7708,19 +7748,23 @@ void handleUpdateResult(const ReleaseInfo& info) {
         return;
     }
     guiLog("检查更新：" + info.tag + "（当前 " + std::string(appVersion()) + "）");
+    // 不管有没有新版，都把最新发布号挂在标题栏：点一下就能去 Release 页面
+    if (!info.tag.empty()) {
+        g_app.updateTag = info.tag;
+        g_app.updateUrl = info.url.empty()
+                              ? std::string("https://github.com/CodeWithiYouth/rshell/releases")
+                              : info.url;
+        g_app.updateNewer = info.newer;
+        if (g_app.main) {
+            layoutMain(g_app.main);
+            InvalidateRect(g_app.main, nullptr, FALSE);
+        }
+    }
     if (!info.newer) {
         if (manual) messageInfo(L"已是最新版本", L"当前版本 " + current + L"，没有更新的发布。");
         return;
     }
 
-    g_app.updateTag = info.tag;
-    g_app.updateUrl = info.url.empty()
-                          ? std::string("https://github.com/CodeWithiYouth/rshell/releases")
-                          : info.url;
-    if (g_app.main) {
-        layoutMain(g_app.main);
-        InvalidateRect(g_app.main, nullptr, FALSE);
-    }
     setStatus(L"发现新版本 " + toWide(info.tag) + L"，点标签栏右上角可以查看");
     if (manual) {
         const std::wstring title = L"发现新版本 " + toWide(info.tag);
@@ -8282,17 +8326,24 @@ void paintTitleBar(HDC dc, const RECT& rc) {
     const int pillRight = g_app.titleAi.left - dp(8);
     const int pillLeft = pillRight - pillW;
 
-    // 新版本提示：贴在连接状态药丸左边，点一下打开发布页
+    // 版本提示：贴在连接状态药丸左边，点一下打开发布页。
+    // 有新版本时用强调色和 ↑；没有新版时显示当前发布号，保持可点击。
     if (!g_app.updateTag.empty()) {
-        const std::wstring label = L"↑ " + toWide(g_app.updateTag);
+        const std::wstring label =
+            (g_app.updateNewer ? L"↑ " : L"") + toWide(g_app.updateTag);
         const int chipH = dp(20);
         const int chipW = textWidth(dc, label, g_app.tinyFont) + dp(18);
         g_app.updateChip = RECT{pillLeft - dp(8) - chipW, (h - chipH) / 2,
                                 pillLeft - dp(8), (h - chipH) / 2 + chipH};
-        fillRoundRect(dc, g_app.updateChip, chipH / 2,
-                      ui::mix(ui::accent, ui::bgPanel, g_app.hoverUpdateChip ? 0.68 : 0.84),
-                      ui::mix(ui::accent, ui::bgPanel, 0.45));
-        drawText(dc, label, g_app.updateChip, ui::accent, g_app.tinyFont,
+        const std::uint32_t chipBg =
+            g_app.updateNewer
+                ? ui::mix(ui::accent, ui::bgPanel, g_app.hoverUpdateChip ? 0.68 : 0.84)
+                : (g_app.hoverUpdateChip ? ui::bgHover : ui::bgCard);
+        const std::uint32_t chipBorder =
+            g_app.updateNewer ? ui::mix(ui::accent, ui::bgPanel, 0.45) : ui::borderSoft;
+        fillRoundRect(dc, g_app.updateChip, chipH / 2, chipBg, chipBorder);
+        drawText(dc, label, g_app.updateChip,
+                 g_app.updateNewer ? ui::accent : ui::textDim, g_app.tinyFont,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     } else {
         g_app.updateChip = RECT{};
@@ -9671,6 +9722,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             initializeSessionTabs();
             g_app.dpi = wincompat::windowDpi(hwnd);
             loadUiLayout();  // 上次拖好的分栏宽度
+            // 版本胶囊常驻：即使关闭自动更新检查，也能看到当前版本并点进发布页
+            if (g_app.updateTag.empty()) {
+                g_app.updateTag = std::string("v") + appVersion();
+                g_app.updateUrl =
+                    "https://github.com/CodeWithiYouth/rshell/releases";
+            }
             if (g_app.updateCheckOnStart) SetTimer(hwnd, kUpdateCheckTimer, 4000, nullptr);
 
             g_app.list = CreateWindowExW(
@@ -9712,8 +9769,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             POINT client{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
             ScreenToClient(hwnd, &client);
 
-            // 自绘按钮区域交回客户区处理
-            if (hitTitleButton(client) >= 0 || hitAiButton(client) || hitButton(client) >= 0) return HTCLIENT;
+            // 自绘按钮区域交回客户区处理。版本胶囊也在这里：否则标题栏会把
+            // 它当成 HTCAPTION，点击变成拖动窗口，永远收不到 WM_LBUTTONDOWN。
+            if (hitTitleButton(client) >= 0 || hitAiButton(client) || hitButton(client) >= 0 ||
+                (!IsRectEmpty(&g_app.updateChip) && PtInRect(&g_app.updateChip, client))) {
+                return HTCLIENT;
+            }
 
             // 去掉非客户区后，缩放边缘要自己判定
             if (!IsZoomed(hwnd)) {
@@ -10171,6 +10232,9 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case IDM_FS_MKDIR:
                     fsMkdirDialog();
+                    return 0;
+                case IDM_FS_NEW_FILE:
+                    fsNewFileDialog();
                     return 0;
                 case IDM_FS_DOWNLOAD:
                     fsOpenEntry(g_app.fsSel);

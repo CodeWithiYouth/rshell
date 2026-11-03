@@ -584,6 +584,21 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
 界面线程只碰面板；AI 工作线程负责请求与工具调用；`RemoteFs` 的文件线程负责 libssh2。
 审批时工作线程阻塞在条件变量上，界面点「允许/拒绝」后唤醒——不会阻塞终端，也不会并发压两条 SSH 会话。
 
+注意「AI 在别的线程」不等于界面不会卡：排版和绘制都在界面线程。工作线程只是把 SSE 增量放进
+`pendingText` / `pendingReasoning`，`kAiFlushMessage` 到界面线程后才进 `ChatPanel`，
+之后的高度计算与 `WM_PAINT` 全是界面线程的活。
+
+### 长文本与帧率
+
+- 助手回答走 `md::LayoutCache`（块级缓存 + 显示列表）：内容不变只回放，流式追加只重排变化的尾块。
+- 思考过程（默认展开）走 `WrapCache`：按宽度把文本切成行缓存，追加时只从最后一个未完成行继续切，
+  绘制是逐行 `TextOutW` 并按可视区跳过上面的行；正文没动过（同一缓冲、同样长度）时直接返回。
+  这里曾经每帧用 `DrawText(DT_WORDBREAK)` 整段重排，思考一长单帧就到几百毫秒，窗口连拖都拖不动。
+- 绘制走 60fps 帧合并 + 局部重绘，`lastPaintMs` 超过一帧会自动放宽间隔（最多 200ms）。
+- 回归：`reasoningWrapRegression`（切行计数，文本没变时不切行）、`reasoningStreamRegression`
+  （真实 SSE 推 6KB 思考，单帧 <150ms）；`RSHELL_AI_PAINT_BENCH=1` 会打印
+  `BENCH reason-static` / `BENCH reason-stream`。
+
 ### 网络
 
 - 只用系统 `winhttp.dll`，TLS 由 SChannel 提供，不打包 OpenSSL/curl

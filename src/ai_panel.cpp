@@ -14,6 +14,36 @@
 
 namespace rshell::ai {
 
+// 思考过程的换行缓存。
+//
+// 以前这段文本每帧都用 DrawText(DT_WORDBREAK) 整段排版：思考过程一长，
+// 每帧要重排几万字，主线程被绘制占满，窗口连拖都拖不动。
+//
+// 现在按宽度把文本切成行缓存下来，流式追加只从"最后一个还没结束的行"
+// 继续切；已确定的行（以换行符或行宽结束）不会再变，直接复用。
+// 绘制就变成逐行 TextOut，并且按可视区跳过上面的行。
+struct WrapCache {
+    std::wstring text;
+    HFONT font = nullptr;
+    int width = -1;
+    int lineHeight = 0;
+    std::vector<std::wstring> lines;
+    std::size_t committed = 0;  // lines 中已确定、追加后不会再变的行数
+    std::size_t pending = 0;    // 未完成行在 text 中的起点
+    // 正文所在的缓冲：同一块缓冲 + 同样长度说明一个字都没动（拖动窗口时走这里）
+    const wchar_t* lastData = nullptr;
+    std::size_t lastSize = 0;
+    // 累计切了多少行（诊断 / 回归测试用，不参与排版）
+    std::size_t linesCut = 0;
+
+    // 返回排版后的总高度；文本没变时几乎不做事
+    int build(HDC dc, const std::wstring& body, HFONT useFont, int useWidth, int useLineHeight);
+    void draw(HDC dc, int x, int y, COLORREF color, const RECT& clip) const;
+    int height() const {
+        return static_cast<int>(lines.size()) * (lineHeight > 0 ? lineHeight : 18);
+    }
+};
+
 namespace {
 
 using namespace rshell::ui;
@@ -194,7 +224,145 @@ int wrappedHeight(HDC dc, const std::wstring& text, HFONT font, int width) {
     return rc.bottom - rc.top;
 }
 
+// 计算 [pos, end) 中放得下一行的字符数（至少 1，不会切开代理对）
+std::size_t wrapFitCount(HDC dc, const std::wstring& text, std::size_t pos, std::size_t end,
+                         int width, HFONT font) {
+    const std::size_t remaining = end - pos;
+    if (remaining == 0 || width <= 0 || !font) return 0;
+    HGDIOBJ old = SelectObject(dc, font);
+    int fit = 0;
+    SIZE size{};
+    const BOOL ok = GetTextExtentExPointW(dc, text.data() + pos, static_cast<int>(remaining),
+                                          width, &fit, nullptr, &size);
+    SelectObject(dc, old);
+    if (!ok || fit <= 0) fit = 1;  // 字体没选上时也别死循环
+    std::size_t take = std::min(remaining, static_cast<std::size_t>(fit));
+    if (take < remaining) {
+        const wchar_t next = text[pos + take];
+        if (next >= 0xDC00 && next <= 0xDFFF && take > 1) --take;  // 别切开代理对
+        // 英文尽量按词折行（贴近 DrawText 的 DT_WORDBREAK），
+        // 但退得太多会让一行特别空，只退不到 1/3 行宽时才用。
+        std::size_t back = take;
+        while (back > 0) {
+            const wchar_t ch = text[pos + back - 1];
+            if (ch == L' ' || ch == L'\t') break;
+            --back;
+        }
+        if (back > 0 && back >= take / 3) take = back;
+        if (take == 0) take = 1;
+    }
+    return take;
+}
+
 }  // namespace
+
+// ---------------------------------------------------------------- 思考过程折行缓存
+
+int WrapCache::build(HDC dc, const std::wstring& body, HFONT useFont, int useWidth,
+                     int useLineHeight) {
+    // 正文没动过（同一块缓冲、同样长度）：直接返回，拖动窗口时每帧都走这条
+    if (body.size() == lastSize && body.data() == lastData && useFont == font &&
+        useWidth == width) {
+        return height();
+    }
+
+    // 宽度/字体不变、正文只在末尾追加时，前面的行还能用
+    bool reuse = useFont == font && useWidth == width && body.size() >= text.size();
+    if (reuse) {
+        // 同一块缓冲上变长 = 纯追加（std::wstring::operator+=），不用逐字比较；
+        // 其它情况（缓冲搬了家、长度没变）仍要确认旧内容确实是前缀。
+        const bool appendedInPlace =
+            body.size() > text.size() && lastSize > 0 && body.data() == lastData;
+        if (!appendedInPlace) reuse = std::equal(text.begin(), text.end(), body.begin());
+    }
+    if (!reuse) {
+        text.clear();
+        lines.clear();
+        committed = 0;
+        pending = 0;
+    }
+    font = useFont;
+    width = useWidth;
+    lineHeight = useLineHeight;
+
+    // 只把新增的部分接上，不要每帧整段拷贝
+    if (reuse) {
+        if (body.size() > text.size())
+            text.append(body.data() + text.size(), body.size() - text.size());
+    } else {
+        text = body;
+    }
+    lastData = body.data();
+    lastSize = body.size();
+
+    if (width <= 0 || text.empty()) {
+        lines.clear();
+        committed = 0;
+        pending = text.size();
+        return 0;
+    }
+
+    // 上次的最后一行可能还会变长（流式追加），先丢掉重切
+    if (lines.size() > committed) lines.resize(committed);
+
+    std::size_t pos = pending;
+    for (;;) {
+        if (pos >= text.size()) break;
+        const std::size_t nl = text.find(L'\n', pos);
+        const std::size_t paraEnd = (nl == std::wstring::npos) ? text.size() : nl;
+
+        if (pos == paraEnd) {  // 连续换行产生的空行也要占一行
+            lines.emplace_back();
+            committed = lines.size();
+            ++linesCut;
+            pos = paraEnd + 1;
+            continue;
+        }
+
+        for (std::size_t start = pos; start < paraEnd;) {
+            std::size_t take = wrapFitCount(dc, text, start, paraEnd, width, font);
+            if (take == 0) take = 1;
+            const bool tail = start + take >= paraEnd;
+            std::size_t end = start + take;
+            if (end > start && text[end - 1] == L'\r') --end;  // 去掉行尾 \r
+            lines.push_back(text.substr(start, end - start));
+            ++linesCut;
+            if (tail && nl == std::wstring::npos) {
+                // 这是文本末尾、又没有硬换行的一行，下一次追加还会变
+                pending = start;
+                return height();
+            }
+            committed = lines.size();
+            start += take;
+        }
+        if (nl == std::wstring::npos) break;
+        pos = nl + 1;
+    }
+    pending = text.size();
+    return height();
+}
+
+void WrapCache::draw(HDC dc, int x, int y, COLORREF color, const RECT& clip) const {
+    if (lines.empty() || !font) return;
+    const int lineH = lineHeight > 0 ? lineHeight : 18;
+    // 直接从第一行可见行开始，不用遍历上面的行
+    int first = 0;
+    if (clip.top > y) first = (clip.top - y) / lineH;
+    if (first < 0) first = 0;
+    if (first >= static_cast<int>(lines.size())) return;
+
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    const int oldBk = SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, color);
+    for (int i = first; i < static_cast<int>(lines.size()); ++i) {
+        const int top = y + i * lineH;
+        if (top >= clip.bottom) break;
+        if (!lines[i].empty())
+            TextOutW(dc, x, top, lines[i].c_str(), static_cast<int>(lines[i].size()));
+    }
+    SetBkMode(dc, oldBk);
+    SelectObject(dc, oldFont);
+}
 
 // ---------------------------------------------------------------- 基础
 
@@ -295,6 +463,13 @@ void ChatPanel::setHostLabel(std::wstring label, bool clickable) {
 void ChatPanel::setInputEnabled(bool enabled) { inputEnabled_ = enabled; }
 
 void ChatPanel::setFullScreen(bool full) { fullScreen_ = full; }
+
+std::size_t ChatPanel::reasoningLinesCut() const {
+    std::size_t total = 0;
+    for (const ChatItem& item : items_)
+        if (item.kind == ItemKind::Reasoning && item.wrapCache) total += item.wrapCache->linesCut;
+    return total;
+}
 
 void ChatPanel::setWelcome(std::wstring title, std::wstring subtitle, bool settingsButton,
                             std::wstring buttonLabel) {
@@ -476,7 +651,9 @@ int ChatPanel::itemHeight(HDC dc, const ChatItem& item, int width) const {    co
         case ItemKind::Reasoning: {
             const int header = labelFont + 2;
             if (!item.expanded) return header;
-            return header + wrappedHeight(dc, item.body, fonts_.caption, width - 20) + 12;
+            if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+            return header +
+                   item.wrapCache->build(dc, item.body, fonts_.caption, width - 20, labelFont) + 12;
         }
 
         case ItemKind::Tool: {
@@ -846,8 +1023,10 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
                      fonts_.caption, DT_LEFT | DT_TOP | DT_SINGLELINE);
             if (item.expanded) {
                 RECT inner{rc.left + 10, rc.top + cap + 2, rc.right - 10, rc.bottom};
-                drawText(dc, item.body, inner, textDim, fonts_.caption,
-                         DT_LEFT | DT_TOP | DT_WORDBREAK | DT_EDITCONTROL | DT_END_ELLIPSIS);
+                if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+                // 逐行回放，只画可视区里那几行（长思考过程也拖得动窗口）
+                item.wrapCache->build(dc, item.body, fonts_.caption, inner.right - inner.left, cap);
+                item.wrapCache->draw(dc, inner.left, inner.top, toColorRef(textDim), viewRect());
             }
             hits_.push_back({rc, Hit::Toggle, index});
             return;

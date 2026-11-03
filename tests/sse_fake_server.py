@@ -14,6 +14,11 @@ CHARS_PER_BATCH = 25
 BATCH_INTERVAL = 0.35
 MARKER = "【测试结束标记】"
 
+# 思考过程：长文本 + 大块推送，用来检验面板不会因为重排整段而卡住
+REASONING_SEGMENTS = 40
+REASONING_CHARS_PER_SEGMENT = 500
+REASONING_INTERVAL = 0.05
+
 
 def full_text() -> str:
     parts = []
@@ -21,6 +26,14 @@ def full_text() -> str:
         parts.append(f"第{i + 1}段文字用于验证平滑输出，包含若干中文字符和 English 混排。")
     parts.append(MARKER)
     return "".join(parts)
+
+
+def reasoning_text() -> str:
+    line = "先确认端口是否在监听，再检查进程和配置，顺便看一眼最近的日志有没有异常。\n"
+    segments = []
+    for i in range(REASONING_SEGMENTS):
+        segments.append(f"[{i + 1}] " + line * 4)  # 每段 4 行，贴近真实的长思考
+    return "".join(segments)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,6 +58,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
+        if getattr(self.server, "mode", "text") == "reasoning":
+            self.streamReasoning()
+            return
+
         text = full_text()
         step = CHARS_PER_BATCH
         for start in range(0, len(text), step):
@@ -62,9 +79,33 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
         self.close_connection = True
 
+    def streamReasoning(self):  # noqa: N802
+        """先推一大段 reasoning_content，再给一句正式回答。"""
+        text = reasoning_text()
+        for start in range(0, len(text), REASONING_CHARS_PER_SEGMENT):
+            batch = text[start:start + REASONING_CHARS_PER_SEGMENT]
+            payload = {
+                "id": "fake",
+                "choices": [{"index": 0, "delta": {"reasoning_content": batch}}],
+            }
+            self.writeChunk(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
+            time.sleep(REASONING_INTERVAL)
+        payload = {
+            "id": "fake",
+            "choices": [{"index": 0, "delta": {"content": "思考完毕。"}}],
+        }
+        self.writeChunk(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
+        done = {"id": "fake", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        self.writeChunk(f"data: {json.dumps(done, ensure_ascii=False)}\n\n")
+        self.writeChunk("data: [DONE]\n\n")
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+        self.close_connection = True
 
-def start_server(port: int = 0):
+
+def start_server(port: int = 0, mode: str = "text"):
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.mode = mode
     opt = server.socket.getsockname()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

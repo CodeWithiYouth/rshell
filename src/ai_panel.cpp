@@ -28,6 +28,7 @@ struct WrapCache {
     int width = -1;
     int lineHeight = 0;
     std::vector<std::wstring> lines;
+    std::vector<char> hardBreaks;  // 1 = 这一行以真实换行结束（复制时补 \n）
     std::size_t committed = 0;  // lines 中已确定、追加后不会再变的行数
     std::size_t pending = 0;    // 未完成行在 text 中的起点
     // 正文所在的缓冲：同一块缓冲 + 同样长度说明一个字都没动（拖动窗口时走这里）
@@ -303,7 +304,10 @@ int WrapCache::build(HDC dc, const std::wstring& body, HFONT useFont, int useWid
     }
 
     // 上次的最后一行可能还会变长（流式追加），先丢掉重切
-    if (lines.size() > committed) lines.resize(committed);
+    if (lines.size() > committed) {
+        lines.resize(committed);
+        hardBreaks.resize(committed);
+    }
 
     std::size_t pos = pending;
     for (;;) {
@@ -313,6 +317,7 @@ int WrapCache::build(HDC dc, const std::wstring& body, HFONT useFont, int useWid
 
         if (pos == paraEnd) {  // 连续换行产生的空行也要占一行
             lines.emplace_back();
+            hardBreaks.push_back(1);
             committed = lines.size();
             ++linesCut;
             pos = paraEnd + 1;
@@ -326,12 +331,14 @@ int WrapCache::build(HDC dc, const std::wstring& body, HFONT useFont, int useWid
             std::size_t end = start + take;
             if (end > start && text[end - 1] == L'\r') --end;  // 去掉行尾 \r
             lines.push_back(text.substr(start, end - start));
+            hardBreaks.push_back(0);
             ++linesCut;
             if (tail && nl == std::wstring::npos) {
                 // 这是文本末尾、又没有硬换行的一行，下一次追加还会变
                 pending = start;
                 return height();
             }
+            if (tail) hardBreaks.back() = 1;  // 段落最后一行 = 硬换行
             committed = lines.size();
             start += take;
         }
@@ -395,6 +402,7 @@ ChatPanel::~ChatPanel() {
         if (font) DeleteObject(font);
     }
     if (italicFont_) DeleteObject(italicFont_);
+    if (measureDc_) DeleteDC(measureDc_);
 }
 
 void ChatPanel::rebuildDerivedFonts() {
@@ -469,6 +477,341 @@ std::size_t ChatPanel::reasoningLinesCut() const {
     for (const ChatItem& item : items_)
         if (item.kind == ItemKind::Reasoning && item.wrapCache) total += item.wrapCache->linesCut;
     return total;
+}
+
+// ---------------------------------------------------------------- 文本选择 / 复制
+
+namespace {
+
+bool setClipboardText(const std::wstring& text) {
+    if (text.empty()) return false;
+    // 剪贴板刚被别的程序（或本进程上一次复制）打开时可能短暂失败，重试几次
+    bool opened = false;
+    for (int attempt = 0; attempt < 5 && !opened; ++attempt) {
+        opened = OpenClipboard(nullptr) != FALSE;
+        if (!opened) Sleep(10);
+    }
+    if (!opened) return false;
+    bool ok = false;
+    if (EmptyClipboard()) {
+        const std::size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+            if (void* dst = GlobalLock(mem)) {
+                std::memcpy(dst, text.c_str(), bytes);
+                GlobalUnlock(mem);
+                if (SetClipboardData(CF_UNICODETEXT, mem)) {
+                    ok = true;
+                } else {
+                    GlobalFree(mem);
+                }
+            } else {
+                GlobalFree(mem);
+            }
+        }
+    }
+    CloseClipboard();
+    return ok;
+}
+
+bool isWordChar(wchar_t ch) {
+    return (ch >= L'0' && ch <= L'9') || (ch >= L'a' && ch <= L'z') ||
+           (ch >= L'A' && ch <= L'Z');
+}
+
+}  // namespace
+
+HDC ChatPanel::measureDc() {
+    if (!measureDc_) {
+        HDC screen = GetDC(nullptr);
+        measureDc_ = CreateCompatibleDC(screen);
+        ReleaseDC(nullptr, screen);
+    }
+    return measureDc_;
+}
+
+void ChatPanel::ensureLineDx(const SelectLine& line) const {
+    if (line.dxReady) return;
+    line.dx.assign(line.text.size(), 0);
+    if (!line.text.empty() && line.font) {
+        HDC dc = const_cast<ChatPanel*>(this)->measureDc();
+        HGDIOBJ old = SelectObject(dc, line.font);
+        SIZE size{};
+        std::vector<int> dx(line.text.size(), 0);
+        const BOOL ok = GetTextExtentExPointW(dc, line.text.data(),
+                                              static_cast<int>(line.text.size()), 1 << 30,
+                                              nullptr, dx.data(), &size);
+        SelectObject(dc, old);
+        if (ok && size.cx > 0) {
+            line.dx = std::move(dx);
+        } else {
+            const int per = std::max(1, static_cast<int>(line.text.size()));
+            const int step = std::max(1, static_cast<int>(size.cx) / per);
+            for (std::size_t i = 0; i < line.text.size(); ++i)
+                line.dx[i] = step * static_cast<int>(i + 1);
+        }
+    }
+    line.dxReady = true;
+}
+
+void ChatPanel::collectSelectLines(HDC dc, const ChatItem& item, const RECT& rc,
+                                   std::size_t index) {
+    const int cap = lineHeight(dc, fonts_.caption);
+
+    auto addLine = [&](int left, int top, const std::wstring& text, HFONT font, bool hardBreak) {
+        SelectLine line;
+        line.item = index;
+        line.top = top;
+        line.bottom = top + lineHeight(dc, font ? font : fonts_.ui);
+        line.left = left;
+        line.font = font;
+        line.text = text;
+        line.hardBreak = hardBreak;
+        selectLines_.push_back(std::move(line));
+    };
+
+    switch (item.kind) {
+        case ItemKind::Notice:
+        case ItemKind::Error: {
+            if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+            const int lineH = cap;
+            item.wrapCache->build(dc, item.body, fonts_.caption, rc.right - rc.left, lineH);
+            for (std::size_t i = 0; i < item.wrapCache->lines.size(); ++i)
+                addLine(rc.left, rc.top + static_cast<int>(i) * lineH, item.wrapCache->lines[i],
+                        fonts_.caption, item.wrapCache->hardBreaks[i] != 0);
+            break;
+        }
+
+        case ItemKind::User: {
+            const int bodyTop = rc.top + 6 + cap + 4;
+            const int lineH = lineHeight(dc, fonts_.ui);
+            if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+            item.wrapCache->build(dc, item.body, fonts_.ui, (rc.right - 10) - (rc.left + 10),
+                                  lineH);
+            for (std::size_t i = 0; i < item.wrapCache->lines.size(); ++i)
+                addLine(rc.left + 10, bodyTop + static_cast<int>(i) * lineH,
+                        item.wrapCache->lines[i], fonts_.ui,
+                        item.wrapCache->hardBreaks[i] != 0);
+            break;
+        }
+
+        case ItemKind::Assistant: {
+            if (!item.mdCache) item.mdCache = std::make_shared<md::LayoutCache>();
+            const int bodyTop = rc.top + cap + 4;
+            item.mdCache->build(dc, rc.right - rc.left, item.body, markdownStyle(dc));
+            for (const auto& line : item.mdCache->visualLines())
+                addLine(rc.left + line.x, bodyTop + line.y, line.text,
+                        line.font ? line.font : fonts_.ui, line.hardBreak);
+            break;
+        }
+
+        case ItemKind::Reasoning: {
+            if (!item.expanded) break;
+            if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+            const int left = rc.left + 10;
+            const int top = rc.top + cap + 2;
+            item.wrapCache->build(dc, item.body, fonts_.caption, (rc.right - 10) - left, cap);
+            for (std::size_t i = 0; i < item.wrapCache->lines.size(); ++i)
+                addLine(left, top + static_cast<int>(i) * cap, item.wrapCache->lines[i],
+                        fonts_.caption, item.wrapCache->hardBreaks[i] != 0);
+            break;
+        }
+
+        default:
+            break;
+    }
+}
+
+void ChatPanel::rebuildSelectLines(HDC dc) {
+    selectLines_.clear();
+    const RECT view = viewRect();
+    const int contentWidth = bounds_.right - bounds_.left - kPad * 2;
+    int y = contentHeight_ <= viewportHeight_ ? view.top
+                                              : view.bottom + scrollBack_ - contentHeight_;
+    for (std::size_t i = 0; i < items_.size(); ++i) {
+        const int h = i < heights_.size() ? heights_[i] : itemHeight(dc, items_[i], contentWidth);
+        RECT rc{view.left + kPad, y, view.right - kPad, y + h};
+        if (rc.bottom >= view.top && rc.top <= view.bottom) {
+            const ItemKind kind = items_[i].kind;
+            const bool selectable = kind == ItemKind::Assistant || kind == ItemKind::Reasoning ||
+                                    kind == ItemKind::User || kind == ItemKind::Notice ||
+                                    kind == ItemKind::Error;
+            if (selectable) collectSelectLines(dc, items_[i], rc, i);
+        }
+        y += h + kItemGap;
+    }
+    selectStampContent_ = contentHeight_;
+    selectStampScroll_ = scrollBack_;
+    selectStampWidth_ = contentWidth;
+    selectStampItems_ = items_.size();
+    selectStampTail_ = items_.empty() ? 0 : items_.back().body.size();
+}
+
+void ChatPanel::paintSelectionForItem(HDC dc, std::size_t index) {
+    if (selectLines_.empty()) return;
+    if (!hasSelection_ && !selecting_) return;
+
+    std::size_t first = selAnchorLine_;
+    std::size_t last = selFocusLine_;
+    int firstCh = selAnchorCh_;
+    int lastCh = selFocusCh_;
+    if (last < first || (last == first && lastCh < firstCh)) {
+        std::swap(first, last);
+        std::swap(firstCh, lastCh);
+    }
+
+    // mix 的第三个参数是“后半段（bgApp）的比例”，0.35 约等于 65% accent
+    const std::uint32_t color = ui::mix(ui::accent, ui::bgApp, 0.35);
+    for (std::size_t i = first; i <= last && i < selectLines_.size(); ++i) {
+        const SelectLine& line = selectLines_[i];
+        if (line.item != index) continue;
+        const int length = static_cast<int>(line.text.size());
+        const int start = i == first ? std::clamp(firstCh, 0, length) : 0;
+        const int end = i == last ? std::clamp(lastCh, 0, length) : length;
+        ensureLineDx(line);
+        const int x1 = line.left + (start > 0 ? line.dx[start - 1] : 0);
+        const int x2 = line.left + (end > 0 ? line.dx[end - 1] : 0);
+        RECT fill{x1, line.top + 2, std::max(x1 + 3, x2), line.bottom - 1};
+        fillRect(dc, fill, color);
+    }
+}
+
+bool ChatPanel::selectionPoint(POINT pt, std::size_t& lineIndex, int& ch) const {
+    if (selectLines_.empty()) return false;
+    std::size_t found = selectLines_.size();
+    for (std::size_t i = 0; i < selectLines_.size(); ++i) {
+        if (pt.y < selectLines_[i].bottom) {
+            found = i;
+            break;
+        }
+    }
+    if (found >= selectLines_.size()) found = selectLines_.size() - 1;
+
+    const SelectLine& line = selectLines_[found];
+    lineIndex = found;
+    ch = 0;
+    if (pt.x <= line.left) return true;
+    ensureLineDx(line);
+    for (std::size_t i = 0; i < line.text.size(); ++i) {
+        const int right = line.left + line.dx[i];
+        if (pt.x < right) {
+            const int left = line.left + (i > 0 ? line.dx[i - 1] : 0);
+            ch = (pt.x - left > (right - left) / 2) ? static_cast<int>(i + 1)
+                                                    : static_cast<int>(i);
+            return true;
+        }
+    }
+    ch = static_cast<int>(line.text.size());
+    return true;
+}
+
+void ChatPanel::updateSelection(POINT pt) {
+    std::size_t line = selFocusLine_;
+    int ch = selFocusCh_;
+    if (!selectionPoint(pt, line, ch)) return;
+    selFocusLine_ = line;
+    selFocusCh_ = ch;
+    hasSelection_ = !(selAnchorLine_ == selFocusLine_ && selAnchorCh_ == selFocusCh_);
+    rebuildSelectedText();
+}
+
+void ChatPanel::rebuildSelectedText() {
+    selectedText_.clear();
+    if (!hasSelection_ || selectLines_.empty()) return;
+
+    std::size_t first = selAnchorLine_;
+    std::size_t last = selFocusLine_;
+    int firstCh = selAnchorCh_;
+    int lastCh = selFocusCh_;
+    if (last < first || (last == first && lastCh < firstCh)) {
+        std::swap(first, last);
+        std::swap(firstCh, lastCh);
+    }
+
+    for (std::size_t i = first; i <= last && i < selectLines_.size(); ++i) {
+        const SelectLine& line = selectLines_[i];
+        const int length = static_cast<int>(line.text.size());
+        const int start = i == first ? std::clamp(firstCh, 0, length) : 0;
+        const int end = i == last ? std::clamp(lastCh, 0, length) : length;
+        if (end > start) selectedText_.append(line.text.substr(start, end - start));
+
+        if (i < last) {
+            if (line.hardBreak) {
+                selectedText_ += L'\n';
+            } else if (end > start && !line.text.empty()) {
+                // 软换行：英文单词之间补空格，中文直接接上
+                wchar_t next = 0;
+                for (std::size_t k = i + 1; k <= last && k < selectLines_.size(); ++k) {
+                    if (!selectLines_[k].text.empty()) {
+                        next = selectLines_[k].text.front();
+                        break;
+                    }
+                }
+                if (isWordChar(line.text[end - 1]) && isWordChar(next)) selectedText_ += L' ';
+            }
+        }
+    }
+    while (!selectedText_.empty() && selectedText_.back() == L'\n') selectedText_.pop_back();
+}
+
+bool ChatPanel::copySelection() {
+    if (selectedText_.empty()) return false;
+    return setClipboardText(selectedText_);
+}
+
+void ChatPanel::clearSelection() {
+    selecting_ = false;
+    hasSelection_ = false;
+    selectedText_.clear();
+}
+
+bool ChatPanel::selectText(POINT from, POINT to) {
+    if (!selectionPoint(from, selAnchorLine_, selAnchorCh_)) return false;
+    if (!selectionPoint(to, selFocusLine_, selFocusCh_)) return false;
+    selecting_ = false;
+    hasSelection_ = !(selAnchorLine_ == selFocusLine_ && selAnchorCh_ == selFocusCh_);
+    rebuildSelectedText();
+    return hasSelection_;
+}
+
+bool ChatPanel::selectLineRange(std::size_t firstLine, int firstCh, std::size_t lastLine,
+                                int lastCh) {
+    // 测试入口：平时不维护行数据，这里按需建一次
+    if (selectLines_.empty()) rebuildSelectLines(measureDc());
+    if (firstLine >= selectLines_.size() || lastLine >= selectLines_.size()) return false;
+    selecting_ = false;
+    selAnchorLine_ = firstLine;
+    selAnchorCh_ = firstCh;
+    selFocusLine_ = lastLine;
+    selFocusCh_ = lastCh;
+    hasSelection_ = !(firstLine == lastLine && firstCh == lastCh);
+    rebuildSelectedText();
+    return hasSelection_;
+}
+
+RECT ChatPanel::codeBlockCopyRect(std::size_t itemIndex, std::size_t blockIndex) const {
+    for (const HitRect& rect : hits_)
+        if (rect.kind == Hit::CopyCode && rect.index == itemIndex && rect.sub == blockIndex)
+            return rect.rect;
+    return RECT{};
+}
+
+RECT ChatPanel::selectLineRect(std::size_t line) const {
+    if (line >= selectLines_.size()) return RECT{};
+    const SelectLine& value = selectLines_[line];
+    ensureLineDx(value);
+    const int width = value.dx.empty() ? 0 : value.dx.back();
+    return RECT{value.left, value.top, value.left + width, value.bottom};
+}
+
+void ChatPanel::copyCodeBlock(std::size_t itemIndex, std::size_t blockIndex) {
+    if (itemIndex >= items_.size() || !items_[itemIndex].mdCache) return;
+    const auto& blocks = items_[itemIndex].mdCache->codeBlocks();
+    if (blockIndex >= blocks.size()) return;
+    if (!setClipboardText(blocks[blockIndex].code)) return;
+    copyFlashItem_ = itemIndex;
+    copyFlashBlock_ = blockIndex;
+    copyFlashUntil_ = GetTickCount64() + 1400;
+    if (actions_.onCopied) actions_.onCopied();
 }
 
 void ChatPanel::setWelcome(std::wstring title, std::wstring subtitle, bool settingsButton,
@@ -635,11 +978,17 @@ int ChatPanel::itemHeight(HDC dc, const ChatItem& item, int width) const {    co
 
     switch (item.kind) {
         case ItemKind::Notice:
-        case ItemKind::Error:
-            return std::max(bodyFont, wrappedHeight(dc, item.body, fonts_.caption, width));
+        case ItemKind::Error: {
+            if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+            return std::max(bodyFont,
+                            item.wrapCache->build(dc, item.body, fonts_.caption, width, labelFont));
+        }
 
-        case ItemKind::User:
-            return labelFont + 4 + wrappedHeight(dc, item.body, fonts_.ui, width - 20) + 16;
+        case ItemKind::User: {
+            if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+            return labelFont + 4 +
+                   item.wrapCache->build(dc, item.body, fonts_.ui, width - 20, bodyFont) + 16;
+        }
 
         case ItemKind::Assistant: {
             // 走缓存：同一份文本只需要排一次版，之后一直是重放
@@ -736,6 +1085,15 @@ void ChatPanel::paint(HDC dc, const RECT* dirty) {    hits_.clear();
     // 内容不足一屏时从顶部开始排，避免只有一条提示时上方一大片空白
     int y = contentHeight_ <= viewportHeight_ ? view.top
                                               : view.bottom + scrollBack_ - contentHeight_;
+    // 只有正在选择/已有选中时才维护“可选文本行”，平时完全不做额外工作。
+    if (hasSelection_ || selecting_) {
+        const std::size_t tail = items_.empty() ? 0 : items_.back().body.size();
+        if (selectLines_.empty() || selectStampContent_ != contentHeight_ ||
+            selectStampScroll_ != scrollBack_ || selectStampWidth_ != contentWidth ||
+            selectStampItems_ != items_.size() || selectStampTail_ != tail) {
+            rebuildSelectLines(dc);
+        }
+    }
     for (std::size_t i = 0; i < items_.size(); ++i) {
         const int h = heights_[i];
         RECT rc{view.left + kPad, y, view.right - kPad, y + h};
@@ -748,7 +1106,9 @@ void ChatPanel::paint(HDC dc, const RECT* dirty) {    hits_.clear();
             const bool outside = dirty != nullptr &&
                                  (dirty->bottom < rc.top || dirty->top > rc.bottom ||
                                   dirty->right < rc.left || dirty->left > rc.right);
-            if (!(outside && cheapToSkip)) drawItem(dc, items_[i], rc, i);
+            if (!(outside && cheapToSkip)) {
+                drawItem(dc, items_[i], rc, i);
+            }
         }
         y += h + kItemGap;
     }
@@ -978,9 +1338,12 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
     switch (item.kind) {
         case ItemKind::Notice:
         case ItemKind::Error: {
-            RECT text = rc;
-            drawText(dc, item.body, text, item.kind == ItemKind::Error ? danger : textFaint,
-                     fonts_.caption, DT_LEFT | DT_TOP | DT_WORDBREAK | DT_EDITCONTROL);
+            if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+            item.wrapCache->build(dc, item.body, fonts_.caption, rc.right - rc.left, cap);
+            paintSelectionForItem(dc, index);
+            item.wrapCache->draw(dc, rc.left, rc.top,
+                                 toColorRef(item.kind == ItemKind::Error ? danger : textFaint),
+                                 viewRect());
             return;
         }
 
@@ -993,8 +1356,10 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
             drawText(dc, item.title, RECT{inner.left, inner.top, inner.right, inner.top + cap},
                      accent, fonts_.caption, DT_LEFT | DT_TOP | DT_SINGLELINE);
             RECT bodyRect{inner.left, inner.top + cap + 4, inner.right, rc.bottom - 6};
-            drawText(dc, item.body, bodyRect, text, fonts_.ui,
-                     DT_LEFT | DT_TOP | DT_WORDBREAK | DT_EDITCONTROL);
+            if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
+            item.wrapCache->build(dc, item.body, fonts_.ui, bodyRect.right - bodyRect.left, body);
+            paintSelectionForItem(dc, index);
+            item.wrapCache->draw(dc, bodyRect.left, bodyRect.top, toColorRef(text), viewRect());
             return;
         }
 
@@ -1011,8 +1376,32 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
             RECT bodyRect{textLeft, rc.top + cap + 4, rc.right, rc.bottom};
             if (!item.mdCache) item.mdCache = std::make_shared<md::LayoutCache>();
             item.mdCache->build(dc, bodyRect.right - bodyRect.left, item.body, markdownStyle(dc));
+            paintSelectionForItem(dc, index);
             const RECT view = viewRect();
             item.mdCache->draw(dc, bodyRect.left, bodyRect.top, &view);
+
+            // 代码块右上角的“复制”（点一下复制整块，含换行）
+            const auto& codeBlocks = item.mdCache->codeBlocks();
+            const int copyW = 46;
+            const int copyH = 20;
+            for (std::size_t b = 0; b < codeBlocks.size(); ++b) {
+                const auto& block = codeBlocks[b];
+                RECT btn{bodyRect.right - copyW - 6, bodyRect.top + block.y + 6,
+                         bodyRect.right - 6, bodyRect.top + block.y + 6 + copyH};
+                if (btn.bottom > bodyRect.bottom) break;
+                const bool flash = copyFlashItem_ == index && copyFlashBlock_ == b &&
+                                   GetTickCount64() < copyFlashUntil_;
+                const bool hovered =
+                    hover_ == Hit::CopyCode && hoverIndex_ == index && hoverSub_ == b;
+                fillRoundRect(dc, btn, 5,
+                              flash ? ui::mix(ui::success, ui::bgCard, 0.40)
+                                    : (hovered ? ui::mix(ui::bgCard, 0xFFFFFF, 0.10) : ui::bgCard),
+                              flash ? ui::success : ui::borderSoft);
+                drawText(dc, flash ? L"已复制" : L"复制", btn,
+                         flash ? 0xFFFFFF : ui::textDim, fonts_.caption,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                hits_.push_back({btn, Hit::CopyCode, index, b});
+            }
             return;
         }
 
@@ -1026,9 +1415,11 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
                 if (!item.wrapCache) item.wrapCache = std::make_shared<WrapCache>();
                 // 逐行回放，只画可视区里那几行（长思考过程也拖得动窗口）
                 item.wrapCache->build(dc, item.body, fonts_.caption, inner.right - inner.left, cap);
+                paintSelectionForItem(dc, index);
                 item.wrapCache->draw(dc, inner.left, inner.top, toColorRef(textDim), viewRect());
             }
-            hits_.push_back({rc, Hit::Toggle, index});
+            // 只有标题行负责折叠，正文留给鼠标选择
+            hits_.push_back({RECT{rc.left, rc.top, rc.right, rc.top + cap}, Hit::Toggle, index});
             return;
         }
 
@@ -1148,18 +1539,28 @@ void ChatPanel::drawItem(HDC dc, const ChatItem& item, const RECT& rc, std::size
 // ---------------------------------------------------------------- 交互
 
 bool ChatPanel::onMouseMove(POINT pt) {
+    if (selecting_) {
+        const std::size_t beforeLine = selFocusLine_;
+        const int beforeCh = selFocusCh_;
+        updateSelection(pt);
+        return beforeLine != selFocusLine_ || beforeCh != selFocusCh_;
+    }
+
     Hit hit = Hit::None;
     std::size_t index = 0;
+    std::size_t sub = 0;
     for (const HitRect& rect : hits_) {
         if (PtInRect(&rect.rect, pt)) {
             hit = rect.kind;
             index = rect.index;
+            sub = rect.sub;
             break;
         }
     }
-    if (hit == hover_ && index == hoverIndex_) return false;
+    if (hit == hover_ && index == hoverIndex_ && sub == hoverSub_) return false;
     hover_ = hit;
     hoverIndex_ = index;
+    hoverSub_ = sub;
     return true;
 }
 
@@ -1168,6 +1569,39 @@ bool ChatPanel::onMouseDown(POINT pt) {
         if (PtInRect(&rect.rect, pt)) {
             pressed_ = rect.kind;
             pressedIndex_ = rect.index;
+            pressedSub_ = rect.sub;
+            return true;
+        }
+    }
+    // 点消息文本：开始拖选
+    RECT view = viewRect();
+    if (PtInRect(&view, pt)) {
+        // 平时不维护行数据，点下去才建；内容/滚动变了也要重建
+        const std::size_t tail = items_.empty() ? 0 : items_.back().body.size();
+        if (selectLines_.empty() || selectStampContent_ != contentHeight_ ||
+            selectStampScroll_ != scrollBack_ || selectStampItems_ != items_.size() ||
+            selectStampTail_ != tail) {
+            HDC dc = measureDc();
+            const int contentWidth = bounds_.right - bounds_.left - kPad * 2;
+            if (heights_.size() != items_.size()) {
+                measure(dc, contentWidth);
+                measuredWidth_ = contentWidth;
+                layoutDirty_ = false;
+                lastItemDirty_ = false;
+            }
+            rebuildSelectLines(dc);
+        }
+        std::size_t line = 0;
+        int ch = 0;
+        if (selectionPoint(pt, line, ch)) {
+            selecting_ = true;
+            selAnchorLine_ = line;
+            selAnchorCh_ = ch;
+            selFocusLine_ = line;
+            selFocusCh_ = ch;
+            hasSelection_ = false;
+            selectedText_.clear();
+            inputFocused_ = false;
             return true;
         }
     }
@@ -1175,21 +1609,27 @@ bool ChatPanel::onMouseDown(POINT pt) {
     RECT composer{bounds_.left, bounds_.bottom - kComposerH, bounds_.right, bounds_.bottom};
     if (PtInRect(&composer, pt)) {
         inputFocused_ = true;
+        clearSelection();
         return true;
     }
     inputFocused_ = false;
+    clearSelection();
     return false;
 }
 
 bool ChatPanel::onMouseUp(POINT pt) {
+    const bool wasSelecting = selecting_;
+    selecting_ = false;
     const Hit pressed = pressed_;
     const std::size_t pressedIndex = pressedIndex_;
+    const std::size_t pressedSub = pressedSub_;
     pressed_ = Hit::None;
-    if (pressed == Hit::None) return false;
+    if (pressed == Hit::None) return wasSelecting && hasSelection_;
 
     for (const HitRect& rect : hits_) {
         if (!PtInRect(&rect.rect, pt)) continue;
-        if (rect.kind != pressed || rect.index != pressedIndex) return false;
+        if (rect.kind != pressed || rect.index != pressedIndex || rect.sub != pressedSub)
+            return false;
         switch (pressed) {
             case Hit::Send:
                 if (inputEnabled_ && !input_.empty()) {
@@ -1241,6 +1681,9 @@ bool ChatPanel::onMouseUp(POINT pt) {
                     layoutDirty_ = true;
                 }
                 return true;
+            case Hit::CopyCode:
+                copyCodeBlock(rect.index, rect.sub);
+                return true;
             default: return false;
         }
     }
@@ -1258,6 +1701,11 @@ bool ChatPanel::onMouseWheel(int delta) {
 }
 
 bool ChatPanel::onKeyDown(UINT vk, bool shift, bool ctrl) {
+    // 有选中文本时 Ctrl+C 复制对话内容（即使焦点在输入框）
+    if (ctrl && vk == 'C' && hasSelection_) {
+        copySelection();
+        return true;
+    }
     if (!inputFocused_) return false;
 
     switch (vk) {

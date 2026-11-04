@@ -45,7 +45,25 @@ public:
     int height() const { return height_; }
     // 上一次 build 实际重新折行了几块（测试/性能观测用）
     std::size_t lastRebuiltBlocks() const { return rebuilt_; }
-    void clear() { blocks_.clear(); height_ = 0; width_ = -1; source_.clear(); }
+    void clear() { blocks_.clear(); height_ = 0; width_ = -1; source_.clear(); visualLines_.clear(); codeBlocks_.clear(); }
+
+    // 一行“看得见的文本”（相对排版左上角），用于鼠标选区与复制。
+    struct VisualLine {
+        int x = 0;
+        int y = 0;
+        std::wstring text;
+        HFONT font = nullptr;   // 该行主要使用的字体（代码块是 mono）
+        bool hardBreak = true;  // true = 这里确实是换行（复制时补 \n）
+    };
+    const std::vector<VisualLine>& visualLines() const { return visualLines_; }
+
+    // 代码块（用于右上角的“复制”按钮）
+    struct CodeBlock {
+        int y = 0;
+        int height = 0;
+        std::wstring code;
+    };
+    const std::vector<CodeBlock>& codeBlocks() const { return codeBlocks_; }
 
     // 绘制命令（块内相对坐标）；draw() 只重放它们，不再测量
     struct Command {
@@ -72,6 +90,9 @@ private:
     int width_ = -1;
     std::wstring source_;
     std::size_t rebuilt_ = 0;
+    std::vector<VisualLine> visualLines_;
+    std::vector<CodeBlock> codeBlocks_;
+    void rebuildDerived();
 };
 
 // 兼容旧调用：一次排版（必要时绘制），返回高度。

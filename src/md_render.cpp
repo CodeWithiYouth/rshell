@@ -407,7 +407,55 @@ int LayoutCache::build(HDC dc, int width, const std::wstring& source, const Styl
     source_ = source;
     height_ = total;
     rebuilt_ = rebuilt;
+    rebuildDerived();
     return height_;
+}
+
+// 从块缓存里整理出“按行”的文本，供鼠标选区和代码块复制按钮使用。
+// 只在真正重排过（rebuilt_ > 0）后调用，内容没变时直接复用。
+void LayoutCache::rebuildDerived() {
+    visualLines_.clear();
+    codeBlocks_.clear();
+
+    int blockTop = 0;
+    for (const BlockCache& cache : blocks_) {
+        if (cache.block.kind == BlockKind::Code) {
+            CodeBlock code;
+            code.y = blockTop;
+            code.height = cache.height;
+            code.code = cache.block.text;
+            codeBlocks_.push_back(std::move(code));
+        }
+
+        // 同一视觉行可能由多个 Text 命令拼成（加粗/代码片段），按 y 合并
+        int lastY = 0;
+        bool hasLast = false;
+        std::size_t firstLineOfBlock = visualLines_.size();
+        for (const Command& command : cache.commands) {
+            if (command.kind != Command::Kind::Text || command.text.empty()) continue;
+            const int lineY = blockTop + command.y;
+            if (hasLast && lineY == lastY) {
+                visualLines_.back().text += command.text;
+                continue;
+            }
+            VisualLine line;
+            line.x = command.x;
+            line.y = lineY;
+            line.text = command.text;
+            line.font = command.font;
+            line.hardBreak = true;
+            visualLines_.push_back(std::move(line));
+            lastY = lineY;
+            hasLast = true;
+        }
+
+        // 一个块内部折行是“软换行”：复制时直接连起来更接近原文。
+        // 只有块的最后一行才算真正的换行。
+        for (std::size_t i = firstLineOfBlock; i + 1 < visualLines_.size(); ++i)
+            visualLines_[i].hardBreak = false;
+
+        blockTop += cache.height;
+    }
 }
 
 void LayoutCache::draw(HDC dc, int x, int y, const RECT* clip) const {

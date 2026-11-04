@@ -50,6 +50,7 @@ constexpr UINT kAiFlushMessage = WM_APP + 62;
 constexpr UINT kAiModelsMessage = WM_APP + 63;
 constexpr UINT_PTR kCaretTimer = 11;
 constexpr UINT_PTR kRepaintTimer = 12;
+constexpr UINT_PTR kCopyFlashTimer = 13;  // 复制代码块后把按钮从“已复制”恢复成“复制”
 constexpr int kRepaintIntervalMs = 16;  // 流式刷新上限约 60fps（实际按上帧耗时自适应放慢）
 
 // 设置视图的固定排版（绘制与建控件共用）
@@ -518,6 +519,10 @@ void AiTab::initialize(HWND) {
     };
     actions.onApproval = [this](std::size_t index, bool allowed) {
         onPanelApproval(index, allowed);
+    };
+    // 复制代码块后让按钮显示一会儿“已复制”，再重绘恢复
+    actions.onCopied = [this]() {
+        if (window_) SetTimer(window_, kCopyFlashTimer, 1500, nullptr);
     };
     panel_.setCallbacks(std::move(actions));
 
@@ -1818,6 +1823,9 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             } else if (wParam == kCaretTimer && panel_.inputFocused() && !settingsOpen_) {
                 const RECT caretArea = panel_.composerRect();
                 InvalidateRect(window_, &caretArea, FALSE);
+            } else if (wParam == kCopyFlashTimer) {
+                KillTimer(window_, kCopyFlashTimer);
+                InvalidateRect(window_, nullptr, FALSE);
             }
             return 0;
 

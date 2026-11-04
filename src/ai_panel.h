@@ -71,6 +71,8 @@ struct PanelActions {
     std::function<void()> onHistory;
     std::function<void()> onHost;
     std::function<void()> onToggleFullScreen;
+    // 复制了代码块之后通知宿主：请安排一次重绘把我恢复成“复制”
+    std::function<void()> onCopied;
     // 空状态里的按钮（与标题栏「设置」分开：可能只是去解锁保险库）
     std::function<void()> onWelcome;
     std::function<void()> onClose;
@@ -93,6 +95,21 @@ public:
     // 诊断 / 回归测试：所有思考条目累计切了多少行。
     // 文本没变化时重绘不应再增加（防止退回"每帧整段重排"）。
     std::size_t reasoningLinesCut() const;
+    // 文本选择：Ctrl+C 复制选中的对话内容
+    bool hasSelection() const { return hasSelection_; }
+    bool copySelection();
+    void clearSelection();
+    // 回归测试用：当前选中的文本
+    const std::wstring& selectedText() const { return selectedText_; }
+    // 回归测试用：点一下消息文本并拖到终点，覆盖真实的选择路径
+    bool selectText(POINT from, POINT to);
+    // 回归测试用：按“行号 + 行内偏移”直接建选区（行数据在 paint 后才有）
+    bool selectLineRange(std::size_t firstLine, int firstCh, std::size_t lastLine, int lastCh);
+    std::size_t selectableLineCount() const { return selectLines_.size(); }
+    // 回归测试用：代码块复制按钮的矩形（没绘制过时为空）
+    RECT codeBlockCopyRect(std::size_t itemIndex, std::size_t blockIndex) const;
+    // 回归测试用：第 N 条可选文本行的屏幕矩形
+    RECT selectLineRect(std::size_t line) const;
     // 面板内容是否超过一屏（用于切换滚动条显示）
     bool contentOverflows() const { return contentHeight_ > viewportHeight_; }
     int contentHeight() const { return contentHeight_; }
@@ -160,12 +177,13 @@ public:
     void setInput(std::wstring text);
 
 private:
-    enum class Hit { None, Send, Cancel, Settings, Clear, History, Allow, Deny, Toggle, Host, Full, WelcomeSettings, Close };
+    enum class Hit { None, Send, Cancel, Settings, Clear, History, Allow, Deny, Toggle, Host, Full, WelcomeSettings, Close, CopyCode };
 
     struct HitRect {
         RECT rect{};
         Hit kind = Hit::None;
         std::size_t index = 0;
+        std::size_t sub = 0;  // 同一条消息里的第几个按钮（代码块复制）
     };
 
     int dp(int value) const;
@@ -181,11 +199,50 @@ private:
     void rebuildDerivedFonts();
     md::Style markdownStyle(HDC dc) const;
     void pushHistory(const ChatItem& item);
+    // 收集一条消息里可选择的文本行（绘制时调用，坐标是屏幕坐标）
+    void collectSelectLines(HDC dc, const ChatItem& item, const RECT& rc, std::size_t index);
+    // 重建所有可见消息的可选文本行（有选择/刚开始选择时才调用）
+    void rebuildSelectLines(HDC dc);
+    // 在文本下面画选区高亮（必须在卡片背景之后、文字之前）
+    void paintSelectionForItem(HDC dc, std::size_t index);
+    bool selectionPoint(POINT pt, std::size_t& line, int& ch) const;
+    void updateSelection(POINT pt);
+    void rebuildSelectedText();
+    void copyCodeBlock(std::size_t itemIndex, std::size_t blockIndex);
     void scrollToBottom();
     void clampScroll(int viewportHeight, int contentHeight);
 
     std::vector<ChatItem> items_;
     std::vector<HitRect> hits_;
+    // 鼠标选择的文本行（每次绘制重建，只包含可见区域）
+    struct SelectLine {
+        std::size_t item = 0;
+        int top = 0;
+        int bottom = 0;
+        int left = 0;
+        HFONT font = nullptr;
+        std::wstring text;
+        // 每个字符结束处的 x（相对 left）。只在真的要命中/高亮时才计算，
+        // 否则每帧给几百行算一遍 GDI 宽度，流式会被拖慢。
+        mutable std::vector<int> dx;
+        mutable bool dxReady = false;
+        bool hardBreak = true;
+    };
+    HDC measureDc();
+    void ensureLineDx(const SelectLine& line) const;
+    std::vector<SelectLine> selectLines_;
+    std::size_t selAnchorLine_ = 0;
+    std::size_t selFocusLine_ = 0;
+    int selAnchorCh_ = 0;
+    int selFocusCh_ = 0;
+    bool selecting_ = false;
+    bool hasSelection_ = false;
+    std::wstring selectedText_;
+    // 代码块复制按钮的短暂反馈
+    std::size_t copyFlashItem_ = static_cast<std::size_t>(-1);
+    std::size_t copyFlashBlock_ = static_cast<std::size_t>(-1);
+    ULONGLONG copyFlashUntil_ = 0;
+    std::size_t hoverSub_ = 0;
     std::vector<int> heights_;
     int measuredWidth_ = -1;
     bool layoutDirty_ = true;
@@ -225,6 +282,14 @@ private:
     std::size_t hoverIndex_ = 0;
     Hit pressed_ = Hit::None;
     std::size_t pressedIndex_ = 0;
+    std::size_t pressedSub_ = 0;
+    HDC measureDc_ = nullptr;  // 懒计算字符宽度用的内存 DC
+    // 可选文本行的缓存时间戳：内容/滚动/尺寸没变就不重建
+    int selectStampContent_ = -1;
+    int selectStampScroll_ = -1;
+    int selectStampWidth_ = -1;
+    std::size_t selectStampItems_ = 0;
+    std::size_t selectStampTail_ = 0;
 };
 
 // 离屏渲染一段演示对话到 32bpp BMP，用于人工核对界面（rshell-gui.exe --ai-preview <out.bmp>）

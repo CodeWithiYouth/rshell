@@ -1393,6 +1393,128 @@ void markdownCacheRegression() {
     ReleaseDC(nullptr, screen);
 }
 
+// 导出当前内存 DC（32bpp），用于人工核对选区高亮等视觉效果
+void saveDcBmp(HDC dc, int width, int height, const char* path) {
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width;
+    info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    std::vector<unsigned char> pixels(static_cast<std::size_t>(width) * height * 4);
+    HBITMAP bitmap = static_cast<HBITMAP>(GetCurrentObject(dc, OBJ_BITMAP));
+    if (!bitmap) return;
+    if (!GetDIBits(dc, bitmap, 0, static_cast<UINT>(height), pixels.data(), &info,
+                   DIB_RGB_COLORS))
+        return;
+    BITMAPFILEHEADER header{};
+    header.bfType = 0x4D42;
+    header.bfOffBits = sizeof(header) + sizeof(BITMAPINFOHEADER);
+    header.bfSize = header.bfOffBits + static_cast<DWORD>(pixels.size());
+    std::ofstream out(path, std::ios::binary);
+    out.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    out.write(reinterpret_cast<const char*>(&info.bmiHeader), sizeof(info.bmiHeader));
+    out.write(reinterpret_cast<const char*>(pixels.data()),
+              static_cast<std::streamsize>(pixels.size()));
+}
+
+// 文本选择与复制：拖选消息文本后 Ctrl+C 要能拿到内容；
+// markdown 代码块右上角有“复制”按钮，点一下复制整块。
+void textSelectionRegression() {
+    HDC screen = GetDC(nullptr);
+    HDC dc = CreateCompatibleDC(screen);
+    HBITMAP bmp = CreateCompatibleBitmap(screen, 460, 620);
+    HGDIOBJ old = SelectObject(dc, bmp);
+
+    ai::ChatPanel panel;
+    ai::PanelFonts fonts;
+    fonts.ui = g_app.uiFont;
+    fonts.bold = g_app.uiFontBold;
+    fonts.mono = g_app.font;
+    fonts.caption = g_app.tinyFont;
+    panel.setFonts(fonts);
+    panel.setBounds(RECT{0, 0, 460, 620});
+
+    panel.addUser(L"请检查一下磁盘占用");
+    const std::size_t index = panel.beginAssistant();
+    panel.appendAssistant(index,
+                          L"先看 `/var/lib/docker`，再压缩日志。\n\n"
+                          L"```bash\nsystemctl status nginx\nss -lntp | grep 8080\n```\n");
+    panel.finishAssistant(index, true);
+    panel.paint(dc);
+
+    check(panel.selectLineRange(0, 0, 0, 999), "selecting a line builds a selection");
+    check(panel.selectableLineCount() >= 4, "message text is exposed as selectable lines");
+    check(panel.selectedText() == L"请检查一下磁盘占用",
+          "the selected text matches the message body");
+
+    check(panel.selectLineRange(0, 0, 1, 5), "selection can span lines");
+    check(panel.selectedText().rfind(L"请检查", 0) == 0, "selection starts at the anchor");
+
+    // 真实拖动路径：按下 → 移动 → 抬起
+    const RECT line0 = panel.selectLineRect(0);
+    const RECT line1 = panel.selectLineRect(1);
+    check(!IsRectEmpty(&line0) && !IsRectEmpty(&line1), "selectable lines expose screen rects");
+    const POINT dragFrom{line0.left + 6, line0.top + 4};
+    const POINT dragTo{line1.left + 40, line1.top + 4};
+    panel.onMouseDown(dragFrom);
+    panel.onMouseMove(dragTo);
+    panel.onMouseUp(dragTo);
+    check(panel.hasSelection() && !panel.selectedText().empty(),
+          "dragging across messages selects text");
+
+    std::wstring previous;
+    const bool hadText = clipboardText(previous);
+    if (copyTextToClipboard(L"rshell-selection-probe")) {
+        panel.selectLineRange(0, 0, 0, 999);
+        Sleep(30);  // 让上一次剪贴板操作彻底释放
+        panel.onKeyDown('C', false, true);
+        std::wstring copied;
+        if (clipboardText(copied)) {
+            if (copied == L"请检查一下磁盘占用") {
+                check(true, "Ctrl+C copies the selected text");
+            } else {
+                std::cout << "clipboard has " << copied.size() << " chars instead of the selection\n";
+                check(false, "Ctrl+C copies the selected text");
+            }
+        } else {
+            std::cout << "SKIP clipboard read failed, Ctrl+C check skipped\n";
+        }
+        if (hadText && !previous.empty()) copyTextToClipboard(previous);
+    } else {
+        std::cout << "SKIP clipboard is busy, selection copy skipped\n";
+    }
+
+    const RECT copyBtn = panel.codeBlockCopyRect(index, 0);
+    check(!IsRectEmpty(&copyBtn), "the code block has a copy button");
+    if (!IsRectEmpty(&copyBtn)) {
+        const POINT center{(copyBtn.left + copyBtn.right) / 2,
+                           (copyBtn.top + copyBtn.bottom) / 2};
+        panel.onMouseDown(center);
+        panel.onMouseUp(center);
+        std::wstring copied;
+        if (clipboardText(copied)) {
+            check(copied.find(L"systemctl status nginx") != std::wstring::npos &&
+                      copied.find(L"ss -lntp | grep 8080") != std::wstring::npos,
+                  "the code block button copies the whole block");
+        } else {
+            std::cout << "SKIP clipboard read failed, code block check skipped\n";
+        }
+    }
+
+    if (const char* shot = std::getenv("RSHELL_SELECT_PREVIEW")) {
+        panel.selectLineRange(0, 0, 1, 10);
+        panel.paint(dc);
+        saveDcBmp(dc, 460, 620, shot);
+    }
+
+    SelectObject(dc, old);
+    DeleteObject(bmp);
+    DeleteDC(dc);
+    ReleaseDC(nullptr, screen);
+}
+
 // 思考过程：长文本在流式追加时只切最后一行，内容没变时重绘完全不重新排版。
 // 以前这里是每帧 DrawText 整段重排，思考一长窗口就拖不动（100 条长思考单帧 45ms，
 // 流式每帧平均 1.2s），所以用切行计数把"增量"行为锁住。
@@ -1852,6 +1974,7 @@ int main(int argc, char** argv) {
         aiPanelFullButtonRegression();
         markdownCacheRegression();
         reasoningWrapRegression();
+        textSelectionRegression();
         aiPanelPartialPaintRegression();
         mainMenuRegression();
         submenuHoverRegression();

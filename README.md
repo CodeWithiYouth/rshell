@@ -8,10 +8,10 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 **Windows 10/11，64 位，按需下载：**
 
-- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.13/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
-- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.13/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.14/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.14/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
 
-两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.2.13 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.2.13)。
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.2.14 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.2.14)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -53,6 +53,7 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 4. 直接提问，例如「磁盘怎么满了」「看看 nginx 为什么返回 502」。
 
 回答支持基础的 Markdown 渲染：标题、列表、引用、代码块和表格都会按格式显示。
+面板里的文字可以用鼠标拖选，按 **Ctrl+C** 复制；代码块右上角有「复制」按钮，点一下复制整段代码。
 
 **权限模型：**
 

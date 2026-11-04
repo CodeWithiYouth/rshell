@@ -10711,6 +10711,16 @@ int runGui(HINSTANCE inst, int showCommand) {
                 stopGdiplus();
                 return ok ? 0 : 2;
             }
+            if (argc >= 3 && std::wstring(argv[1]) == L"--ai-markdown") {
+                // rshell-gui.exe --ai-markdown <out.bmp> [宽] [高]
+                // 渲染一段含代码块/表格的回答，用来核对代码块复制按钮的位置
+                const int w = argc >= 4 ? _wtoi(argv[3]) : 440;
+                const int h = argc >= 5 ? _wtoi(argv[4]) : 780;
+                const bool ok = ai::renderPreview(argv[2], w > 0 ? w : 440, h > 0 ? h : 780, 3);
+                LocalFree(argv);
+                stopGdiplus();
+                return ok ? 0 : 2;
+            }
             if (argc >= 3 && std::wstring(argv[1]) == L"--ai-preview") {
                 // rshell-gui.exe --ai-preview <out.bmp> [宽] [高]
                 // 用与真实面板相同的绘制代码渲染一段演示对话，便于核对排版

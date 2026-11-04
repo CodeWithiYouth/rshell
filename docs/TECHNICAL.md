@@ -599,6 +599,23 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
   （真实 SSE 推 6KB 思考，单帧 <150ms）；`RSHELL_AI_PAINT_BENCH=1` 会打印
   `BENCH reason-static` / `BENCH reason-stream`。
 
+### 文字选择与复制
+
+面板是 GDI 自绘的，没有系统文本框可借，所以选区自己做：
+
+- 绘制时把每条消息的“可视文本行”整理成 `SelectLine`（屏幕坐标 + 行文本 + 字体）。
+  用户消息、提示、错误、思考过程来自 `WrapCache` 的行；Markdown 回答来自
+  `LayoutCache::visualLines()`（按命令的 y 合并同一视觉行）。
+- 平时**不**整理这些行；点进消息区才按需构建一次，之后只在内容/滚动/宽度变化时重建，
+  避免每帧给几百行算 `GetTextExtentExPointW`（那会让流式帧从 9ms 掉到 70ms）。
+- 每行的字符宽度是懒计算的：命中鼠标、画高亮时才测那一行。
+- 拖动得到 `(item, line, ch)` 区间，`Ctrl+C` 按行拼接：硬换行补 `\n`，软换行在英文
+  单词之间补空格，中文直接接上。
+- 代码块的几何来自 `LayoutCache::codeBlocks()`，回答右上角画「复制」按钮，点击复制整块原文；
+  按钮随后短暂显示「已复制」，由 `ai_tab` 的 1.5 秒定时器触发重绘恢复。
+- 回归：`textSelectionRegression`（行选择、跨行拖动、Ctrl+C、代码块按钮）；剪贴板被占用时
+  只跳过剪贴板比较，不判失败。
+
 ### 网络
 
 - 只用系统 `winhttp.dll`，TLS 由 SChannel 提供，不打包 OpenSSL/curl

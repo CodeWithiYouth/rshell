@@ -290,6 +290,50 @@ void networkRegression(int port, const std::string& upload, const std::string& d
     waitUntil([&] { return pending.expired(); }, "closing a connecting tab releases its backend without touching active shell");
     check(g_app.shell->running(), "active connection survives closing a pending connection");
 
+    // 在隔离服务器上验证递归文件夹传输和已有前缀的双向续传。
+    const fs::path fixture = utf8ToPath(download).parent_path();
+    const UINT_PTR transferConnection = g_app.connectionId;
+    auto folderCancel = std::make_shared<std::atomic<bool>>(false);
+    g_app.fs->uploadDirectory(pathToUtf8(fixture / "folder-source"), "/folder-copy", folderCancel, false);
+    waitUntil([&] { return completed(transferConnection, "/folder-copy"); },
+              "nested directory upload completes");
+    auto treeDownloadCancel = std::make_shared<std::atomic<bool>>(false);
+    addDownloadTask("/folder-copy", L"folder-copy", 0, false, treeDownloadCancel);
+    g_app.fs->downloadDirectory("/folder-copy", pathToUtf8(fixture / "folder-download"), treeDownloadCancel, false);
+    waitUntil([&] {
+        const auto& tasks = state(transferConnection)->downloads;
+        return std::any_of(tasks.begin(), tasks.end(), [](const SessionState::DownloadTask& task) {
+            return task.remote == "/folder-copy" && !task.upload &&
+                   task.state == SessionState::DownloadState::Done;
+        });
+    },
+              "nested directory download completes");
+    auto uploadCancel = std::make_shared<std::atomic<bool>>(false);
+    g_app.fs->upload(pathToUtf8(fixture / "resume-upload.bin"), "/partial-upload.bin", uploadCancel, true);
+    waitUntil([&] { return completed(transferConnection, "/partial-upload.bin"); },
+              "partial upload resumes");
+    auto oversizedCancel = std::make_shared<std::atomic<bool>>(false);
+    g_app.fs->upload(pathToUtf8(fixture / "resume-upload.bin"), "/oversized-upload.bin", oversizedCancel, true);
+    waitUntil([&] {
+        const auto& tasks = state(transferConnection)->downloads;
+        return std::any_of(tasks.begin(), tasks.end(), [](const SessionState::DownloadTask& task) {
+            return task.remote == "/oversized-upload.bin" && task.state == SessionState::DownloadState::Failed;
+        });
+    }, "oversized destination is rejected without truncation");
+    auto cancelledFolder = std::make_shared<std::atomic<bool>>(true);
+    g_app.fs->uploadDirectory(pathToUtf8(fixture / "folder-source"), "/cancelled-folder", cancelledFolder, false);
+    waitUntil([&] {
+        const auto& tasks = state(transferConnection)->downloads;
+        return std::any_of(tasks.begin(), tasks.end(), [](const SessionState::DownloadTask& task) {
+            return task.remote == "/cancelled-folder" && task.state == SessionState::DownloadState::Cancelled;
+        });
+    }, "cancelled folder upload stops");
+    auto resumeCancel = std::make_shared<std::atomic<bool>>(false);
+    addDownloadTask("/resume-download.bin", L"resume-download.bin", 24, false, resumeCancel);
+    g_app.fs->download("/resume-download.bin", pathToUtf8(fixture / "partial-download.bin"), resumeCancel, true);
+    waitUntil([&] { return completed(transferConnection, "/resume-download.bin"); },
+              "partial download resumes");
+
     // 断线自动重连：用和读线程失败时完全相同的那条消息模拟掉线
     if (std::getenv("RSHELL_TEST_RECONNECT")) {
         const UINT_PTR before = g_app.connectionId;
@@ -305,6 +349,38 @@ void networkRegression(int port, const std::string& upload, const std::string& d
         check(output(g_app).find("连接已自动恢复") != std::string::npos,
               "terminal reports the recovered connection");
         waitUntil([&] { return g_app.fsReady; }, "file channel comes back after the reconnect");
+
+        // 文件连接可能比 shell 晚恢复：模拟一次暂时性失败，验证重试确实建立
+        // 新的 SFTP/AI 共用连接，而不是只改变界面状态。
+        g_app.fs->stop();
+        g_app.fsReady = false;
+        g_app.fsRecoveryPending = true;
+        g_app.fsRecoveryAttempt = 0;
+        FsEvent failed; failed.kind = FsEventKind::Failed; failed.message = "network temporarily unavailable";
+        dispatchFs(g_app.connectionId, failed);
+        check(g_app.fsRecoveryPending && g_app.reconnectTimerSet,
+              "a transient file connection failure schedules a retry");
+        const UINT_PTR recoveringConnection = g_app.connectionId;
+        newSessionTab();
+        waitUntil([&] {
+            const SessionState* recovering = state(recoveringConnection);
+            return recovering && !recovering->fsRecoveryPending && recovering->fsReady;
+        }, "the background file connection recovers after a transient failure");
+        waitUntil([&] {
+            const SessionState* recovering = state(recoveringConnection);
+            return recovering && !recovering->fsLoading && !recovering->fsPath.empty();
+        },
+                  "SFTP directory listing works after the file connection retry");
+        closeSessionTab(1);
+        const bool aiWasOpen = g_app.aiOpen;
+        if (!aiWasOpen) toggleAiPanel();
+        check(g_app.aiTab && g_app.aiTab->resolveHostForTest("") == g_app.fs.get(),
+              "AI tools resolve the recovered file connection");
+        ai::SshToolBackend aiBackend(*g_app.fs);
+        const auto aiResult = aiBackend.runCommand("echo recovered-ai", 8, {});
+        check(aiResult.exitCode == 0 && aiResult.output.find("recovered-ai") != std::string::npos,
+              "AI command execution works on the recovered connection");
+        if (!aiWasOpen) toggleAiPanel();
 
         // exec 通道连续调用必须稳定（曾经「第一条成功、第二条就超时」）
         for (int i = 0; i < 5; ++i) {
@@ -1850,6 +1926,38 @@ void updateCheckRegression() {
     check(g_app.updateTag == "v99.9.9", "a newer release is remembered");
     check(g_app.updateUrl == "https://example.invalid/rshell", "its page url is remembered");
     check(g_app.updateNewer, "a newer release is highlighted");
+    const MessageSpec prompt = updatePromptSpec(newer);
+    check(prompt.buttons.size() == 3 && prompt.buttons[0] == L"是" &&
+          prompt.buttons[1] == L"GitHub" && prompt.buttons[2] == L"否" && prompt.defaultIndex == 2,
+          "update confirmation offers yes, GitHub and no with no as the default");
+    const std::string digest(64, 'a');
+    const std::string assetUrl = "https://github.com/CodeWithiYouth/rshell/releases/download/v9.0.0/rshell-gui.exe";
+    const std::string releaseJson = "{\"tag_name\":\"v9.0.0\",\"body\":\"" + digest +
+        "  rshell-gui.exe\\n\",\"assets\":[{\"name\":\"rshell-gui.exe\",\"size\":2048,"
+        "\"browser_download_url\":\"" + assetUrl + "\"}]}";
+    const ReleaseInfo parsed = parseReleaseInfo(releaseJson, "1.0.0");
+    check(parsed.ok && parsed.newer && parsed.downloadUrl == assetUrl && parsed.sha256 == digest && parsed.assetSize == 2048,
+          "release metadata selects the official GUI asset and its checksum");
+    ReleaseInfo untrusted = parsed;
+    untrusted.downloadUrl = "https://example.invalid/rshell-gui.exe";
+    check(!downloadRelease(untrusted, L"C:\\unused\\rshell-gui.exe").ok,
+          "an unofficial update URL is rejected before downloading");
+    const ReleaseInfo badTag = parseReleaseInfo("{\"tag_name\":\"../bad\"}", "1.0.0");
+    check(!badTag.ok, "unsafe release tags are rejected");
+    if (std::getenv("RSHELL_TEST_LIVE_UPDATE")) {
+        const ReleaseInfo official = fetchLatestRelease("0.0.0", 15000);
+        check(official.ok && official.newer && !official.sha256.empty(),
+              "official release metadata includes a verifiable GUI asset");
+        wchar_t directory[MAX_PATH]{};
+        check(GetTempPathW(MAX_PATH, directory) > 0, "find update test directory");
+        const UpdateDownload downloaded = downloadRelease(official, std::wstring(directory) + L"rshell-test-target.exe");
+        check(downloaded.ok && !downloaded.stagedPath.empty(), "official release downloads and passes validation");
+        check(DeleteFileW(downloaded.stagedPath.c_str()) != FALSE, "remove the test-only staged download");
+        ReleaseInfo corrupt = official;
+        corrupt.sha256 = std::string(64, official.sha256[0] == '0' ? '1' : '0');
+        const UpdateDownload rejected = downloadRelease(corrupt, std::wstring(directory) + L"rshell-test-target.exe");
+        check(!rejected.ok && rejected.stagedPath.empty(), "checksum mismatch rejects the download before staging");
+    }
     {
         // 提示胶囊是在 paintTitleBar 里算出来的，探针窗口不显示，得自己画一次
         RECT client{};

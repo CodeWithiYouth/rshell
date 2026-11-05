@@ -85,7 +85,11 @@ AiSettings loadAiSettings(const std::string& path) {
             settings.autoApprove = !(value == "0" || iequals(value, "false") ||
                                      iequals(value, "no"));
         } else if (key == "max_steps" || key == "maxsteps") {
-            settings.maxSteps = parseInt(value, settings.maxSteps);
+            const int parsed = parseInt(value, settings.maxSteps);
+            if (parsed > 0 && parsed <= 10000) settings.maxSteps = parsed;
+        } else if (key == "limit_steps") {
+            settings.limitSteps = !(value == "0" || iequals(value, "false") ||
+                                    iequals(value, "no"));
         } else if (key == "search_provider" || key == "searchprovider") {
             if (value == "tinyfish" || value == "exa") settings.searchProvider = value;
         } else if (key == "save_sessions" || key == "savesessions") {
@@ -124,6 +128,7 @@ bool saveAiSettings(const AiSettings& settings, std::string* error, const std::s
     out << "save_sessions=" << (settings.saveSessions ? "1" : "0") << "\n";
     out << "search_provider=" << settings.searchProvider << "\n";
     out << "max_steps=" << settings.maxSteps << "\n";
+    out << "limit_steps=" << (settings.limitSteps ? "1" : "0") << "\n";
     if (!out.good()) {
         if (error) *error = "写入配置文件失败：" + file;
         return false;

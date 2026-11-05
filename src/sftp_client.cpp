@@ -414,7 +414,11 @@ TransferResult SftpClient::upload(const std::string& localPath,
         throw Error("远端文件已存在：" + target + "（加 --force 覆盖）");
 
     std::uint64_t offset = 0;
-    if (options.resume && targetExists && existing.size < total) offset = existing.size;
+    if (options.resume && targetExists) {
+        if (existing.size > total) throw Error("远端文件比源文件大，无法续传：" + target);
+        if (existing.size == total) return TransferResult{};
+        offset = existing.size;
+    }
 
     std::ifstream in(local, std::ios::binary);
     if (!in) throw Error("无法读取本地文件：" + localPath);
@@ -499,7 +503,9 @@ TransferResult SftpClient::download(const std::string& remotePath,
     std::uint64_t offset = 0;
     if (options.resume && localExists && fs::is_regular_file(local, ec)) {
         std::uint64_t have = fs::file_size(local, ec);
-        if (have < entry.size) offset = have;
+        if (have > entry.size) throw Error("本地文件比源文件大，无法续传：" + pathToUtf8(local));
+        if (have == entry.size) return TransferResult{};
+        offset = have;
     }
 
     if (local.has_parent_path()) fs::create_directories(local.parent_path(), ec);

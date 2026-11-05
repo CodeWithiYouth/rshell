@@ -8,10 +8,10 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 **Windows 10/11，64 位，按需下载：**
 
-- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.14/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
-- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.2.14/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.0/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.0/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
 
-两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.2.14 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.2.14)。
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.3.0 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.3.0)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -31,9 +31,12 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 - **切换与关闭：** Ctrl+Tab / Ctrl+Shift+Tab 切换标签；点击标签上的 `×`、鼠标中键或 Ctrl+Shift+W 关闭当前标签。
 - **远端路径：** 点 SFTP 面板顶部的路径框，输入路径并回车；Ctrl+L 也可打开路径输入。
 - **新建远端文件：** 在 SFTP 面板右键 →「新建」→「新建文件…」；同一菜单也可新建文件夹。
+- **文件夹传输：** 在文件面板右键上传文件夹，或选中远端文件夹后选择下载；也可以把本地文件夹拖入面板。文件夹传输遇到已存在的同名文件会停止，避免覆盖。
+- **断点续传：** 文件面板右键选择续传上传或续传下载；按已有文件长度继续，长度相同则跳过。请确认源文件与原来一致，续传不会校验已有内容。
 - **编辑远端文件：** 右键文件 →「编辑」；保存后自动上传。可在右键菜单底部或「工具」菜单选择文本编辑器。
 - **搜索终端输出：** Ctrl+Shift+F，然后按 Enter / Shift+Enter 浏览匹配项。
 - **断线重连：** Ctrl+Shift+R。
+- **更新程序：** 点击标题栏的新版本提示，选择「是」下载校验后替换并重启，或选「GitHub」前往发布页。更新会关闭当前连接和正在进行的传输；程序目录需要写入权限。
 - **保持活动状态：** 会话管理里勾选「保活」并填间隔（默认 30 秒），空闲时定时发送 SSH 保活消息，避免 NAT/防火墙把连接断开。
 - **AI 助手：** 标题栏右上角的星芒按钮、Ctrl+J，或菜单 →「AI 助手」，在当前会话右侧展开（面板打开时按钮高亮）；面板内可切换到全屏。
 - **终端字号：** Ctrl++ 放大、Ctrl+- 缩小、Ctrl+0 重置。
@@ -53,6 +56,7 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 4. 直接提问，例如「磁盘怎么满了」「看看 nginx 为什么返回 502」。
 
 回答支持基础的 Markdown 渲染：标题、列表、引用、代码块和表格都会按格式显示。
+AI 设置中可调整单次任务的最大执行步数（默认 16），也可取消勾选限制；取消限制后仍可手动停止，审批规则保持生效。
 面板里的文字可以用鼠标拖选，按 **Ctrl+C** 复制；代码块右上角有「复制」按钮，点一下复制整段代码。
 
 **权限模型：**

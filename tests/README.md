@@ -6,7 +6,8 @@
 | --- | --- | --- | --- |
 | 单元测试 | `rshell_tests.exe`（或 `.\build.ps1 -Test`） | 无 | 路径/通配符/配置解析/进度与格式化、终端模拟器（VT 解析）等纯逻辑 |
 | GUI 多标签回归 | `rshell_gui_tabs_probe.exe`（包含在 `.\build.ps1 -Test` 中） | Windows，无需 SSH | 隐藏窗口中的标签切换、后台事件分发、SFTP/传输状态隔离、关闭清理、DPI 与溢出布局 |
-| GUI 多连接端到端 | `python tests/gui_tabs_e2e.py --exe build\modern\rshell_gui_tabs_probe.exe` | Python 3.9+、`paramiko` | 真实双 SSH/SFTP、中文输入、后台上传下载、重连与连接建立期间关闭标签 |
+| 自更新助手 | `python tests/update_helper_e2e.py --gui build\modern\rshell-gui.exe --fixture build\modern\rshell_update_fixture.exe`（也包含在 `.\build.ps1 -Test` 中） | Windows、Python 3 | 临时副本替换、等待旧进程退出、重新启动和非法参数；不触碰正在使用的程序 |
+| GUI 多连接端到端 | `python tests/gui_tabs_e2e.py --exe build\modern\rshell_gui_tabs_probe.exe` | Python 3.9+、`paramiko` | 真实双 SSH/SFTP、文件夹和双向续传、取消与冲突保护、自动重连及 AI 通道恢复 |
 | 慢连接目录跟随 | `python tests/gui_tabs_e2e.py --exe build\modern\rshell_gui_tabs_probe.exe --cwd-hooks --cwd-delay 1.8` | Python 3.9+、`paramiko` | 延迟回显、逐字节确认帧、初始化输入暂存及 `stty` 回显清理 |
 | Bash 历史隔离 | `python tests/cwd_history_test.py --exe build\modern\rshell_gui_tabs_probe.exe` | Python 3.9+、Bash（默认 Git Bash，可用 `--bash` 指定） | 真实交互式 Bash 的默认、忽略空格、过滤、时间戳、自动追加及关闭历史等配置；不读写用户实际历史 |
 | 端到端测试 | `python tests/e2e_test.py` | Python 3.9+、`paramiko` | 真实 SSH/SFTP 会话上的全部子命令 |

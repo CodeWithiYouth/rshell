@@ -128,7 +128,7 @@ AgentTurn Agent::run(const std::function<bool()>& shouldCancel) {
 
     const std::vector<ToolSpec> specs = tools_.specs();
 
-    for (int step = 0; step < config_.maxSteps; ++step) {
+    for (int step = 0; config_.maxSteps <= 0 || step < config_.maxSteps; ) {
         if (shouldCancel && shouldCancel()) {
             turn.cancelled = true;
             return turn;
@@ -157,7 +157,8 @@ AgentTurn Agent::run(const std::function<bool()>& shouldCancel) {
             return turn;
         }
 
-        turn.steps = step + 1;
+        if (step < 2147483647) ++step;
+        turn.steps = step;
         if (result.cancelled) {
             turn.cancelled = true;
             return turn;

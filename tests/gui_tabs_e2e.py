@@ -28,6 +28,14 @@ def main():
         (remote / "alpha-dir").mkdir(parents=True)
         (remote / "beta-dir").mkdir()
         (remote / "alpha-dir" / "alpha.txt").write_bytes(b"alpha-download-content\n")
+        (remote / "partial-upload.bin").write_bytes(b"resume-")
+        (remote / "oversized-upload.bin").write_bytes(b"this-is-longer-than-the-source-file")
+        (remote / "resume-download.bin").write_bytes(b"resume-download-complete")
+        (directory / "partial-download.bin").write_bytes(b"resume-")
+        (directory / "resume-upload.bin").write_bytes(b"resume-upload-complete")
+        (directory / "folder-source" / "nested").mkdir(parents=True)
+        (directory / "folder-source" / "empty").mkdir()
+        (directory / "folder-source" / "nested" / "sample.txt").write_bytes(b"nested-content")
         profile = directory / "profile"
         (profile / ".ssh").mkdir(parents=True)
         (profile / ".rshell").mkdir()
@@ -48,6 +56,7 @@ def main():
         environment["USERPROFILE"] = str(profile)
         environment["RSHELL_SESSIONS"] = str(profile / "sessions.ini")
         environment["RSHELL_NO_CWD_SYNC"] = "1"
+        environment["RSHELL_TEST_RECONNECT"] = "1"
         if args.cwd_hooks:
             environment.pop("RSHELL_NO_CWD_SYNC", None)
             environment["RSHELL_TEST_CWD_HOOKS"] = "1"
@@ -63,6 +72,13 @@ def main():
                 raise RuntimeError(result.stderr or f"GUI probe exited {result.returncode}")
             assert (remote / "beta-dir" / "upload.bin").read_bytes() == content
             assert download.read_bytes() == b"alpha-download-content\n"
+            assert (remote / "partial-upload.bin").read_bytes() == b"resume-upload-complete"
+            assert (remote / "oversized-upload.bin").read_bytes() == b"this-is-longer-than-the-source-file"
+            assert (directory / "partial-download.bin").read_bytes() == b"resume-download-complete"
+            assert (remote / "folder-copy" / "nested" / "sample.txt").read_bytes() == b"nested-content"
+            assert (directory / "folder-download" / "nested" / "sample.txt").read_bytes() == b"nested-content"
+            assert (remote / "folder-copy" / "empty").is_dir()
+            assert (directory / "folder-download" / "empty").is_dir()
             if args.cwd_hooks:
                 log = (profile / ".rshell" / "gui.log").read_text(encoding="utf-8")
                 times = re.findall(r"目录跟随初始化完成（(\d+) ms）", log)

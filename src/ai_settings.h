@@ -39,6 +39,7 @@ struct AiSettings {
     // 联网搜索后端：空 = 关闭；tinyfish / exa（Key 按后端分别存保险库）
     std::string searchProvider;
     int maxSteps = 16;           // 单轮工具调用上限
+    bool limitSteps = true;      // 关闭后保留数值，下次勾选时恢复
 };
 
 // AI 配置文件路径：~/.rshell/ai.ini（可用 RSHELL_AI_CONFIG 覆盖）

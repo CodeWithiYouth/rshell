@@ -2547,6 +2547,23 @@ void testAiAgentAbortAndDefaults() {
         CHECK(!turn.finished);
         CHECK_EQ(turn.steps, 2);
     }
+    {
+        FakeToolBackend backend;
+        ai::ToolRegistry registry(backend);
+        FakeChatBackend chat;
+        for (int i = 0; i < 20; ++i)
+            chat.replies.push_back({"继续", {fakeCall("unlimited_" + std::to_string(i), "list_dir",
+                                                       R"({"path":"/tmp"})")}});
+        chat.replies.push_back({"完成", {}});
+        ai::AgentConfig config;
+        config.maxSteps = 0;
+        ai::Agent agent(chat, registry, config);
+        agent.addUserMessage("列目录");
+        const ai::AgentTurn turn = agent.run();
+        CHECK(turn.finished);
+        CHECK(!turn.stepLimit);
+        CHECK_EQ(turn.steps, 21);
+    }
 }
 
 void testAiAgentHistoryTrim() {
@@ -2763,6 +2780,7 @@ void testAiSettings() {
     CHECK(defaults.saveSessions);  // 会话保存默认开
     CHECK(defaults.searchProvider.empty());  // 联网搜索默认关闭
     CHECK_EQ(defaults.maxSteps, 16);
+    CHECK(defaults.limitSteps);
 
     // 写入会顺带建目录
     ai::AiSettings settings;
@@ -2773,6 +2791,7 @@ void testAiSettings() {
     settings.saveSessions = false;
     settings.searchProvider = "exa";
     settings.maxSteps = 8;
+    settings.limitSteps = false;
     std::string error;
     CHECK(ai::saveAiSettings(settings, &error, file.string()));
     CHECK(error.empty());
@@ -2795,6 +2814,7 @@ void testAiSettings() {
     CHECK(!loaded.saveSessions);
     CHECK_EQ(loaded.searchProvider, std::string("exa"));
     CHECK_EQ(loaded.maxSteps, 8);
+    CHECK(!loaded.limitSteps);
 
     // 手工写的配置：注释、CRLF、未知键、非法数字都要能容忍
     {

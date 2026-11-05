@@ -117,11 +117,15 @@ public:
     void createFile(const std::string& path);
     void remove(const std::string& path, bool isDir);
     void rename(const std::string& from, const std::string& to);
-    // cancel 非空时，传输会在每块数据前检查它，置 true 即中断并删掉半截本地文件
+    // cancel 非空时，每块数据前检查；中断后保留半截文件供显式续传。
     void download(const std::string& remotePath, const std::string& localPath,
-                  std::shared_ptr<std::atomic<bool>> cancel = nullptr);
+                  std::shared_ptr<std::atomic<bool>> cancel = nullptr, bool resume = false);
     void upload(const std::string& localPath, const std::string& remotePath,
-                std::shared_ptr<std::atomic<bool>> cancel = nullptr);
+                std::shared_ptr<std::atomic<bool>> cancel = nullptr, bool resume = false);
+    void uploadDirectory(const std::string& localPath, const std::string& remotePath,
+                         std::shared_ptr<std::atomic<bool>> cancel, bool resume);
+    void downloadDirectory(const std::string& remotePath, const std::string& localPath,
+                           std::shared_ptr<std::atomic<bool>> cancel, bool resume);
     void sampleNow();
 
     // ---- 拖动下载用的按需读取 ----

@@ -75,6 +75,7 @@ enum : UINT {
     WM_ASK_HOSTKEY = WM_APP + 7,  // lParam = HostKeyRequest*（工作线程同步等待）
     WM_VAULT_TPM_DONE = WM_APP + 8,  // lParam = std::shared_ptr<TpmAttempt>*（UI 线程释放）
     WM_UPDATE_AVAILABLE = WM_APP + 9,  // lParam = ReleaseInfo*（UI 线程释放）
+    WM_UPDATE_DOWNLOADED = WM_APP + 10, // lParam = UpdateDownload*
 };
 
 // 目录跟随分三步执行，每步由远端私有 OSC 确认；定时器只负责静默等待和超时。
@@ -132,6 +133,10 @@ ID_BTN_FS_TOGGLE,   // 文件面板：折叠 / 展开
     IDM_FS_EDIT,         // 下载到本地副本并用编辑器打开
     IDM_FS_EDIT_SYSTEM,  // 忽略已设置的编辑器，用系统默认程序打开
     IDM_FS_EDITOR,       // 选择 / 更换文本编辑器
+    IDM_FS_UPLOAD_DIR,
+    IDM_FS_UPLOAD_RESUME,
+    IDM_FS_UPLOAD_DIR_RESUME,
+    IDM_FS_DOWNLOAD_RESUME,
     // 密码保险库：新建 / 解锁 / 锁定同一个入口，标签随状态变
     IDM_VAULT = 2201,
 };
@@ -186,6 +191,8 @@ struct SessionState {
     int reconnectAttempt = 0;        // 已经排过几次（0 表示还没开始）
     bool reconnectTimerSet = false;
     std::string reconnectSession;    // 掉线时的会话名
+    bool fsRecoveryPending = false;   // 终端已恢复，独立文件连接仍在恢复
+    int fsRecoveryAttempt = 0;
     bool fsFailed = false;       // 独立连接失败（左侧显示原因）
     std::string fsPath;          // 当前远端目录
     std::string fsHome;          // 登录后的 home
@@ -232,6 +239,8 @@ struct App : SessionState {
     bool hoverUpdateChip = false;
     bool updateCheckManual = false;
     bool updateCheckOnStart = true;
+    bool updateDownloading = false;
+    ReleaseInfo updateRelease;
     // 远端文件的本地编辑副本：下载到 ~/.rshell/edit，编辑器保存后自动回传。
     // editorPath 为空表示用系统默认程序打开。
     std::wstring editorPath;
@@ -2627,6 +2636,8 @@ void cancelAutoReconnect(bool dropCredentials) {
     g_app.reconnectPending = false;
     g_app.reconnectAttempt = 0;
     g_app.reconnectSession.clear();
+    g_app.fsRecoveryPending = false;
+    g_app.fsRecoveryAttempt = 0;
     if (dropCredentials) {
         g_app.currentPassword.clear();
         g_app.currentKeyPassphrase.clear();
@@ -6083,7 +6094,7 @@ void fsGoUp() {
 }
 
 // 双击：目录进入，文件弹出另存为并下载
-void fsOpenEntry(int index) {
+void fsOpenEntry(int index, bool resume = false) {
     if (index < 0 || index >= static_cast<int>(g_app.fsEntries.size())) return;
     const RemoteEntry entry = g_app.fsEntries[static_cast<std::size_t>(index)];
     if (entry.isDir()) {
@@ -6099,18 +6110,18 @@ void fsOpenEntry(int index) {
     ofn.lpstrFile = file;
     ofn.nMaxFile = MAX_PATH;
     ofn.lpstrFilter = L"所有文件\0*.*\0\0";
-    ofn.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+    ofn.Flags = OFN_PATHMUSTEXIST | (resume ? OFN_FILEMUSTEXIST : OFN_OVERWRITEPROMPT);
     if (!GetSaveFileNameW(&ofn)) return;
 
     // 登记下载任务：状态栏会展开列表显示进度，可随时取消
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     addDownloadTask(entry.path, toWide(entry.name), entry.size, false, cancel);
-    g_app.fs->download(entry.path, toUtf8(file), cancel);
+    g_app.fs->download(entry.path, toUtf8(file), cancel, resume);
     setStatus(L"正在下载 " + toWide(entry.name) + L" …");
 }
 
 // 上传：支持多选，逐个排队（RemoteFs 内部串行执行）
-void fsUploadFiles() {
+void fsUploadFiles(bool resume = false) {
     if (!g_app.fsReady) {
         messageWarn(L"SFTP 未就绪", L"文件通道还没连上，请稍后再试。");
         return;
@@ -6141,12 +6152,58 @@ void fsUploadFiles() {
     for (const std::wstring& local : files) {
         const std::string name = localBaseName(toUtf8(local));
         auto cancel = std::make_shared<std::atomic<bool>>(false);
-        g_app.fs->upload(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel);
+        g_app.fs->upload(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel, resume);
         ++g_app.fsPendingUploads;
     }
     setStatus(L"正在上传 " + std::to_wstring(files.size()) + L" 个文件到 " + toWide(g_app.fsPath) +
               L" …");
     updateButtons();
+}
+
+std::wstring chooseTransferFolder(const wchar_t* title) {
+    BROWSEINFOW browse{};
+    browse.hwndOwner = g_app.main;
+    browse.lpszTitle = title;
+    browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+    PIDLIST_ABSOLUTE selected = SHBrowseForFolderW(&browse);
+    if (!selected) return {};
+    wchar_t path[MAX_PATH]{};
+    const bool ok = SHGetPathFromIDListW(selected, path) != FALSE;
+    CoTaskMemFree(selected);
+    return ok ? std::wstring(path) : std::wstring();
+}
+
+bool confirmTransferResume() {
+    return messageConfirm(L"断点续传", L"将按目标文件已有长度继续传输，同样大小的文件会跳过。\n"
+                          L"请确认已有文件来自同一个源文件；程序不会校验已有内容。\n"
+                          L"目标比源文件大时会停止，不会覆盖。", L"继续", L"取消");
+}
+
+void fsUploadDirectory(bool resume) {
+    if (!g_app.fsReady || (resume && !confirmTransferResume())) return;
+    const std::wstring folder = chooseTransferFolder(L"选择要上传的文件夹");
+    if (folder.empty()) return;
+    const std::string local = toUtf8(folder);
+    const std::string name = localBaseName(local);
+    if (name.empty()) { messageWarn(L"无法上传", L"请选择有名称的文件夹。 "); return; }
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    g_app.fs->uploadDirectory(local, remoteJoin(g_app.fsPath, name), cancel, resume);
+    ++g_app.fsPendingUploads;
+    setStatus(L"正在上传文件夹 " + toWide(name) + L" …");
+}
+
+void fsDownloadSelected(bool resume) {
+    const RemoteEntry* selected = selectedFileEntry();
+    if (!selected || !g_app.fsReady || (resume && !confirmTransferResume())) return;
+    const RemoteEntry entry = *selected;
+    if (!entry.isDir()) { fsOpenEntry(g_app.fsSel, resume); return; }
+    const std::wstring folder = chooseTransferFolder(L"选择保存文件夹的位置");
+    if (folder.empty()) return;
+    const fs::path target = fs::path(folder) / utf8ToPath(entry.name);
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    addDownloadTask(entry.path, toWide(entry.name), 0, false, cancel);
+    g_app.fs->downloadDirectory(entry.path, pathToUtf8(target), cancel, resume);
+    setStatus(L"正在下载文件夹 " + toWide(entry.name) + L" …");
 }
 
 void fsDeleteSelected() {
@@ -7183,6 +7240,9 @@ std::vector<popup::Item> buildFileContextMenu() {
     };
 
     add(IDM_FS_UPLOAD, L"上传文件…", L"", ready);
+    add(IDM_FS_UPLOAD_DIR, L"上传文件夹…", L"", ready);
+    add(IDM_FS_UPLOAD_RESUME, L"续传文件…", L"", ready);
+    add(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…", L"", ready);
     // 新建文件 / 新建文件夹收进二级菜单，右键菜单顶层保持精简
     popup::Item createGroup;
     createGroup.text = L"新建";
@@ -7198,7 +7258,8 @@ std::vector<popup::Item> buildFileContextMenu() {
     createGroup.children.push_back(std::move(newFolder));
     items.push_back(std::move(createGroup));
     sep();
-    add(IDM_FS_DOWNLOAD, L"下载到本地…", L"", editable);
+    add(IDM_FS_DOWNLOAD, L"下载到本地…", L"", ready && entry != nullptr);
+    add(IDM_FS_DOWNLOAD_RESUME, L"续传下载…", L"", ready && entry != nullptr);
     add(IDM_FS_EDIT, L"编辑", L"", editable);
     // 已经设置过编辑器时，额外给一个不走自定义编辑器的入口
     if (!g_app.editorPath.empty()) add(IDM_FS_EDIT_SYSTEM, L"用系统默认程序编辑", L"", editable);
@@ -7375,6 +7436,8 @@ ConnectionOptions makeRemoteOptions(const Session& session, const std::wstring& 
 
 void startRemoteFs(const Session& session, const std::wstring& password,
                    const std::wstring& keyPassphrase) {
+    // 先结束旧工作线程，避免它在替换回调时仍然访问回调对象。
+    g_app.fs->stop();
     g_app.fsReady = false;
     g_app.fsFailed = false;
     g_app.fsError.clear();
@@ -7544,6 +7607,7 @@ void handleFsEvent(const FsEvent& event) {
         return;
     }
     if (event.kind == FsEventKind::Cancelled) {
+        if (event.upload && g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
         if (event.upload) finishEditUpload(event.path, false);
         else finishEditDownload(event.path, false);
         if (App::DownloadTask* task = findDownloadTask(event.path, event.upload)) {
@@ -7559,9 +7623,21 @@ void handleFsEvent(const FsEvent& event) {
         case FsEventKind::Cancelled:
             break;
         case FsEventKind::Ready:
-            g_app.fsReady = true;
+            g_app.fsReady = event.message.empty();
             g_app.fsFailed = false;
             g_app.fsHome = event.path;  // 路径框里的 ~ 展开用
+            if (!event.message.empty() && g_app.fsRecoveryPending &&
+                ReconnectPolicy::retryableError(event.message) &&
+                ReconnectPolicy::shouldRetry(g_app.fsRecoveryAttempt)) {
+                const int delay = ReconnectPolicy::delayMs(g_app.fsRecoveryAttempt++);
+                SetTimer(g_app.main, reconnectTimerId(g_app), static_cast<UINT>(delay), nullptr);
+                g_app.reconnectTimerSet = true;
+                setStatus(L"文件通道连接失败，正在准备重试…");
+                break;
+            }
+            g_app.fsRecoveryPending = false;
+            g_app.fsRecoveryAttempt = 0;
+            if (g_app.aiTab && foregroundSession()) g_app.aiTab->refreshHost();
             if (!event.message.empty()) {
                 g_app.fsError = event.message;
                 if (foregroundSession()) messageWarn(L"文件面板不可用",
@@ -7578,6 +7654,17 @@ void handleFsEvent(const FsEvent& event) {
             g_app.fsReady = false;
             g_app.fsFailed = true;
             g_app.fsError = event.message;
+            if (g_app.fsRecoveryPending && ReconnectPolicy::retryableError(event.message) &&
+                ReconnectPolicy::shouldRetry(g_app.fsRecoveryAttempt)) {
+                const int delay = ReconnectPolicy::delayMs(g_app.fsRecoveryAttempt++);
+                SetTimer(g_app.main, reconnectTimerId(g_app), static_cast<UINT>(delay), nullptr);
+                g_app.reconnectTimerSet = true;
+                setStatus(L"文件通道连接失败，正在准备重试…");
+                break;
+            }
+            g_app.fsRecoveryPending = false;
+            g_app.fsRecoveryAttempt = 0;
+            if (g_app.aiTab && foregroundSession()) g_app.aiTab->refreshHost();
             setStatus(L"文件通道连接失败", true);
             break;
         case FsEventKind::Listing: {
@@ -7719,6 +7806,47 @@ int splitterAt(POINT pt) {
 
 // ---------------------------------------------------------------- 检查更新
 
+void beginUpdateDownload() {
+    if (g_app.updateDownloading) { setStatus(L"正在下载更新，请稍候…"); return; }
+    wchar_t executable[32768]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+    if (!length || length >= std::size(executable)) {
+        messageError(L"无法更新", L"无法确定当前程序的位置。");
+        return;
+    }
+    const std::wstring path(executable, length);
+    const ReleaseInfo release = g_app.updateRelease;
+    const HWND window = g_app.main;
+    g_app.updateDownloading = true;
+    setStatus(L"正在下载并校验 " + toWide(release.tag) + L" …");
+    std::thread([window, release, path]() {
+        auto* result = new UpdateDownload(downloadRelease(release, path));
+        if (g_applicationClosing.load() ||
+            !PostMessageW(window, WM_UPDATE_DOWNLOADED, 0, reinterpret_cast<LPARAM>(result))) {
+            if (!result->stagedPath.empty()) DeleteFileW(result->stagedPath.c_str());
+            delete result;
+        }
+    }).detach();
+}
+
+MessageSpec updatePromptSpec(const ReleaseInfo& info) {
+    MessageSpec spec;
+    spec.kind = 3;
+    spec.title = L"发现新版本 " + toWide(info.tag);
+    spec.text = L"当前版本 " + toWide(appVersion()) + L"，最新版本 " + toWide(info.tag) +
+                L"。是否下载更新并重启？\n\n更新将关闭当前连接和正在进行的传输。";
+    spec.buttons = {L"是", L"GitHub", L"否"};
+    spec.defaultIndex = 2;
+    return spec;
+}
+
+void promptForUpdate() {
+    if (!g_app.updateNewer) { openInBrowser(g_app.updateUrl); return; }
+    const int choice = showMessage(updatePromptSpec(g_app.updateRelease));
+    if (choice == 0) beginUpdateDownload();
+    else if (choice == 1) openInBrowser(g_app.updateUrl);
+}
+
 void startUpdateCheck(bool manual) {
     if (!g_app.main) return;
     g_app.updateCheckManual = manual;
@@ -7755,6 +7883,7 @@ void handleUpdateResult(const ReleaseInfo& info) {
                               ? std::string("https://github.com/CodeWithiYouth/rshell/releases")
                               : info.url;
         g_app.updateNewer = info.newer;
+        g_app.updateRelease = info;
         if (g_app.main) {
             layoutMain(g_app.main);
             InvalidateRect(g_app.main, nullptr, FALSE);
@@ -7767,15 +7896,7 @@ void handleUpdateResult(const ReleaseInfo& info) {
 
     setStatus(L"发现新版本 " + toWide(info.tag) + L"，点标签栏右上角可以查看");
     if (manual) {
-        const std::wstring title = L"发现新版本 " + toWide(info.tag);
-        std::wstring text = L"当前版本 " + current + L"，最新发布是 " + toWide(info.tag) + L"。";
-        if (!info.body.empty()) {
-            std::wstring notes = toWide(info.body);
-            if (notes.size() > 600) notes = notes.substr(0, 600) + L"…";
-            text += L"\n\n" + notes;
-        }
-        if (messageConfirm(title, text, L"打开发布页", L"以后再说"))
-            openInBrowser(g_app.updateUrl);
+        promptForUpdate();
     }
 }
 
@@ -8095,7 +8216,7 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_DROPFILES: {
-            // 拖入：把本地文件上传到当前远端目录（目录略过，RemoteFs 只传文件）
+            // 拖入文件或文件夹；文件夹传输遇到已有文件时停止，不覆盖。
             HDROP drop = reinterpret_cast<HDROP>(wp);
             const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
             std::vector<std::wstring> paths;
@@ -8115,10 +8236,12 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             for (const std::wstring& local : paths) {
                 const DWORD attrs = GetFileAttributesW(local.c_str());
                 if (attrs == INVALID_FILE_ATTRIBUTES) continue;
-                if (attrs & FILE_ATTRIBUTE_DIRECTORY) continue;
                 const std::string name = localBaseName(toUtf8(local));
                 auto cancel = std::make_shared<std::atomic<bool>>(false);
-                g_app.fs->upload(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel);
+                if (attrs & FILE_ATTRIBUTE_DIRECTORY)
+                    g_app.fs->uploadDirectory(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel, false);
+                else
+                    g_app.fs->upload(toUtf8(local), remoteJoin(g_app.fsPath, name), cancel);
                 ++g_app.fsPendingUploads;
                 ++sent;
             }
@@ -8126,8 +8249,7 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 setStatus(L"正在上传 " + std::to_wstring(sent) + L" 个文件到 " + toWide(g_app.fsPath) +
                           L" …");
             } else {
-                messageWarn(L"没有可上传的文件",
-                            L"拖进来的都是文件夹。请直接拖文件，或用右键菜单「上传文件…」。");
+                messageWarn(L"没有可上传的文件", L"无法访问拖入的文件或文件夹。");
             }
             updateButtons();
             return 0;
@@ -9641,6 +9763,7 @@ void setAiPanelFull(bool full) {
 void disposeSessionState(SessionState& state) {
     for (UINT_PTR timer = kCwdHookTimer1; timer <= kCwdHookTimer4; ++timer)
         KillTimer(g_app.main, state.tabId * 8 + timer);
+    KillTimer(g_app.main, reconnectTimerId(state));
     dropEditedFiles(state.connectionId);
     state.connectionId = g_nextConnectionId++;
     for (auto& task : state.downloads) if (task.cancel) task.cancel->store(true);
@@ -9837,7 +9960,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.hoverUpdateChip = updateHover;
                 // 悬停时在底栏说明一下，避免只看颜色不知道能点
                 if (updateHover && !g_app.updateTag.empty()) {
-                    setStatus(L"点击打开 " + toWide(g_app.updateTag) + L" 的 Release 页面");
+                    setStatus(g_app.updateNewer ? L"点击选择更新方式" :
+                              L"点击打开 " + toWide(g_app.updateTag) + L" 的 Release 页面");
                 }
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
@@ -9902,7 +10026,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             hideStatusHint();
             if (!IsRectEmpty(&g_app.updateChip) && PtInRect(&g_app.updateChip, pt)) {
                 guiLog("点击更新提示：" + g_app.updateUrl);
-                openInBrowser(g_app.updateUrl);
+                promptForUpdate();
                 return 0;
             }
             // 分栏分隔条：按下就开始拖
@@ -10069,7 +10193,25 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (wp == kReconnectTimer) {
                 if (g_app.main) KillTimer(hwnd,
                     static_cast<UINT_PTR>(g_app.tabId * 8) + kReconnectTimer);
-                runAutoReconnectAttempt();
+                if (g_app.fsRecoveryPending) {
+                    g_app.reconnectTimerSet = false;
+                    if (g_app.shell->running()) {
+                        if (const Session* session = g_app.store.find(g_app.currentSession)) {
+                            std::wstring password = g_app.currentPassword.reveal();
+                            std::wstring passphrase = g_app.currentKeyPassphrase.reveal();
+                            startRemoteFs(*session, password, passphrase);
+                            wipeWideString(password);
+                            wipeWideString(passphrase);
+                        } else {
+                            g_app.fsRecoveryPending = false;
+                            setStatus(L"文件通道重连失败：会话配置已删除", true);
+                        }
+                    } else {
+                        g_app.fsRecoveryPending = false;
+                    }
+                } else {
+                    runAutoReconnectAttempt();
+                }
             } else if (wp == kCwdHookTimer1) {
                 killCwdTimer(kCwdHookTimer1);
                 if (!g_app.shell->running()) return 0;
@@ -10230,6 +10372,15 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDM_FS_UPLOAD:
                     fsUploadFiles();
                     return 0;
+                case IDM_FS_UPLOAD_DIR:
+                    fsUploadDirectory(false);
+                    return 0;
+                case IDM_FS_UPLOAD_RESUME:
+                    if (confirmTransferResume()) fsUploadFiles(true);
+                    return 0;
+                case IDM_FS_UPLOAD_DIR_RESUME:
+                    fsUploadDirectory(true);
+                    return 0;
                 case IDM_FS_MKDIR:
                     fsMkdirDialog();
                     return 0;
@@ -10237,7 +10388,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     fsNewFileDialog();
                     return 0;
                 case IDM_FS_DOWNLOAD:
-                    fsOpenEntry(g_app.fsSel);
+                    fsDownloadSelected(false);
+                    return 0;
+                case IDM_FS_DOWNLOAD_RESUME:
+                    fsDownloadSelected(true);
                     return 0;
                 case IDM_FS_EDIT:
                     fsEditSelected(false);
@@ -10353,6 +10507,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.reconnectPending = false;
                 g_app.reconnectAttempt = 0;
                 g_app.reconnectSession.clear();
+                g_app.fsRecoveryPending = true;
+                g_app.fsRecoveryAttempt = 0;
                 if (g_app.reconnectTimerSet && g_app.main) {
                     KillTimer(g_app.main, static_cast<UINT_PTR>(g_app.tabId * 8) + kReconnectTimer);
                     g_app.reconnectTimerSet = false;
@@ -10497,6 +10653,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SHELL_CLOSED: {
             std::unique_ptr<std::string> reason(reinterpret_cast<std::string*>(lp));
             if (wp != g_app.connectionId) return 0;
+            if (g_app.fsRecoveryPending) {
+                if (g_app.reconnectTimerSet) KillTimer(hwnd, reconnectTimerId(g_app));
+                g_app.reconnectTimerSet = false;
+                g_app.fsRecoveryPending = false;
+                g_app.fsRecoveryAttempt = 0;
+            }
             // 会话结束：注入钩子的定时器可能还在排队，先撤掉
             stopCwdHook();
             g_app.connecting = false;
@@ -10574,7 +10736,34 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_applicationClosing.load()) return 0;
             if (info) handleUpdateResult(*info);
             return 0;
-        }        case WM_ASK_HOSTKEY: {
+        }
+        case WM_UPDATE_DOWNLOADED: {
+            std::unique_ptr<UpdateDownload> result(reinterpret_cast<UpdateDownload*>(lp));
+            g_app.updateDownloading = false;
+            if (!result) return 0;
+            if (g_applicationClosing.load()) {
+                if (!result->stagedPath.empty()) DeleteFileW(result->stagedPath.c_str());
+                return 0;
+            }
+            if (!result->ok) {
+                setStatus(L"更新下载失败", true);
+                messageError(L"更新失败", L"无法下载或验证更新，当前程序没有改变。", toWide(result->error));
+                return 0;
+            }
+            wchar_t executable[32768]{};
+            const DWORD length = GetModuleFileNameW(nullptr, executable, static_cast<DWORD>(std::size(executable)));
+            std::string error;
+            if (!length || length >= std::size(executable) ||
+                !launchUpdateHelper(std::wstring(executable, length), result->stagedPath, error)) {
+                DeleteFileW(result->stagedPath.c_str());
+                setStatus(L"更新启动失败", true);
+                messageError(L"更新失败", L"无法启动更新助手，当前程序没有改变。", toWide(error));
+                return 0;
+            }
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        case WM_ASK_HOSTKEY: {
             auto* request = reinterpret_cast<HostKeyRequest*>(lp);
             if (request && !g_applicationClosing.load() &&
                 (!request->connectionId || findSessionState(request->connectionId, true))) {
@@ -10953,6 +11142,16 @@ int runGui(HINSTANCE inst, int showCommand) {
 }  // namespace
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int showCommand) {
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    if (argv) {
+        if (argc >= 2 && std::wstring(argv[1]) == L"--rshell-update-apply") {
+            const int result = runUpdateHelper(argc, argv);
+            LocalFree(argv);
+            return result;
+        }
+        LocalFree(argv);
+    }
     return runGui(inst, showCommand);
 }
 

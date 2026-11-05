@@ -16,6 +16,15 @@ struct ReleaseInfo {
     std::string body;         // 更新说明（可能为空，截断到 4 KB）
     std::string error;        // 失败原因（网络错误、非 200 等）
     bool newer = false;       // tag 比当前版本新
+    std::string downloadUrl;  // 官方桌面版附件地址
+    std::string sha256;       // 官方 Release 提供的 SHA-256
+    unsigned long long assetSize = 0;
+};
+
+struct UpdateDownload {
+    bool ok = false;
+    std::wstring stagedPath;
+    std::string error;
 };
 
 // 当前编译进去的版本号（CMake 的 PROJECT_VERSION）
@@ -25,6 +34,11 @@ const char* appVersion();
 
 // 同步请求，调用方放在工作线程里跑；timeoutMs 建议 5~10 秒
 ReleaseInfo fetchLatestRelease(const std::string& currentVersion, int timeoutMs = 8000);
+ReleaseInfo parseReleaseInfo(const std::string& json, const std::string& currentVersion);
+UpdateDownload downloadRelease(const ReleaseInfo& release, const std::wstring& executablePath);
+bool launchUpdateHelper(const std::wstring& executablePath, const std::wstring& stagedPath,
+                        std::string& error);
+int runUpdateHelper(int argc, wchar_t** argv);
 
 // 用默认浏览器打开链接
 void openInBrowser(const std::string& url);

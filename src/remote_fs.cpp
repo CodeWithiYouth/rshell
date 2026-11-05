@@ -263,8 +263,8 @@ void RemoteFs::rename(const std::string& from, const std::string& to) {
 }
 
 void RemoteFs::download(const std::string& remotePath, const std::string& localPath,
-                        std::shared_ptr<std::atomic<bool>> cancel) {
-    post([this, remotePath, localPath, cancel]() {
+                        std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
+    post([this, remotePath, localPath, cancel, resume]() {
         FsEvent event;
         event.kind = FsEventKind::Done;
         event.path = remotePath;
@@ -273,6 +273,7 @@ void RemoteFs::download(const std::string& remotePath, const std::string& localP
             if (!sftp_) throw Error("SFTP 尚未就绪");
             TransferOptions options;
             options.showProgress = false;
+            options.resume = resume;
             // 每 ~100ms 把已传输字节数抛回 UI 线程，供进度条使用
             options.onProgress = [this, remotePath](std::uint64_t done, std::uint64_t total) {
                 FsEvent progress;
@@ -289,12 +290,8 @@ void RemoteFs::download(const std::string& remotePath, const std::string& localP
             event.message =
                 "已下载 " + remoteBaseName(remotePath) + "（" + formatBytes(result.bytes) + "）";
         } catch (const std::exception& ex) {
-            // 用户取消时删掉半截文件，避免留下一个看着像成功的残片
+            // 保留半截文件，用户可以显式选择续传。
             cancelled = cancel && cancel->load();
-            if (cancelled) {
-                std::error_code ec;
-                fs::remove(utf8ToPath(localPath), ec);
-            }
             event.kind = cancelled ? FsEventKind::Cancelled : FsEventKind::Error;
             event.message = cancelled ? ("已取消下载 " + remoteBaseName(remotePath))
                                       : std::string("下载失败：") + ex.what();
@@ -422,8 +419,8 @@ std::shared_ptr<RemoteFs::Reader> RemoteFs::openReader(const std::string& remote
 }
 
 void RemoteFs::upload(const std::string& localPath, const std::string& remotePath,
-                      std::shared_ptr<std::atomic<bool>> cancel) {
-    post([this, localPath, remotePath, cancel]() {
+                      std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
+    post([this, localPath, remotePath, cancel, resume]() {
         // 先报一次 Started，UI 才有东西可显示（总字节取本地文件大小，
         // 取不到就留 0，进度条退化成「上传中…」而不是一直空着）
         FsEvent started;
@@ -444,17 +441,11 @@ void RemoteFs::upload(const std::string& localPath, const std::string& remotePat
         event.path = remotePath;
         event.upload = true;
         bool cancelled = false;
-        // 取消时只在「目标原本不存在」的情况删掉半截文件：
-        // 覆盖已有文件后再删会把用户原来的远端文件一起弄丢。
-        std::string targetPath;
-        bool targetExisted = false;
         try {
             if (!sftp_) throw Error("SFTP 尚未就绪");
-            targetPath = sftp_->resolveRemoteTarget(remotePath, localPath);
-            SftpEntry before;
-            targetExisted = sftp_->stat(targetPath, before);
             TransferOptions options;
             options.showProgress = false;
+            options.resume = resume;
             // 和下载一样按 ~100ms 把已传字节抛回 UI 线程
             options.onProgress = [this, remotePath](std::uint64_t done, std::uint64_t total) {
                 FsEvent progress;
@@ -470,17 +461,111 @@ void RemoteFs::upload(const std::string& localPath, const std::string& remotePat
             event.message =
                 "已上传 " + localBaseName(localPath) + "（" + formatBytes(result.bytes) + "）";
         } catch (const std::exception& ex) {
-            // 和下载对称：取消后把远端半截文件删掉，不然远端会留一个像样的残片
+            // 保留半截文件供显式续传。
             cancelled = cancel && cancel->load();
-            if (cancelled && sftp_ && !targetExisted && !targetPath.empty()) {
-                try {
-                    sftp_->removeFile(targetPath);
-                } catch (...) {
-                }
-            }
             event.kind = cancelled ? FsEventKind::Cancelled : FsEventKind::Error;
             event.message = cancelled ? ("已取消上传 " + localBaseName(localPath))
                                       : std::string("上传失败：") + ex.what();
+        }
+        if (callbacks_.onEvent) callbacks_.onEvent(event);
+    });
+}
+
+namespace {
+void checkTreeCancelled(const std::shared_ptr<std::atomic<bool>>& cancel) {
+    if (cancel && cancel->load()) throw Error("传输已取消");
+}
+
+void uploadDirectoryTree(SftpClient& sftp, const fs::path& local, const std::string& remote,
+                         const TransferOptions& options,
+                         const std::shared_ptr<std::atomic<bool>>& cancel) {
+    checkTreeCancelled(cancel);
+    SftpEntry existing;
+    if (sftp.stat(remote, existing)) {
+        if (!existing.isDir() || existing.isSymlink()) throw Error("远端目标不是普通目录：" + remote);
+    } else {
+        sftp.mkdir(remote, 0755, false);
+    }
+    std::error_code ec;
+    fs::directory_iterator it(local, ec), end;
+    if (ec) throw Error("无法读取本地目录：" + ec.message());
+    for (; it != end; it.increment(ec)) {
+        if (ec) throw Error("读取本地目录失败：" + ec.message());
+        checkTreeCancelled(cancel);
+        const auto status = it->symlink_status(ec);
+        if (ec) throw Error("读取本地文件属性失败：" + ec.message());
+        if (fs::is_symlink(status)) continue;
+        const std::string child = remoteJoin(remote, pathToUtf8(it->path().filename()));
+        if (fs::is_directory(status)) uploadDirectoryTree(sftp, it->path(), child, options, cancel);
+        else if (fs::is_regular_file(status)) {
+            SftpEntry target;
+            if (sftp.stat(child, target) && !target.isFile())
+                throw Error("远端目标不是普通文件：" + child);
+            sftp.upload(pathToUtf8(it->path()), child, options);
+        }
+    }
+    if (ec) throw Error("读取本地目录失败：" + ec.message());
+}
+
+void downloadDirectoryTree(SftpClient& sftp, const std::string& remote, const fs::path& local,
+                           const TransferOptions& options,
+                           const std::shared_ptr<std::atomic<bool>>& cancel) {
+    checkTreeCancelled(cancel);
+    std::error_code ec;
+    if (fs::is_symlink(fs::symlink_status(local, ec))) throw Error("本地目录不能是符号链接");
+    ec.clear();
+    fs::create_directories(local, ec);
+    if (ec) throw Error("无法创建本地目录：" + ec.message());
+    for (const SftpEntry& entry : sftp.listDir(remote)) {
+        checkTreeCancelled(cancel);
+        if (entry.name.empty() || entry.name == "." || entry.name == ".." ||
+            entry.name.find_first_of("/\\:") != std::string::npos)
+            throw Error("远端目录包含无效文件名");
+        const fs::path child = local / utf8ToPath(entry.name);
+        if (fs::is_symlink(fs::symlink_status(child, ec))) throw Error("本地目标不能是符号链接");
+        ec.clear();
+        if (entry.isSymlink()) continue;
+        if (entry.isDir()) downloadDirectoryTree(sftp, entry.path, child, options, cancel);
+        else if (entry.isFile()) sftp.download(entry.path, pathToUtf8(child), options);
+    }
+}
+}  // namespace
+
+void RemoteFs::uploadDirectory(const std::string& localPath, const std::string& remotePath,
+                               std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
+    post([this, localPath, remotePath, cancel, resume]() {
+        FsEvent event; event.kind = FsEventKind::Started; event.path = remotePath;
+        event.upload = true; event.message = localBaseName(localPath); event.cancel = cancel;
+        if (callbacks_.onEvent) callbacks_.onEvent(event);
+        try {
+            if (!sftp_) throw Error("SFTP 尚未就绪");
+            TransferOptions options; options.showProgress = false; options.overwrite = false;
+            options.resume = resume;
+            options.cancelled = [cancel]() { return cancel && cancel->load(); };
+            uploadDirectoryTree(*sftp_, utf8ToPath(localPath), remotePath, options, cancel);
+            event.kind = FsEventKind::Done; event.message = "文件夹上传完成：" + localBaseName(localPath);
+        } catch (const std::exception& ex) {
+            event.kind = cancel && cancel->load() ? FsEventKind::Cancelled : FsEventKind::Error;
+            event.message = std::string("文件夹上传未完成：") + ex.what();
+        }
+        if (callbacks_.onEvent) callbacks_.onEvent(event);
+    });
+}
+
+void RemoteFs::downloadDirectory(const std::string& remotePath, const std::string& localPath,
+                                 std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
+    post([this, remotePath, localPath, cancel, resume]() {
+        FsEvent event; event.kind = FsEventKind::Done; event.path = remotePath;
+        try {
+            if (!sftp_) throw Error("SFTP 尚未就绪");
+            TransferOptions options; options.showProgress = false; options.overwrite = false;
+            options.resume = resume;
+            options.cancelled = [cancel]() { return cancel && cancel->load(); };
+            downloadDirectoryTree(*sftp_, remotePath, utf8ToPath(localPath), options, cancel);
+            event.message = "文件夹下载完成：" + remoteBaseName(remotePath);
+        } catch (const std::exception& ex) {
+            event.kind = cancel && cancel->load() ? FsEventKind::Cancelled : FsEventKind::Error;
+            event.message = std::string("文件夹下载未完成：") + ex.what();
         }
         if (callbacks_.onEvent) callbacks_.onEvent(event);
     });

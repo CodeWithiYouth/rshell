@@ -71,7 +71,7 @@ struct AgentTurn {
 };
 
 struct AgentConfig {
-    int maxSteps = 16;
+    int maxSteps = 16;  // 0 表示不限制，仍可由用户取消
     // 历史超过该字节数时丢弃最早的完整轮次（system 与最近一轮始终保留）
     std::size_t historyBytes = 512u * 1024u;
     bool trimHistory = true;

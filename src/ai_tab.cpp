@@ -66,7 +66,8 @@ constexpr int kAutoTop = kFieldTop + kFieldGap * 3 + kEditOffset + kEditHeight +
 constexpr int kAutoH = 26;
 // 「把对话存到远端」勾选框紧跟在自动审批下面
 constexpr int kSaveSessionTop = kAutoTop + kAutoH + 8;
-constexpr int kButtonTop = kSaveSessionTop + kAutoH + 14;
+constexpr int kStepTop = kSaveSessionTop + kAutoH + 8;
+constexpr int kButtonTop = kStepTop + kAutoH + 14;
 constexpr int kButtonHeight = 34;
 
 // RSHELL_AI_PERF=1 时把流式节奏写进 ~/.rshell/ai-perf.log：
@@ -413,6 +414,9 @@ struct AiTab::Impl {
     bool draftAutoApprove = false;
     RECT saveSessionRect{};   // 「把对话存到远端」勾选框
     bool draftSaveSessions = true;
+    RECT stepRect{};
+    bool draftLimitSteps = true;
+    HWND editMaxSteps = nullptr;
     // 联网搜索：后端 id（空 = 关闭）+ 当前后端的 Key（保险库）
     std::string searchProvider;
     std::string searchKey;
@@ -822,6 +826,9 @@ void AiTab::sendMessage(const std::wstring& text) {
     });
 
     impl_->client.setConfig(makeApiConfig(impl_->settings, impl_->apiKey, impl_->sessionId));
+    AgentConfig agentConfig;
+    agentConfig.maxSteps = impl_->settings.limitSteps ? impl_->settings.maxSteps : 0;
+    impl_->agent.setConfig(agentConfig);
     impl_->busy = true;
     impl_->cancel = false;
     impl_->assistantIndex = static_cast<std::size_t>(-1);
@@ -1385,6 +1392,9 @@ void AiTab::startSettings(bool unlockOnly) {
     impl_->draftSearchProvider = impl_->settings.searchProvider;
     impl_->draftAutoApprove = impl_->settings.autoApprove;
     impl_->draftSaveSessions = impl_->settings.saveSessions;
+    impl_->draftLimitSteps = impl_->settings.limitSteps;
+    SetWindowTextW(impl_->editMaxSteps, std::to_wstring(impl_->settings.maxSteps).c_str());
+    EnableWindow(impl_->editMaxSteps, impl_->draftLimitSteps);
     impl_->fetchStatus.clear();
     SetWindowTextW(impl_->editBase, toWideText(impl_->settings.baseUrl).c_str());
     SetWindowTextW(impl_->editKey, L"");
@@ -1392,7 +1402,8 @@ void AiTab::startSettings(bool unlockOnly) {
     SetWindowTextW(impl_->editSearchKey, L"");  // 已存的 Key 不回显，留空表示不改
 
     layoutSettings();
-    HWND controls[] = {impl_->editBase, impl_->editKey, impl_->modelCombo, impl_->editSearchKey};
+    HWND controls[] = {impl_->editBase, impl_->editKey, impl_->modelCombo, impl_->editSearchKey,
+                       impl_->editMaxSteps};
     for (HWND control : controls)
         if (control) ShowWindow(control, SW_SHOW);
     SetFocus(impl_->editBase);
@@ -1411,6 +1422,10 @@ void AiTab::createSettingsControls() {
     if (!impl_->editBase) impl_->editBase = makeEdit(0);
     if (!impl_->editKey) impl_->editKey = makeEdit(ES_PASSWORD);
     if (!impl_->editSearchKey) impl_->editSearchKey = makeEdit(ES_PASSWORD);
+    if (!impl_->editMaxSteps) {
+        impl_->editMaxSteps = makeEdit(ES_NUMBER);
+        SendMessageW(impl_->editMaxSteps, EM_SETLIMITTEXT, 5, 0);
+    }
     if (!impl_->modelCombo) {
         impl_->modelCombo = CreateWindowExW(0, L"COMBOBOX", L"",
                                             WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWN |
@@ -1474,6 +1489,8 @@ void AiTab::layoutSettings() {
 
     impl_->autoRect = RECT{left, kAutoTop, left + width, kAutoTop + kAutoH};
     impl_->saveSessionRect = RECT{left, kSaveSessionTop, left + width, kSaveSessionTop + kAutoH};
+    impl_->stepRect = RECT{left, kStepTop, left + width - 76, kStepTop + kAutoH};
+    MoveWindow(impl_->editMaxSteps, left + width - 70, kStepTop, 70, kAutoH, TRUE);
     impl_->saveRect = RECT{left, kButtonTop, left + 96, kButtonTop + kButtonHeight};
     impl_->cancelRect = RECT{left + 108, kButtonTop, left + 108 + 96,
                              kButtonTop + kButtonHeight};
@@ -1541,6 +1558,18 @@ void AiTab::finishSettings(bool save) {
         settings.model = trim(readText(impl_->modelCombo));
         settings.autoApprove = impl_->draftAutoApprove;
         settings.saveSessions = impl_->draftSaveSessions;
+        settings.limitSteps = impl_->draftLimitSteps;
+        if (settings.limitSteps) {
+            const std::string value = trim(readText(impl_->editMaxSteps));
+            const int steps = value.empty() ? 0 : std::atoi(value.c_str());
+            if (steps < 1 || steps > 10000 ||
+                !std::all_of(value.begin(), value.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+                impl_->fetchStatus = "最大步数请输入 1 到 10000";
+                InvalidateRect(window_, nullptr, FALSE);
+                return;
+            }
+            settings.maxSteps = steps;
+        }
         settings.searchProvider = impl_->draftSearchProvider;  // chip 上选的后端
         if (settings.baseUrl.empty() || settings.model.empty()) {
             panel_.addNotice(L"API 地址和模型都不能为空", true);
@@ -1611,6 +1640,7 @@ void AiTab::finishSettings(bool save) {
     ShowWindow(impl_->editKey, SW_HIDE);
     ShowWindow(impl_->modelCombo, SW_HIDE);
     ShowWindow(impl_->editSearchKey, SW_HIDE);
+    ShowWindow(impl_->editMaxSteps, SW_HIDE);
     SetFocus(window_);
     panel_.focusInput();
     InvalidateRect(window_, nullptr, TRUE);
@@ -1877,6 +1907,12 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(window_, nullptr, FALSE);
                     return 0;
                 }
+                if (PtInRect(&impl_->stepRect, pt)) {
+                    impl_->draftLimitSteps = !impl_->draftLimitSteps;
+                    EnableWindow(impl_->editMaxSteps, impl_->draftLimitSteps);
+                    InvalidateRect(window_, nullptr, FALSE);
+                    return 0;
+                }
                 for (std::size_t i = 0; i < impl_->searchProviderRects.size(); ++i) {
                     if (!PtInRect(&impl_->searchProviderRects[i], pt)) continue;
                     static const char* ids[] = {"", "tinyfish", "exa"};
@@ -2061,6 +2097,7 @@ void AiTab::paint(HDC dc, const RECT* dirty) {
     // 会话历史：关掉后每轮不再写远端，历史按钮仍然能翻旧对话
     checkbox(impl_->saveSessionRect, impl_->draftSaveSessions,
              L"把对话存到远端 ~/.rshell/sessions（历史会话）");
+    checkbox(impl_->stepRect, impl_->draftLimitSteps, L"限制单次任务最大步数");
     button(impl_->saveRect, L"保存", ui::action, 0xFFFFFF);
     button(impl_->cancelRect, L"取消", ui::bgCard, ui::textDim);
 

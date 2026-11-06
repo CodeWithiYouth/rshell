@@ -7225,7 +7225,7 @@ void beginDragOut(HWND hwnd) {
 }
 
 
-// 文件面板右键菜单：上传 ▸ / 新建 ▸ / 下载 / 编辑 / 删除 / 复制路径 / 刷新 / 断开
+// 文件面板右键菜单：上传 ▸ / 续传 ▸ / 新建 ▸ / 下载 / 编辑 / 删除 / 复制路径 / 刷新 / 断开
 std::vector<popup::Item> buildFileContextMenu() {
     const RemoteEntry* entry = selectedFileEntry();
     const bool ready = g_app.fsReady;
@@ -7249,7 +7249,7 @@ std::vector<popup::Item> buildFileContextMenu() {
         items.push_back(std::move(item));
     };
 
-    // 上传和续传上传共用一个二级菜单，顶层保持精简
+    // 上传和续传分开成两个二级菜单：上传只放正常传输，续传放按已有长度继续的入口
     popup::Item uploadGroup;
     uploadGroup.text = L"上传";
     auto addUpload = [&uploadGroup, ready](int id, const wchar_t* text) {
@@ -7261,9 +7261,21 @@ std::vector<popup::Item> buildFileContextMenu() {
     };
     addUpload(IDM_FS_UPLOAD, L"上传文件…");
     addUpload(IDM_FS_UPLOAD_DIR, L"上传文件夹…");
-    addUpload(IDM_FS_UPLOAD_RESUME, L"续传文件…");
-    addUpload(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…");
     items.push_back(std::move(uploadGroup));
+
+    popup::Item resumeGroup;
+    resumeGroup.text = L"续传";
+    auto addResume = [&resumeGroup](int id, const wchar_t* text, bool enabled) {
+        popup::Item item;
+        item.id = id;
+        item.text = text;
+        item.enabled = enabled;
+        resumeGroup.children.push_back(std::move(item));
+    };
+    addResume(IDM_FS_UPLOAD_RESUME, L"续传文件…", ready);
+    addResume(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…", ready);
+    addResume(IDM_FS_DOWNLOAD_RESUME, L"续传下载…", ready && entry != nullptr);
+    items.push_back(std::move(resumeGroup));
     // 新建文件 / 新建文件夹收进二级菜单，右键菜单顶层保持精简
     popup::Item createGroup;
     createGroup.text = L"新建";
@@ -7280,7 +7292,6 @@ std::vector<popup::Item> buildFileContextMenu() {
     items.push_back(std::move(createGroup));
     sep();
     add(IDM_FS_DOWNLOAD, L"下载到本地…", L"", ready && entry != nullptr);
-    add(IDM_FS_DOWNLOAD_RESUME, L"续传下载…", L"", ready && entry != nullptr);
     add(IDM_FS_EDIT, L"编辑", L"", editable);
     // 已经设置过编辑器时，额外给一个不走自定义编辑器的入口
     if (!g_app.editorPath.empty()) add(IDM_FS_EDIT_SYSTEM, L"用系统默认程序编辑", L"", editable);

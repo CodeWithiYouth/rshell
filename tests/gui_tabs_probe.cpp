@@ -1087,25 +1087,33 @@ void fileEditRegression() {
     check(findItem(items, IDM_FS_EDIT_SYSTEM) == nullptr,
           "the system-default entry only appears after an editor is configured");
 
-    // 上传和续传上传共用一个二级菜单，顶层不再各占一行
+    // 上传和续传分成两个二级菜单，顶层不再各占一行
     const popup::Item* uploadGroup = nullptr;
+    const popup::Item* resumeGroup = nullptr;
     for (const auto& item : items) {
         if (item.text == L"上传" && !item.children.empty()) uploadGroup = &item;
+        if (item.text == L"续传" && !item.children.empty()) resumeGroup = &item;
         check(item.id != IDM_FS_UPLOAD && item.id != IDM_FS_UPLOAD_DIR &&
-                  item.id != IDM_FS_UPLOAD_RESUME && item.id != IDM_FS_UPLOAD_DIR_RESUME,
-              "upload and resume commands only live in the upload submenu");
+                  item.id != IDM_FS_UPLOAD_RESUME && item.id != IDM_FS_UPLOAD_DIR_RESUME &&
+                  item.id != IDM_FS_DOWNLOAD_RESUME,
+              "upload and resume commands only live in their submenus");
     }
-    check(uploadGroup != nullptr, "the upload submenu exists");
-    check(uploadGroup->children.size() == 4, "the upload submenu has both upload and resume commands");
-    const int uploadIds[4] = {IDM_FS_UPLOAD, IDM_FS_UPLOAD_DIR, IDM_FS_UPLOAD_RESUME,
-                              IDM_FS_UPLOAD_DIR_RESUME};
-    const wchar_t* uploadTexts[4] = {L"上传文件…", L"上传文件夹…", L"续传文件…",
-                                     L"续传文件夹上传…"};
-    for (int i = 0; i < 4; ++i) {
-        check(uploadGroup->children[i].id == uploadIds[i] &&
-                  uploadGroup->children[i].text == uploadTexts[i] &&
-                  uploadGroup->children[i].enabled,
-              "upload submenu keeps upload and resume in order");
+    check(uploadGroup != nullptr && resumeGroup != nullptr, "upload and resume submenus exist");
+    check(uploadGroup->children.size() == 2, "the upload submenu only holds normal uploads");
+    check(uploadGroup->children[0].id == IDM_FS_UPLOAD &&
+              uploadGroup->children[0].text == L"上传文件…" && uploadGroup->children[0].enabled,
+          "upload file is the first upload command");
+    check(uploadGroup->children[1].id == IDM_FS_UPLOAD_DIR &&
+              uploadGroup->children[1].text == L"上传文件夹…" && uploadGroup->children[1].enabled,
+          "upload folder follows upload file");
+    check(resumeGroup->children.size() == 3, "the resume submenu holds upload, folder and download");
+    const int resumeIds[3] = {IDM_FS_UPLOAD_RESUME, IDM_FS_UPLOAD_DIR_RESUME, IDM_FS_DOWNLOAD_RESUME};
+    const wchar_t* resumeTexts[3] = {L"续传文件…", L"续传文件夹上传…", L"续传下载…"};
+    for (int i = 0; i < 3; ++i) {
+        check(resumeGroup->children[i].id == resumeIds[i] &&
+                  resumeGroup->children[i].text == resumeTexts[i] &&
+                  resumeGroup->children[i].enabled,
+              "resume submenu keeps upload and download in order");
     }
 
     // 新建文件 / 新建文件夹共用一个二级菜单，顶层不再各占一行
@@ -1136,6 +1144,9 @@ void fileEditRegression() {
     const popup::Item* disabledUploadResume = findItem(items, IDM_FS_UPLOAD_RESUME);
     check(disabledUploadResume != nullptr && !disabledUploadResume->enabled,
           "resume upload waits for the SFTP channel");
+    const popup::Item* disabledDownloadResume = findItem(items, IDM_FS_DOWNLOAD_RESUME);
+    check(disabledDownloadResume != nullptr && !disabledDownloadResume->enabled,
+          "resume download waits for the SFTP channel");
     g_app.fsReady = true;
     items = buildFileContextMenu();
 

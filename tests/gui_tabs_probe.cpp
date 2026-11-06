@@ -2037,6 +2037,60 @@ void titleAiButtonRegression() {
     check(!hitAiButton(POINT{g_app.titleButtons[0].left + dp(4), center.y}),
           "AI hit test does not swallow the menu button");
 }
+
+void windowPlacementRegression() {
+    // 解析层：位置是物理像素，尺寸是 96dpi 逻辑像素，格式不对必须拒绝
+    SavedWindowPlacement parsed;
+    check(parseWindowGeometry("10,20,800,600", parsed), "parse window geometry from ui.ini");
+    check(parsed.valid && parsed.pos.x == 10 && parsed.pos.y == 20 && parsed.size.cx == 800 &&
+              parsed.size.cy == 600, "window geometry fields are read correctly");
+    check(!parseWindowGeometry("1,2,3", parsed), "incomplete window geometry is rejected");
+    check(!parseWindowGeometry("1,2,0,600", parsed), "empty window size is rejected");
+    check(!parseWindowGeometry("1,2,800x600,3", parsed), "malformed window geometry is rejected");
+
+    // 保存的位置已经不在任何屏幕内时，不能把窗口丢到看不见的地方
+    SavedWindowPlacement offscreen;
+    check(parseWindowGeometry("-200000,-200000,800,600", offscreen),
+          "parse off-screen window geometry");
+    RECT rect{};
+    check(!resolveWindowPlacement(offscreen, rect),
+          "off-screen placement falls back to the default geometry");
+
+    // 保存/读取往返：直接动真实窗口，放在最后一项，避免影响其它布局断言
+    const auto path = std::filesystem::temp_directory_path() /
+        ("rshell-ui-" + std::to_string(GetCurrentProcessId()) + "-" +
+         std::to_string(GetTickCount64()) + ".ini");
+    SetEnvironmentVariableW(L"RSHELL_UI_CONFIG", path.c_str());
+    _putenv_s("RSHELL_NO_UI_SAVE", "");  // 只让这一项测试真正写临时布局文件
+    RECT before{};
+    GetWindowRect(g_app.main, &before);
+    const int beforeDpi = g_app.dpi;
+    g_app.dpi = 96;  // 让保存的尺寸按 96dpi 折算，断言不受 CI 缩放比例影响
+    MoveWindow(g_app.main, 40, 30, 800, 520, FALSE);
+    g_app.windowPlacement = SavedWindowPlacement{};
+    saveUiLayout();
+    g_app.windowPlacement = SavedWindowPlacement{};
+    loadWindowPlacement();
+    check(g_app.windowPlacement.valid, "closing saves the window geometry");
+    check(g_app.windowPlacement.pos.x == 40 && g_app.windowPlacement.pos.y == 30,
+          "saved window position matches the live window");
+    check(std::abs(static_cast<int>(g_app.windowPlacement.size.cx) - 800) <= 1 &&
+              std::abs(static_cast<int>(g_app.windowPlacement.size.cy) - 520) <= 1,
+          "saved window size matches the live window");
+
+    RECT restored{};
+    check(resolveWindowPlacement(g_app.windowPlacement, restored),
+          "saved placement resolves on screen");
+    check(restored.right > restored.left && restored.bottom > restored.top,
+          "restored window geometry has a positive size");
+    g_app.dpi = beforeDpi;
+
+    MoveWindow(g_app.main, before.left, before.top, before.right - before.left,
+               before.bottom - before.top, FALSE);
+    _putenv_s("RSHELL_NO_UI_SAVE", "1");
+    std::error_code error;
+    std::filesystem::remove(path, error);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -2091,6 +2145,7 @@ int main(int argc, char** argv) {
         updateCheckRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();
+        windowPlacementRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);
         DestroyWindow(window); window = nullptr;
         stopGdiplus(); g_app.runtime.reset();

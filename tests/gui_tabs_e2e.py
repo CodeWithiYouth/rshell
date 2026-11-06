@@ -30,9 +30,12 @@ def main():
         (remote / "alpha-dir" / "alpha.txt").write_bytes(b"alpha-download-content\n")
         (remote / "partial-upload.bin").write_bytes(b"resume-")
         (remote / "oversized-upload.bin").write_bytes(b"this-is-longer-than-the-source-file")
+        (remote / "retry-upload.bin").write_bytes(b"prefix-data")
+        (remote / "cancel-preserve.bin").write_bytes(b"original-must-survive")
         (remote / "resume-download.bin").write_bytes(b"resume-download-complete")
         (directory / "partial-download.bin").write_bytes(b"resume-")
         (directory / "resume-upload.bin").write_bytes(b"resume-upload-complete")
+        (directory / "retry-upload.bin").write_bytes(b"prefix")
         (directory / "folder-source" / "nested").mkdir(parents=True)
         (directory / "folder-source" / "empty").mkdir()
         (directory / "folder-source" / "nested" / "sample.txt").write_bytes(b"nested-content")
@@ -74,8 +77,12 @@ def main():
             assert download.read_bytes() == b"alpha-download-content\n"
             assert (remote / "partial-upload.bin").read_bytes() == b"resume-upload-complete"
             assert (remote / "oversized-upload.bin").read_bytes() == b"this-is-longer-than-the-source-file"
+            assert (remote / "retry-upload.bin").read_bytes() == b"prefix-data-finished"
+            assert (remote / "retry-after-reconnect.bin").read_bytes() == b"prefix-data-finished"
+            assert (remote / "cancel-preserve.bin").read_bytes() == b"original-must-survive"
             assert (directory / "partial-download.bin").read_bytes() == b"resume-download-complete"
             assert (remote / "folder-copy" / "nested" / "sample.txt").read_bytes() == b"nested-content"
+            assert (remote / "folder-copy" / "new.txt").read_bytes() == b"new-after-conflict"
             assert (directory / "folder-download" / "nested" / "sample.txt").read_bytes() == b"nested-content"
             assert (remote / "folder-copy" / "empty").is_dir()
             assert (directory / "folder-download" / "empty").is_dir()

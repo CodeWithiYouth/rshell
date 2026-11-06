@@ -58,7 +58,21 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Transfer-Encoding", "chunked")
         self.end_headers()
 
-        if getattr(self.server, "mode", "text") == "reasoning":
+        mode = getattr(self.server, "mode", "text")
+        if mode in ("limit", "approval"):
+            name = "name_session" if mode == "limit" else "run_command"
+            arguments = '{"title":"测试"}' if mode == "limit" else '{"command":"echo test"}'
+            payload = {"choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "call-state", "type": "function",
+                "function": {"name": name, "arguments": arguments}}]},
+                "finish_reason": "tool_calls"}]}
+            self.writeChunk(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n")
+            self.writeChunk("data: [DONE]\n\n")
+            self.wfile.write(b"0\r\n\r\n")
+            self.wfile.flush()
+            self.close_connection = True
+            return
+        if mode == "reasoning":
             self.streamReasoning()
             return
 
@@ -109,4 +123,8 @@ def start_server(port: int = 0, mode: str = "text"):
     opt = server.socket.getsockname()
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
-    return opt[1], server.server_close
+    def stop():
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+    return opt[1], stop

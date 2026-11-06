@@ -264,23 +264,29 @@ void RemoteFs::rename(const std::string& from, const std::string& to) {
 
 void RemoteFs::download(const std::string& remotePath, const std::string& localPath,
                         std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
+    if (!cancel) cancel = std::make_shared<std::atomic<bool>>(false);
     post([this, remotePath, localPath, cancel, resume]() {
+        FsEvent started; started.kind = FsEventKind::Started; started.path = remotePath;
+        started.localPath = localPath; started.cancel = cancel; started.message = remoteBaseName(remotePath);
+        if (callbacks_.onEvent) callbacks_.onEvent(started);
         FsEvent event;
         event.kind = FsEventKind::Done;
         event.path = remotePath;
         bool cancelled = false;
         try {
+            if (cancel && cancel->load()) throw Error("传输已取消");
             if (!sftp_) throw Error("SFTP 尚未就绪");
             TransferOptions options;
             options.showProgress = false;
             options.resume = resume;
             // 每 ~100ms 把已传输字节数抛回 UI 线程，供进度条使用
-            options.onProgress = [this, remotePath](std::uint64_t done, std::uint64_t total) {
+            options.onProgress = [this, remotePath, cancel](std::uint64_t done, std::uint64_t total) {
                 FsEvent progress;
                 progress.kind = FsEventKind::Progress;
                 progress.path = remotePath;
                 progress.bytes = done;
                 progress.total = total;
+                progress.cancel = cancel;
                 if (callbacks_.onEvent) callbacks_.onEvent(progress);
             };
             if (cancel) {
@@ -296,6 +302,7 @@ void RemoteFs::download(const std::string& remotePath, const std::string& localP
             event.message = cancelled ? ("已取消下载 " + remoteBaseName(remotePath))
                                       : std::string("下载失败：") + ex.what();
         }
+        event.cancel = cancel;
         if (callbacks_.onEvent) callbacks_.onEvent(event);
     });
 }
@@ -420,6 +427,11 @@ std::shared_ptr<RemoteFs::Reader> RemoteFs::openReader(const std::string& remote
 
 void RemoteFs::upload(const std::string& localPath, const std::string& remotePath,
                       std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
+    if (!cancel) cancel = std::make_shared<std::atomic<bool>>(false);
+    FsEvent queued; queued.kind = FsEventKind::Started; queued.path = remotePath;
+    queued.upload = true; queued.message = localBaseName(localPath); queued.cancel = cancel;
+    queued.localPath = localPath; queued.queued = true;
+    if (callbacks_.onEvent) callbacks_.onEvent(queued);
     post([this, localPath, remotePath, cancel, resume]() {
         // 先报一次 Started，UI 才有东西可显示（总字节取本地文件大小，
         // 取不到就留 0，进度条退化成「上传中…」而不是一直空着）
@@ -429,6 +441,7 @@ void RemoteFs::upload(const std::string& localPath, const std::string& remotePat
         started.upload = true;
         started.message = localBaseName(localPath);
         started.cancel = cancel;
+        started.localPath = localPath;
         {
             std::error_code ec;
             started.total = fs::file_size(utf8ToPath(localPath), ec);
@@ -442,18 +455,20 @@ void RemoteFs::upload(const std::string& localPath, const std::string& remotePat
         event.upload = true;
         bool cancelled = false;
         try {
+            if (cancel && cancel->load()) throw Error("传输已取消");
             if (!sftp_) throw Error("SFTP 尚未就绪");
             TransferOptions options;
             options.showProgress = false;
             options.resume = resume;
             // 和下载一样按 ~100ms 把已传字节抛回 UI 线程
-            options.onProgress = [this, remotePath](std::uint64_t done, std::uint64_t total) {
+            options.onProgress = [this, remotePath, cancel](std::uint64_t done, std::uint64_t total) {
                 FsEvent progress;
                 progress.kind = FsEventKind::Progress;
                 progress.path = remotePath;
                 progress.upload = true;
                 progress.bytes = done;
                 progress.total = total;
+                progress.cancel = cancel;
                 if (callbacks_.onEvent) callbacks_.onEvent(progress);
             };
             if (cancel) options.cancelled = [cancel]() { return cancel->load(); };
@@ -467,6 +482,7 @@ void RemoteFs::upload(const std::string& localPath, const std::string& remotePat
             event.message = cancelled ? ("已取消上传 " + localBaseName(localPath))
                                       : std::string("上传失败：") + ex.what();
         }
+        event.cancel = cancel;
         if (callbacks_.onEvent) callbacks_.onEvent(event);
     });
 }
@@ -476,9 +492,16 @@ void checkTreeCancelled(const std::shared_ptr<std::atomic<bool>>& cancel) {
     if (cancel && cancel->load()) throw Error("传输已取消");
 }
 
+struct TreeProgress {
+    std::uint64_t done = 0;
+    std::uint64_t skipped = 0;
+    std::function<void(const std::string&, std::uint64_t, std::uint64_t)> report;
+    std::function<bool(const std::string&)> conflict;
+};
+
 void uploadDirectoryTree(SftpClient& sftp, const fs::path& local, const std::string& remote,
                          const TransferOptions& options,
-                         const std::shared_ptr<std::atomic<bool>>& cancel) {
+                         const std::shared_ptr<std::atomic<bool>>& cancel, TreeProgress& progress) {
     checkTreeCancelled(cancel);
     SftpEntry existing;
     if (sftp.stat(remote, existing)) {
@@ -496,12 +519,25 @@ void uploadDirectoryTree(SftpClient& sftp, const fs::path& local, const std::str
         if (ec) throw Error("读取本地文件属性失败：" + ec.message());
         if (fs::is_symlink(status)) continue;
         const std::string child = remoteJoin(remote, pathToUtf8(it->path().filename()));
-        if (fs::is_directory(status)) uploadDirectoryTree(sftp, it->path(), child, options, cancel);
+        if (fs::is_directory(status)) uploadDirectoryTree(sftp, it->path(), child, options, cancel, progress);
         else if (fs::is_regular_file(status)) {
             SftpEntry target;
-            if (sftp.stat(child, target) && !target.isFile())
+            const bool exists = sftp.stat(child, target);
+            if (exists && !target.isFile())
                 throw Error("远端目标不是普通文件：" + child);
+            progress.report(child, progress.done, progress.skipped);
+            if (exists && !options.resume) {
+                if (!progress.conflict || !progress.conflict(child)) {
+                    if (cancel) cancel->store(true);
+                    throw Error("已取消文件夹传输");
+                }
+                ++progress.skipped;
+                progress.report(child, progress.done, progress.skipped);
+                continue;
+            }
             sftp.upload(pathToUtf8(it->path()), child, options);
+            ++progress.done;
+            progress.report(child, progress.done, progress.skipped);
         }
     }
     if (ec) throw Error("读取本地目录失败：" + ec.message());
@@ -509,7 +545,7 @@ void uploadDirectoryTree(SftpClient& sftp, const fs::path& local, const std::str
 
 void downloadDirectoryTree(SftpClient& sftp, const std::string& remote, const fs::path& local,
                            const TransferOptions& options,
-                           const std::shared_ptr<std::atomic<bool>>& cancel) {
+                           const std::shared_ptr<std::atomic<bool>>& cancel, TreeProgress& progress) {
     checkTreeCancelled(cancel);
     std::error_code ec;
     if (fs::is_symlink(fs::symlink_status(local, ec))) throw Error("本地目录不能是符号链接");
@@ -525,24 +561,53 @@ void downloadDirectoryTree(SftpClient& sftp, const std::string& remote, const fs
         if (fs::is_symlink(fs::symlink_status(child, ec))) throw Error("本地目标不能是符号链接");
         ec.clear();
         if (entry.isSymlink()) continue;
-        if (entry.isDir()) downloadDirectoryTree(sftp, entry.path, child, options, cancel);
-        else if (entry.isFile()) sftp.download(entry.path, pathToUtf8(child), options);
+        if (entry.isDir()) downloadDirectoryTree(sftp, entry.path, child, options, cancel, progress);
+        else if (entry.isFile()) {
+            progress.report(entry.path, progress.done, progress.skipped);
+            if (!options.resume && fs::exists(child, ec)) {
+                if (!progress.conflict || !progress.conflict(pathToUtf8(child))) {
+                    if (cancel) cancel->store(true);
+                    throw Error("已取消文件夹传输");
+                }
+                ++progress.skipped;
+                progress.report(entry.path, progress.done, progress.skipped);
+                continue;
+            }
+            if (ec) throw Error("检查本地目标失败：" + ec.message());
+            sftp.download(entry.path, pathToUtf8(child), options);
+            ++progress.done;
+            progress.report(entry.path, progress.done, progress.skipped);
+        }
     }
 }
 }  // namespace
 
 void RemoteFs::uploadDirectory(const std::string& localPath, const std::string& remotePath,
                                std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
+    if (!cancel) cancel = std::make_shared<std::atomic<bool>>(false);
+    FsEvent queued; queued.kind = FsEventKind::Started; queued.path = remotePath;
+    queued.upload = true; queued.directory = true; queued.queued = true;
+    queued.message = localBaseName(localPath); queued.localPath = localPath; queued.cancel = cancel;
+    if (callbacks_.onEvent) callbacks_.onEvent(queued);
     post([this, localPath, remotePath, cancel, resume]() {
         FsEvent event; event.kind = FsEventKind::Started; event.path = remotePath;
         event.upload = true; event.message = localBaseName(localPath); event.cancel = cancel;
+        event.localPath = localPath; event.directory = true;
         if (callbacks_.onEvent) callbacks_.onEvent(event);
         try {
             if (!sftp_) throw Error("SFTP 尚未就绪");
             TransferOptions options; options.showProgress = false; options.overwrite = false;
             options.resume = resume;
             options.cancelled = [cancel]() { return cancel && cancel->load(); };
-            uploadDirectoryTree(*sftp_, utf8ToPath(localPath), remotePath, options, cancel);
+            TreeProgress progress;
+            progress.conflict = callbacks_.onConflict;
+            progress.report = [this, remotePath, cancel](const std::string& current, std::uint64_t done, std::uint64_t skipped) {
+                FsEvent update; update.kind = FsEventKind::Progress; update.path = remotePath;
+                update.upload = true; update.directory = true; update.cancel = cancel;
+                update.currentFile = current; update.filesDone = done; update.filesSkipped = skipped;
+                if (callbacks_.onEvent) callbacks_.onEvent(update);
+            };
+            uploadDirectoryTree(*sftp_, utf8ToPath(localPath), remotePath, options, cancel, progress);
             event.kind = FsEventKind::Done; event.message = "文件夹上传完成：" + localBaseName(localPath);
         } catch (const std::exception& ex) {
             event.kind = cancel && cancel->load() ? FsEventKind::Cancelled : FsEventKind::Error;
@@ -554,14 +619,28 @@ void RemoteFs::uploadDirectory(const std::string& localPath, const std::string& 
 
 void RemoteFs::downloadDirectory(const std::string& remotePath, const std::string& localPath,
                                  std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
+    if (!cancel) cancel = std::make_shared<std::atomic<bool>>(false);
     post([this, remotePath, localPath, cancel, resume]() {
+        FsEvent started; started.kind = FsEventKind::Started; started.path = remotePath;
+        started.localPath = localPath; started.directory = true; started.cancel = cancel;
+        started.message = remoteBaseName(remotePath);
+        if (callbacks_.onEvent) callbacks_.onEvent(started);
         FsEvent event; event.kind = FsEventKind::Done; event.path = remotePath;
+        event.cancel = cancel; event.localPath = localPath; event.directory = true;
         try {
             if (!sftp_) throw Error("SFTP 尚未就绪");
             TransferOptions options; options.showProgress = false; options.overwrite = false;
             options.resume = resume;
             options.cancelled = [cancel]() { return cancel && cancel->load(); };
-            downloadDirectoryTree(*sftp_, remotePath, utf8ToPath(localPath), options, cancel);
+            TreeProgress progress;
+            progress.conflict = callbacks_.onConflict;
+            progress.report = [this, remotePath, cancel](const std::string& current, std::uint64_t done, std::uint64_t skipped) {
+                FsEvent update; update.kind = FsEventKind::Progress; update.path = remotePath;
+                update.directory = true; update.cancel = cancel; update.currentFile = current;
+                update.filesDone = done; update.filesSkipped = skipped;
+                if (callbacks_.onEvent) callbacks_.onEvent(update);
+            };
+            downloadDirectoryTree(*sftp_, remotePath, utf8ToPath(localPath), options, cancel, progress);
             event.message = "文件夹下载完成：" + remoteBaseName(remotePath);
         } catch (const std::exception& ex) {
             event.kind = cancel && cancel->load() ? FsEventKind::Cancelled : FsEventKind::Error;

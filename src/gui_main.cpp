@@ -25,6 +25,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -76,6 +77,7 @@ enum : UINT {
     WM_VAULT_TPM_DONE = WM_APP + 8,  // lParam = std::shared_ptr<TpmAttempt>*（UI 线程释放）
     WM_UPDATE_AVAILABLE = WM_APP + 9,  // lParam = ReleaseInfo*（UI 线程释放）
     WM_UPDATE_DOWNLOADED = WM_APP + 10, // lParam = UpdateDownload*
+    WM_FS_CONFLICT = WM_APP + 11,
 };
 
 // 目录跟随分三步执行，每步由远端私有 OSC 确认；定时器只负责静默等待和超时。
@@ -154,6 +156,14 @@ struct SessionState {
         DownloadState state = DownloadState::Active;
         bool drag = false;   // 拖到资源管理器：具体落到哪个目录由系统决定
         bool upload = false;  // true = 上传（本地 -> 远端），false = 下载
+        std::string localPath;
+        std::string sessionKey;
+        bool directory = false;
+        bool waiting = false;
+        std::string currentFile;
+        std::string error;
+        std::uint64_t filesDone = 0;
+        std::uint64_t filesSkipped = 0;
         std::shared_ptr<std::atomic<bool>> cancel;  // 取消开关，传输线程轮询
     };
     Terminal termData;
@@ -205,6 +215,7 @@ struct SessionState {
     int fsScroll = 0;
     int fsPendingUploads = 0;    // 排队中的上传数：全部完成时只刷新一次目录
     std::vector<DownloadTask> downloads;
+    int downloadScroll = 0;
     int downloadSeq = 0;
     bool downloadsOpen = false;    // 下载列表是否展开
     RemoteStats stats;
@@ -486,6 +497,14 @@ bool armAutoReconnect();
 void runAutoReconnectAttempt();
 void messageWarn(const std::wstring& title, const std::wstring& text);
 void stopRemoteFs();
+struct TransferConflictRequest {
+    std::string path;
+    std::atomic<int> decision{-1};
+};
+std::vector<std::pair<UINT_PTR, std::shared_ptr<TransferConflictRequest>>> g_transferConflicts;
+
+void presentTransferConflict(const std::shared_ptr<TransferConflictRequest>& request);
+
 void startRemoteFs(const Session& session, const std::wstring& password,
                    const std::wstring& keyPassphrase);
 
@@ -522,8 +541,9 @@ void dropEditedFiles(UINT_PTR connectionId);
 // 传输任务（状态栏列表）：新增、取消、清理已完成、展开高度
 void addDownloadTask(const std::string& remote, const std::wstring& name, std::uint64_t total,
                      bool drag, std::shared_ptr<std::atomic<bool>> cancel,
-                     bool upload = false);
+                     bool upload = false, const std::string& localPath = {}, bool directory = false);
 void cancelDownloadTask(int id);
+bool scrollDownloadPanel(POINT screen, int delta);
 void clearFinishedDownloads();
 int downloadsPanelHeight();
 void syncDownloadLayout();
@@ -2168,6 +2188,7 @@ LRESULT CALLBACK terminalProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_MOUSEWHEEL: {
             int delta = GET_WHEEL_DELTA_WPARAM(wp);
             POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (scrollDownloadPanel(pt, delta)) return 0;
             ScreenToClient(hwnd, &pt);
             if (mouseReportingActive()) {
                 sendMouse(delta > 0 ? 64 : 65, true, pt.x, pt.y);
@@ -2860,10 +2881,14 @@ void paintButton(HDC dc, const RECT& rc, const std::wstring& label, bool primary
         fg = enabled ? ui::text : ui::mix(ui::textFaint, bgCard, 0.5);
         border = enabled ? (hover ? ui::accent : ui::border) : ui::borderSoft;
     }
-    fillRoundRect(dc, rc, dp(7), bg, border);
+    // GDI+ 的描边以路径为中心；将右下边缘收进控件，防止描边被窗口裁掉。
+    RECT outline = rc;
+    if (outline.right - outline.left > 1) --outline.right;
+    if (outline.bottom - outline.top > 1) --outline.bottom;
+    fillRoundRect(dc, outline, dp(7), bg, border);
     if (focused && enabled) {
         // 只加一圈内描边，不能再用 fillRoundRect 的填充色（会盖成黑色）
-        RECT inner = rc;
+        RECT inner = outline;
         InflateRect(&inner, -dp(2), -dp(2));
         fillRoundRect(dc, inner, dp(5), bg, ui::accent);
     }
@@ -6115,7 +6140,7 @@ void fsOpenEntry(int index, bool resume = false) {
 
     // 登记下载任务：状态栏会展开列表显示进度，可随时取消
     auto cancel = std::make_shared<std::atomic<bool>>(false);
-    addDownloadTask(entry.path, toWide(entry.name), entry.size, false, cancel);
+    addDownloadTask(entry.path, toWide(entry.name), entry.size, false, cancel, false, toUtf8(file));
     g_app.fs->download(entry.path, toUtf8(file), cancel, resume);
     setStatus(L"正在下载 " + toWide(entry.name) + L" …");
 }
@@ -6201,7 +6226,7 @@ void fsDownloadSelected(bool resume) {
     if (folder.empty()) return;
     const fs::path target = fs::path(folder) / utf8ToPath(entry.name);
     auto cancel = std::make_shared<std::atomic<bool>>(false);
-    addDownloadTask(entry.path, toWide(entry.name), 0, false, cancel);
+    addDownloadTask(entry.path, toWide(entry.name), 0, false, cancel, false, pathToUtf8(target), true);
     g_app.fs->downloadDirectory(entry.path, pathToUtf8(target), cancel, resume);
     setStatus(L"正在下载文件夹 " + toWide(entry.name) + L" …");
 }
@@ -7282,6 +7307,16 @@ void openFileContextMenu(HWND hwnd, POINT screenPt) {
     if (id > 0) SendMessageW(g_app.main, WM_COMMAND, MAKEWPARAM(id, 0), 0);
 }
 
+RECT fileChannelRetryRect(HWND hwnd) {
+    RECT rc{};
+    if (!hwnd || !g_app.fsFailed || !g_app.shell->running() || g_app.fsRecoveryPending) return rc;
+    GetClientRect(hwnd, &rc);
+    if (rc.bottom < dp(70)) return RECT{};
+    const int center = rc.right / 2;
+    return RECT{std::max(dp(8), center - dp(52)), rc.bottom - dp(42),
+                std::min(static_cast<int>(rc.right) - dp(8), center + dp(52)), rc.bottom - dp(10)};
+}
+
 void paintFileList(HWND hwnd) {
     PAINTSTRUCT ps;
     HDC dc = BeginPaint(hwnd, &ps);
@@ -7301,19 +7336,27 @@ void paintFileList(HWND hwnd) {
         const int center = rc.right / 2;
         paintFileIcon(mem, RECT{center - dp(16), top, center + dp(16), top + dp(32)},
                       FileKind::Folder);
-        const std::wstring text = g_app.fsFailed ? L"文件通道连接失败"
-                                   : g_app.connecting ? L"正在连接…"
+        const std::wstring text = g_app.fsRecoveryPending ? L"文件通道正在重试…"
+                                   : g_app.fsFailed ? L"文件通道连接失败"
+                                   : (g_app.connecting || g_app.shell->running()) ? L"文件通道连接中…"
                                                       : L"浏览远端文件";
         drawText(mem, text, RECT{dp(12), top + dp(46), rc.right - dp(12), top + dp(70)},
                  g_app.fsFailed ? ui::danger : ui::textDim, g_app.uiFontBold,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         if (!g_app.fsError.empty()) {
-            drawText(mem, toWide(g_app.fsError), RECT{dp(12), top + dp(78), rc.right - dp(12), rc.bottom},
+            const int bottom = g_app.fsFailed && g_app.shell->running() && !g_app.fsRecoveryPending
+                                   ? std::max(top + dp(78), static_cast<int>(rc.bottom) - dp(52)) : rc.bottom;
+            drawText(mem, toWide(g_app.fsError), RECT{dp(12), top + dp(78), rc.right - dp(12), bottom},
                      ui::textFaint, g_app.tinyFont, DT_LEFT | DT_TOP | DT_WORDBREAK);
-        } else if (!g_app.connecting) {
+        } else if (!g_app.connecting && !g_app.shell->running()) {
             drawText(mem, L"连接主机后，在这里浏览文件\n支持上传、下载与拖放传输",
                      RECT{dp(12), top + dp(78), rc.right - dp(12), rc.bottom}, ui::textFaint,
                      g_app.tinyFont, DT_CENTER | DT_TOP | DT_WORDBREAK);
+        }
+        if (g_app.fsFailed && g_app.shell->running() && !g_app.fsRecoveryPending && rc.bottom >= dp(70)) {
+            const RECT retry = fileChannelRetryRect(hwnd);
+            if (retry.right > retry.left)
+                dlg::paintButton(mem, retry, L"重试文件连接", false, false, false, false, true);
         }
     } else if (!g_app.fsError.empty()) {
         drawText(mem, L"无法读取目录", RECT{dp(12), dp(10), rc.right - dp(12), dp(30)}, ui::danger,
@@ -7434,6 +7477,15 @@ ConnectionOptions makeRemoteOptions(const Session& session, const std::wstring& 
     return options;
 }
 
+void presentTransferConflict(const std::shared_ptr<TransferConflictRequest>& request) {
+    if (!request || request->decision.load() >= 0) return;
+    const bool skip = messageConfirm(L"文件已存在",
+        L"会话：" + toWide(g_app.currentSession) + L"\n目标文件已存在：\n" + toWide(request->path) +
+        L"\n\n跳过此文件并继续，或取消整个文件夹传输？", L"跳过", L"取消传输");
+    int pending = -1;
+    request->decision.compare_exchange_strong(pending, skip ? 1 : 0);
+}
+
 void startRemoteFs(const Session& session, const std::wstring& password,
                    const std::wstring& keyPassphrase) {
     // 先结束旧工作线程，避免它在替换回调时仍然访问回调对象。
@@ -7460,12 +7512,42 @@ void startRemoteFs(const Session& session, const std::wstring& password,
             auto* copy = new RemoteStats(stats);
             if (!PostMessageW(g_app.main, WM_FS_STATS, connectionId, reinterpret_cast<LPARAM>(copy)))
                 delete copy;
+        },
+        [connectionId, remote = std::weak_ptr<RemoteFs>(g_app.fs)](const std::string& path) {
+            auto request = std::make_shared<TransferConflictRequest>();
+            request->path = path;
+            auto* payload = new std::shared_ptr<TransferConflictRequest>(request);
+            if (!PostMessageW(g_app.main, WM_FS_CONFLICT, connectionId, reinterpret_cast<LPARAM>(payload))) {
+                delete payload;
+                return false;
+            }
+            while (request->decision.load() < 0 && !g_applicationClosing.load()) {
+                auto fs = remote.lock();
+                if (!fs || !fs->running()) { request->decision.store(0); return false; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+            return request->decision.load() == 1;
         }});
     g_app.fs->setSampleInterval(5);
     g_app.fs->start(makeRemoteOptions(session, password, keyPassphrase));
 
     layoutMain(g_app.main);
     updateButtons();
+}
+
+void retryFileChannel() {
+    if (!g_app.shell->running() || !g_app.fsFailed || g_app.fsRecoveryPending) return;
+    const Session* session = g_app.store.find(g_app.currentSession);
+    if (!session) { setStatus(L"无法重试：会话配置已删除", true); return; }
+    std::wstring password = g_app.currentPassword.reveal();
+    std::wstring passphrase = g_app.currentKeyPassphrase.reveal();
+    g_app.fsRecoveryPending = true;
+    g_app.fsRecoveryAttempt = 0;
+    startRemoteFs(*session, password, passphrase);
+    wipeWideString(password);
+    wipeWideString(passphrase);
+    setStatus(L"正在重试文件通道…");
+    if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
 }
 
 // ---------------------------------------------------------------- 下载任务
@@ -7492,11 +7574,13 @@ bool hasFinishedDownloads() {
     return activeDownloadCount() < g_app.downloads.size();
 }
 
-App::DownloadTask* findDownloadTask(const std::string& remote, bool upload, bool activeOnly = true) {
+App::DownloadTask* findDownloadTask(const std::string& remote, bool upload, bool activeOnly = true,
+                                    const std::shared_ptr<std::atomic<bool>>& cancel = {}) {
     // 从后往前找：同名文件重复传输时，进度事件应该落在最新那一项上；
     // 上传和下载可能同时指向同一个远端路径，方向也必须对得上。
     for (auto it = g_app.downloads.rbegin(); it != g_app.downloads.rend(); ++it) {
         if (it->remote != remote || it->upload != upload) continue;
+        if (cancel && it->cancel != cancel) continue;
         if (activeOnly && !downloadActive(*it)) continue;
         return &*it;
     }
@@ -7527,7 +7611,8 @@ void syncDownloadLayout() {
 }
 
 void addDownloadTask(const std::string& remote, const std::wstring& name, std::uint64_t total,
-                     bool drag, std::shared_ptr<std::atomic<bool>> cancel, bool upload) {
+                     bool drag, std::shared_ptr<std::atomic<bool>> cancel, bool upload,
+                     const std::string& localPath, bool directory) {
     App::DownloadTask task;
     task.id = ++g_app.downloadSeq;
     task.remote = remote;
@@ -7535,6 +7620,12 @@ void addDownloadTask(const std::string& remote, const std::wstring& name, std::u
     task.total = total;
     task.drag = drag;
     task.upload = upload;
+    task.localPath = localPath;
+    task.directory = directory;
+    task.waiting = !localPath.empty();
+    if (const Session* session = g_app.store.find(g_app.currentSession))
+        task.sessionKey = session->name + "\n" + session->host + "\n" +
+                          std::to_string(session->port) + "\n" + session->user;
     task.cancel = std::move(cancel);
     g_app.downloads.push_back(std::move(task));
     // 有新任务就把列表展开，让用户马上看到进度和取消按钮
@@ -7552,12 +7643,58 @@ void cancelDownloadTask(int id) {
     }
 }
 
+void showTransferDetails(int id) {
+    auto it = std::find_if(g_app.downloads.begin(), g_app.downloads.end(),
+                           [id](const App::DownloadTask& task) { return task.id == id; });
+    if (it == g_app.downloads.end()) return;
+    const App::DownloadTask task = *it;
+    MessageSpec spec;
+    spec.kind = task.state == App::DownloadState::Failed ? 1 : 0;
+    spec.title = L"传输详情";
+    spec.text = (task.upload ? L"上传：" : L"下载：") + task.name + L"\n远端：" + toWide(task.remote);
+    if (!task.sessionKey.empty()) spec.text += L"\n会话：" + toWide(task.sessionKey.substr(0, task.sessionKey.find('\n')));
+    if (!task.localPath.empty()) spec.text += L"\n本地：" + toWide(task.localPath);
+    if (!task.error.empty()) spec.text += L"\n\n" + toWide(task.error);
+    const bool retryable = !task.localPath.empty() && !task.sessionKey.empty() && !task.drag &&
+        (task.state == App::DownloadState::Failed || task.state == App::DownloadState::Cancelled);
+    if (!retryable) { spec.buttons = {L"关闭"}; showMessage(spec); return; }
+    spec.buttons = {L"重新传输", L"续传", L"关闭"};
+    spec.defaultIndex = 2;
+    const int choice = showMessage(spec);
+    if (choice != 0 && choice != 1) return;
+    const Session* session = g_app.store.find(g_app.currentSession);
+    const std::string key = session ? session->name + "\n" + session->host + "\n" +
+        std::to_string(session->port) + "\n" + session->user : std::string();
+    if (!g_app.fsReady || !g_app.fs->sftpReady() || key != task.sessionKey) {
+        messageWarn(L"无法继续传输", L"请先重新连接原来的会话，再重试此任务。");
+        return;
+    }
+    const bool resume = choice == 1;
+    if (resume && !confirmTransferResume()) return;
+    if (!resume && !task.directory &&
+        !messageConfirm(L"重新传输", L"重新传输可能覆盖目标文件，是否继续？", L"继续", L"取消")) return;
+    auto cancel = std::make_shared<std::atomic<bool>>(false);
+    if (task.upload) {
+        if (task.directory) g_app.fs->uploadDirectory(task.localPath, task.remote, cancel, resume);
+        else g_app.fs->upload(task.localPath, task.remote, cancel, resume);
+        ++g_app.fsPendingUploads;
+    } else {
+        addDownloadTask(task.remote, task.name, task.directory ? 0 : task.total, false, cancel,
+                        false, task.localPath, task.directory);
+        if (task.directory) g_app.fs->downloadDirectory(task.remote, task.localPath, cancel, resume);
+        else g_app.fs->download(task.remote, task.localPath, cancel, resume);
+    }
+    setStatus(resume ? L"正在续传…" : L"正在重新传输…");
+}
+
 void clearFinishedDownloads() {
     g_app.downloads.erase(
         std::remove_if(g_app.downloads.begin(), g_app.downloads.end(),
                        [](const App::DownloadTask& task) { return !downloadActive(task); }),
         g_app.downloads.end());
     if (g_app.downloads.empty()) g_app.downloadsOpen = false;
+    g_app.downloadScroll = std::clamp(g_app.downloadScroll, 0,
+        std::max(0, static_cast<int>(g_app.downloads.size()) - kMaxVisibleDownloads));
     syncDownloadLayout();
 }
 
@@ -7569,6 +7706,7 @@ void stopRemoteFs() {
     for (auto& task : g_app.downloads) {
         if (!downloadActive(task)) continue;
         task.state = App::DownloadState::Failed;
+        task.error = "连接中断，传输未完成";
     }
     g_app.fsReady = false;
     g_app.fsFailed = false;
@@ -7591,17 +7729,34 @@ void stopRemoteFs() {
 void handleFsEvent(const FsEvent& event) {
     // ---- 传输任务（上传 + 下载）----
     if (event.kind == FsEventKind::Started) {
+        if (!g_app.fsReady && !event.localPath.empty()) return;
+        if (event.cancel) {
+            if (App::DownloadTask* existing = findDownloadTask(event.path, event.upload, true, event.cancel)) {
+                existing->waiting = event.queued;
+                if (event.total > 0) existing->total = event.total;
+                if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
+                return;
+            }
+        }
         // 拖动下载的任务在松手后才由资源管理器的复制线程登记过来；
         // 取消开关跟着事件走，同路径的旧任务不会串号。
         // 上传没有「拖放落点」的概念，drag 一律为 false。
-        addDownloadTask(event.path, toWide(event.message), event.total, !event.upload,
-                        event.cancel, event.upload);
+        addDownloadTask(event.path, toWide(event.message), event.total, !event.upload && event.localPath.empty(),
+                        event.cancel, event.upload,
+                        findEditedFile(g_app.connectionId, event.path) ? std::string() : event.localPath,
+                        event.directory);
+        if (!g_app.downloads.empty()) g_app.downloads.back().waiting = event.queued;
         return;
     }
     if (event.kind == FsEventKind::Progress) {
-        if (App::DownloadTask* task = findDownloadTask(event.path, event.upload)) {
+        if (App::DownloadTask* task = findDownloadTask(event.path, event.upload, true, event.cancel)) {
             task->done = event.bytes;
             if (event.total > 0) task->total = event.total;
+            if (event.directory) {
+                task->currentFile = event.currentFile;
+                task->filesDone = event.filesDone;
+                task->filesSkipped = event.filesSkipped;
+            }
             if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
         }
         return;
@@ -7610,7 +7765,7 @@ void handleFsEvent(const FsEvent& event) {
         if (event.upload && g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
         if (event.upload) finishEditUpload(event.path, false);
         else finishEditDownload(event.path, false);
-        if (App::DownloadTask* task = findDownloadTask(event.path, event.upload)) {
+        if (App::DownloadTask* task = findDownloadTask(event.path, event.upload, true, event.cancel)) {
             task->state = App::DownloadState::Cancelled;
             setStatus((task->upload ? L"已取消上传 " : L"已取消下载 ") + task->name);
             syncDownloadLayout();
@@ -7624,7 +7779,7 @@ void handleFsEvent(const FsEvent& event) {
             break;
         case FsEventKind::Ready:
             g_app.fsReady = event.message.empty();
-            g_app.fsFailed = false;
+            g_app.fsFailed = !event.message.empty();
             g_app.fsHome = event.path;  // 路径框里的 ~ 展开用
             if (!event.message.empty() && g_app.fsRecoveryPending &&
                 ReconnectPolicy::retryableError(event.message) &&
@@ -7632,6 +7787,7 @@ void handleFsEvent(const FsEvent& event) {
                 const int delay = ReconnectPolicy::delayMs(g_app.fsRecoveryAttempt++);
                 SetTimer(g_app.main, reconnectTimerId(g_app), static_cast<UINT>(delay), nullptr);
                 g_app.reconnectTimerSet = true;
+                g_app.fsFailed = false;
                 setStatus(L"文件通道连接失败，正在准备重试…");
                 break;
             }
@@ -7640,8 +7796,7 @@ void handleFsEvent(const FsEvent& event) {
             if (g_app.aiTab && foregroundSession()) g_app.aiTab->refreshHost();
             if (!event.message.empty()) {
                 g_app.fsError = event.message;
-                if (foregroundSession()) messageWarn(L"文件面板不可用",
-                            L"终端已经连上，但 SFTP 子系统打开失败：\n" + toWide(event.message));
+                setStatus(L"文件通道连接失败，可在文件面板重试", true);
             } else if (!event.path.empty()) {
                 // shell 通道可能比 SFTP 先连上（并且已经上报过 OSC 7），
                 // 这种情况下起点直接对齐终端所在的目录
@@ -7659,13 +7814,14 @@ void handleFsEvent(const FsEvent& event) {
                 const int delay = ReconnectPolicy::delayMs(g_app.fsRecoveryAttempt++);
                 SetTimer(g_app.main, reconnectTimerId(g_app), static_cast<UINT>(delay), nullptr);
                 g_app.reconnectTimerSet = true;
+                g_app.fsFailed = false;
                 setStatus(L"文件通道连接失败，正在准备重试…");
                 break;
             }
             g_app.fsRecoveryPending = false;
             g_app.fsRecoveryAttempt = 0;
             if (g_app.aiTab && foregroundSession()) g_app.aiTab->refreshHost();
-            setStatus(L"文件通道连接失败", true);
+            setStatus(L"文件通道连接失败，可在文件面板重试", true);
             break;
         case FsEventKind::Listing: {
             g_app.fsLoading = false;
@@ -7688,11 +7844,11 @@ void handleFsEvent(const FsEvent& event) {
             break;
         }
         case FsEventKind::Done: {
-            if (g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
+            if (event.upload && g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
             // 编辑流程先收尾：成功回传要把本地状态记成新基线，下载成功才启动编辑器
             const bool edited = event.upload ? finishEditUpload(event.path, true)
                                              : finishEditDownload(event.path, true);
-            App::DownloadTask* task = findDownloadTask(event.path, event.upload);
+            App::DownloadTask* task = findDownloadTask(event.path, event.upload, true, event.cancel);
             if (task) {
                 task->state = App::DownloadState::Done;
                 if (task->total > 0) task->done = task->total;
@@ -7711,13 +7867,14 @@ void handleFsEvent(const FsEvent& event) {
         }
         case FsEventKind::Error: {
             g_app.fsLoading = false;
-            if (g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
+            if (event.upload && g_app.fsPendingUploads > 0) --g_app.fsPendingUploads;
             const bool editFailed = event.upload ? finishEditUpload(event.path, false)
                                                  : finishEditDownload(event.path, false);
             const std::wstring retryHint =
                 editFailed && event.upload ? L"；本地修改已保留，15 秒后自动重试" : L"";
-            if (App::DownloadTask* task = findDownloadTask(event.path, event.upload)) {
+            if (App::DownloadTask* task = findDownloadTask(event.path, event.upload, true, event.cancel)) {
                 task->state = App::DownloadState::Failed;
+                task->error = event.message;
                 setStatus(toWide(event.message) + retryHint, true);
                 syncDownloadLayout();
                 break;
@@ -8139,9 +8296,13 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.fsDragOrigin = pt;
             return 0;
         }
-        case WM_LBUTTONUP:
+        case WM_LBUTTONUP: {
             g_app.fsDragArmed = false;
+            const RECT retry = fileChannelRetryRect(hwnd);
+            const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (retry.right > retry.left && PtInRect(&retry, pt)) retryFileChannel();
             return 0;
+        }
         case WM_LBUTTONDBLCLK: {
             const int index = fileIndexFromPoint(GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
             if (index >= 0) {
@@ -8172,6 +8333,8 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_MOUSEWHEEL: {
+            POINT screen{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (scrollDownloadPanel(screen, GET_WHEEL_DELTA_WPARAM(wp))) return 0;
             const int notches = GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA;
             if (notches != 0) {
                 g_app.fsScroll = std::clamp(g_app.fsScroll - notches * (fileItemH() * 2), 0,
@@ -8193,6 +8356,7 @@ LRESULT CALLBACK fileListProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (wp == VK_RETURN) {
+                if (g_app.fsFailed) { retryFileChannel(); return 0; }
                 fsOpenEntry(g_app.fsSel);
                 return 0;
             }
@@ -8754,7 +8918,8 @@ StatusLayout statusGeometry(const RECT& client) {
         layout.vault = RECT{right - dp(108), top, right, bottom};
         right = layout.vault.left - dp(12);
     }
-    if (!g_app.connecting && !g_app.shell->running() && selectedSession()) {
+    if ((!g_app.connecting && !g_app.shell->running() && selectedSession()) ||
+        (g_app.shell->running() && g_app.fsFailed && !g_app.fsRecoveryPending)) {
         layout.reconnect = RECT{right - dp(76), top, right, bottom};
         right = layout.reconnect.left - dp(12);
     }
@@ -8802,6 +8967,8 @@ struct DownloadRowLayout {
     RECT row{};
     RECT cancel{};
     bool cancelEnabled = false;
+    bool detailsEnabled = false;
+    int taskIndex = -1;
 };
 
 struct DownloadsPanelLayout {
@@ -8845,8 +9012,13 @@ DownloadsPanelLayout downloadsPanelGeometry(HWND hwnd) {
         DownloadRowLayout row;
         const int top = layout.band.top + headerH + i * rowH;
         row.row = RECT{layout.band.left + dp(6), top, layout.band.right - dp(6), top + rowH};
-        if (downloadActive(g_app.downloads[static_cast<std::size_t>(i)])) {
+        const int index = g_app.downloadScroll + i;
+        row.taskIndex = index;
+        const auto& task = g_app.downloads[static_cast<std::size_t>(index)];
+        if (downloadActive(task) || task.state == App::DownloadState::Failed ||
+            (task.state == App::DownloadState::Cancelled && !task.localPath.empty())) {
             row.cancelEnabled = true;
+            row.detailsEnabled = !downloadActive(task);
             row.cancel = RECT{row.row.right - dp(8) - dp(52), top + (rowH - dp(20)) / 2,
                               row.row.right - dp(8), top + (rowH - dp(20)) / 2 + dp(20)};
         }
@@ -8862,6 +9034,7 @@ struct DownloadHit {
     bool clear = false;
     bool inPanel = false;
     int cancelIndex = -1;  // 点在某行的「取消」上
+    int detailsIndex = -1;
 };
 
 DownloadHit hitDownloadUi(HWND hwnd, const POINT& pt) {
@@ -8885,11 +9058,24 @@ DownloadHit hitDownloadUi(HWND hwnd, const POINT& pt) {
     }
     for (std::size_t i = 0; i < layout.rows.size(); ++i) {
         if (layout.rows[i].cancelEnabled && PtInRect(&layout.rows[i].cancel, pt)) {
-            hit.cancelIndex = static_cast<int>(i);
+            if (layout.rows[i].detailsEnabled) hit.detailsIndex = layout.rows[i].taskIndex;
+            else hit.cancelIndex = layout.rows[i].taskIndex;
             break;
         }
     }
     return hit;
+}
+
+bool scrollDownloadPanel(POINT screen, int delta) {
+    if (!g_app.main || !g_app.downloadsOpen) return false;
+    ScreenToClient(g_app.main, &screen);
+    const DownloadsPanelLayout layout = downloadsPanelGeometry(g_app.main);
+    if (!layout.visible || !PtInRect(&layout.band, screen)) return false;
+    const int maxScroll = std::max(0, static_cast<int>(g_app.downloads.size()) - kMaxVisibleDownloads);
+    const int notches = delta / WHEEL_DELTA;
+    if (notches) g_app.downloadScroll = std::clamp(g_app.downloadScroll - notches * 2, 0, maxScroll);
+    InvalidateRect(g_app.main, nullptr, FALSE);
+    return true;
 }
 
 void paintDownloadsPanel(HDC dc, HWND hwnd) {
@@ -8916,7 +9102,7 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
     if (layout.clearButton.right > layout.clearButton.left) {
-        drawText(dc, L"清除已完成", layout.clearButton, ui::textDim, g_app.tinyFont,
+        drawText(dc, L"清除已结束", layout.clearButton, ui::textDim, g_app.tinyFont,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
     drawText(dc, L"✕", layout.closeButton, ui::textDim, g_app.uiFont,
@@ -8929,10 +9115,10 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
     }
 
     for (std::size_t i = 0; i < layout.rows.size(); ++i) {
-        const App::DownloadTask& task = g_app.downloads[i];
         const DownloadRowLayout& row = layout.rows[i];
+        const App::DownloadTask& task = g_app.downloads[static_cast<std::size_t>(row.taskIndex)];
         const int rowH = row.row.bottom - row.row.top;
-        const bool hover = static_cast<int>(i) == g_app.hoverDownloadCancel;
+        const bool hover = row.taskIndex == g_app.hoverDownloadCancel;
         if (row.cancelEnabled && hover) fillRoundRect(dc, row.row, dp(6), ui::bgHover);
 
         // 类型图标：借用文件列表那套的 16px 版本
@@ -8955,7 +9141,8 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
                     std::max(barLeft - dp(10), static_cast<int>(row.row.left) + dp(50)),
                     row.row.bottom};
         // 名称前带方向箭头：上传和下载混在一个列表里也能一眼分清
-        const std::wstring label = (task.upload ? L"↑ " : L"↓ ") + task.name;
+        std::wstring label = (task.upload ? L"↑ " : L"↓ ") + task.name;
+        if (task.directory && !task.currentFile.empty()) label += L" · " + toWide(task.currentFile);
         drawText(dc, ellipsize(dc, label, g_app.uiFont, nameRc.right - nameRc.left), nameRc,
                  ui::text, g_app.uiFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
@@ -8988,7 +9175,12 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
         std::uint32_t statusColor = ui::textDim;
         switch (task.state) {
             case App::DownloadState::Active:
-                if (task.total > 0) {
+                if (task.waiting) {
+                    status = L"排队中…";
+                } else if (task.directory) {
+                    status = L"已完成 " + std::to_wstring(task.filesDone) + L" 项";
+                    if (task.filesSkipped) status += L" · 跳过 " + std::to_wstring(task.filesSkipped);
+                } else if (task.total > 0) {
                     status = formatPercent(ratio * 100.0) + L" · " +
                              toWide(formatBytes(task.done)) + L" / " +
                              toWide(formatBytes(task.total));
@@ -8997,7 +9189,8 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
                 }
                 break;
             case App::DownloadState::Done:
-                status = L"已完成";
+                status = task.directory ? L"完成 " + std::to_wstring(task.filesDone) + L" 项" : L"已完成";
+                if (task.directory && task.filesSkipped) status += L" · 跳过 " + std::to_wstring(task.filesSkipped);
                 statusColor = ui::success;
                 break;
             case App::DownloadState::Cancelled:
@@ -9015,7 +9208,7 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
         if (row.cancelEnabled) {
             fillRoundRect(dc, row.cancel, dp(5), hover ? ui::bgActive : ui::bgPanel,
                           hover ? ui::border : ui::borderSoft);
-            drawText(dc, L"取消", row.cancel, hover ? ui::text : ui::textDim, g_app.tinyFont,
+            drawText(dc, row.detailsEnabled ? L"详情" : L"取消", row.cancel, hover ? ui::text : ui::textDim, g_app.tinyFont,
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
     }
@@ -9026,7 +9219,9 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
         RECT moreRc{layout.band.left + dp(30),
                     layout.band.top + headerH + downloadVisibleRows() * dp(34),
                     layout.band.right - dp(12), layout.band.bottom - dp(4)};
-        drawText(dc, L"还有 " + std::to_wstring(hidden) + L" 项未显示，可先清除已完成的",
+        drawText(dc, L"显示 " + std::to_wstring(g_app.downloadScroll + 1) + L"–" +
+                     std::to_wstring(g_app.downloadScroll + layout.rows.size()) + L" / " +
+                     std::to_wstring(g_app.downloads.size()) + L" 项 · 滚轮查看更多",
                  moreRc, ui::textFaint, g_app.tinyFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
@@ -9034,8 +9229,13 @@ void paintDownloadsPanel(HDC dc, HWND hwnd) {
 }
 
 std::wstring statusConnectionText() {
-    std::wstring text = g_app.connecting ? L"连接中" :
-        (g_app.shell->running() ? L"已连接" : (g_app.connectionId ? L"已断开" : L"未连接"));
+    const bool connected = g_app.shell->running();
+    std::wstring text = g_app.connecting ? L"终端连接中" : (connected ? L"终端已连" : L"终端已断开");
+    if (connected) {
+        text += g_app.fsReady ? L" · 文件已连" :
+                (g_app.fsRecoveryPending ? L" · 文件重试中" :
+                 (g_app.fsFailed ? L" · 文件失败" : L" · 文件连接中"));
+    }
     if (!g_app.currentSession.empty()) text += L" · " + toWide(g_app.currentSession);
     return text;
 }
@@ -9065,7 +9265,8 @@ void paintStatusBar(HDC dc, const RECT& rc) {
     if (layout.dismiss.right > layout.dismiss.left)
         dlg::paintButton(dc, layout.dismiss, L"×", false, g_app.hoverStatusAction == 2, false, false, true);
     if (layout.reconnect.right > layout.reconnect.left)
-        dlg::paintButton(dc, layout.reconnect, L"重新连接", false, g_app.hoverStatusAction == 1, false, false, true);
+        dlg::paintButton(dc, layout.reconnect, g_app.shell->running() ? L"重试文件" : L"重新连接",
+                         false, g_app.hoverStatusAction == 1, false, false, true);
     if (layout.vault.right > layout.vault.left) {
         fillRoundRect(dc, layout.vault, dp(5), ui::mix(ui::accent, ui::bgPanel, 0.85));
         drawText(dc, L"保险库 已解锁", layout.vault, ui::textDim, g_app.uiFont,
@@ -9083,6 +9284,8 @@ void hideStatusHint() {
 
 std::wstring statusDetailsText() {
     std::wstring text = statusConnectionText();
+    if (g_app.fsFailed && !g_app.fsError.empty())
+        text += L"\n文件通道：" + toWide(g_app.fsError).substr(0, 400) + L"\n可在文件面板重试。";
     if (statusNoticeActive(GetTickCount64())) text += L"\n" + g_app.statusText.substr(0, 400);
     const RemoteStats& stats = g_app.stats;
     if (stats.valid) {
@@ -9823,7 +10026,8 @@ bool handleSessionTabClick(POINT pt) {
 
 LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     const bool sessionMessage = msg == WM_SHELL_DATA || msg == WM_SHELL_CLOSED ||
-        msg == WM_CONNECT_OK || msg == WM_CONNECT_FAIL || msg == WM_FS_EVENT || msg == WM_FS_STATS;
+        msg == WM_CONNECT_OK || msg == WM_CONNECT_FAIL || msg == WM_FS_EVENT || msg == WM_FS_STATS ||
+        msg == WM_FS_CONFLICT;
     SessionState* target = sessionMessage ? findSessionState(wp, true) : findSessionState(g_selectedTabId, false);
     if (msg == WM_TIMER && wp >= 8) {
         target = findSessionState(wp / 8, false);
@@ -9835,6 +10039,11 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             delete reinterpret_cast<std::string*>(lp);
         else if (msg == WM_FS_EVENT) delete reinterpret_cast<FsEvent*>(lp);
         else if (msg == WM_FS_STATS) delete reinterpret_cast<RemoteStats*>(lp);
+        else if (msg == WM_FS_CONFLICT) {
+            std::unique_ptr<std::shared_ptr<TransferConflictRequest>> conflict(
+                reinterpret_cast<std::shared_ptr<TransferConflictRequest>*>(lp));
+            if (conflict && *conflict) (*conflict)->decision.store(0);
+        }
         return 0;
     }
     SessionStateScope context(target);
@@ -9968,7 +10177,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // 下载胶囊 / 列表里的悬停状态
             const DownloadHit downloadHit = hitDownloadUi(hwnd, pt);
             const bool chipHover = downloadHit.chip;
-            const int cancelHover = downloadHit.cancelIndex;
+            const int cancelHover = downloadHit.cancelIndex >= 0 ? downloadHit.cancelIndex : downloadHit.detailsIndex;
             const bool pathHover = g_app.fsReady && PtInRect(&g_app.fsPathRect, pt) != FALSE;
             if (button != g_app.hoverButton || titleButton != g_app.hoverTitleBtn ||
                 aiHover != g_app.hoverTitleAi ||
@@ -10044,7 +10253,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             const StatusLayout status = statusGeometry(client);
             if (PtInRect(&status.dismiss, pt)) { setStatus(L""); return 0; }
             if (PtInRect(&status.reconnect, pt)) {
-                PostMessageW(hwnd, WM_COMMAND, IDM_RECONNECT, 0);
+                if (g_app.shell->running() && g_app.fsFailed) retryFileChannel();
+                else PostMessageW(hwnd, WM_COMMAND, IDM_RECONNECT, 0);
                 return 0;
             }
             if (g_app.searchOpen) {
@@ -10074,6 +10284,11 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 downloadHit.cancelIndex < static_cast<int>(g_app.downloads.size())) {
                 cancelDownloadTask(g_app.downloads[static_cast<std::size_t>(
                     downloadHit.cancelIndex)].id);
+                return 0;
+            }
+            if (downloadHit.detailsIndex >= 0 &&
+                downloadHit.detailsIndex < static_cast<int>(g_app.downloads.size())) {
+                showTransferDetails(g_app.downloads[static_cast<std::size_t>(downloadHit.detailsIndex)].id);
                 return 0;
             }
             if (downloadHit.inPanel) return 0;  // 面板内的点击不要穿到下面
@@ -10174,11 +10389,27 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             break;
         }
+        case WM_MOUSEWHEEL: {
+            POINT screen{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (scrollDownloadPanel(screen, GET_WHEEL_DELTA_WPARAM(wp))) return 0;
+            break;
+        }
         case WM_TIMER:
             // 闪烁定时器设在主窗口上（WM_CREATE 里的 SetTimer），之前只在
             // terminalProc 里处理，主窗口把它交给了 DefWindowProc，结果光标
             // 一直亮着不闪。这里统一由主窗口驱动。
             if (wp == 1) {
+                if (!g_message.dlg && !g_transferConflicts.empty()) {
+                    auto conflict = g_transferConflicts.front();
+                    g_transferConflicts.erase(g_transferConflicts.begin());
+                    SessionState* owner = findSessionState(conflict.first, true);
+                    if (owner) {
+                        SessionStateScope scope(owner);
+                        presentTransferConflict(conflict.second);
+                    } else if (conflict.second) {
+                        conflict.second->decision.store(0);
+                    }
+                }
                 expireStatusNotices(GetTickCount64());
                 if (g_app.searchDirty) refreshTerminalSearch(false);
                 g_app.cursorOn = !g_app.cursorOn;
@@ -10716,6 +10947,15 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (g_tpmAttempt == attempt) g_tpmAttempt.reset();
             return 0;
         }
+        case WM_FS_CONFLICT: {
+            std::unique_ptr<std::shared_ptr<TransferConflictRequest>> conflict(
+                reinterpret_cast<std::shared_ptr<TransferConflictRequest>*>(lp));
+            if (conflict && *conflict && (*conflict)->decision.load() < 0) {
+                if (g_message.dlg) g_transferConflicts.emplace_back(wp, *conflict);
+                else presentTransferConflict(*conflict);
+            }
+            return 0;
+        }
         case WM_FS_EVENT: {
             std::unique_ptr<FsEvent> event(reinterpret_cast<FsEvent*>(lp));
             if (wp != 0 && wp != g_app.connectionId) return 0;
@@ -11116,6 +11356,9 @@ int runGui(HINSTANCE inst, int showCommand) {
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+        if (msg.message == WM_MOUSEWHEEL && (msg.hwnd == g_app.main || IsChild(g_app.main, msg.hwnd)) &&
+            scrollDownloadPanel(POINT{GET_X_LPARAM(msg.lParam), GET_Y_LPARAM(msg.lParam)},
+                                GET_WHEEL_DELTA_WPARAM(msg.wParam))) continue;
         if (msg.message == WM_KEYDOWN && (GetKeyState(VK_CONTROL) & 0x8000) &&
             !(GetKeyState(VK_MENU) & 0x8000) &&
             (msg.hwnd == window || IsChild(window, msg.hwnd))) {

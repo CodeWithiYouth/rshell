@@ -1,11 +1,37 @@
 // GUI 状态回归使用隐藏窗口，不发送真实键鼠输入，不读取用户的会话配置。
 #include "../src/gui_main.cpp"
 #include "../src/md_render.h"
+#include "../src/ai_settings.h"
 #include <iostream>
 #include <stdexcept>
 
 namespace {
 int checks = 0;
+int conflictChoice = 0;
+int conflictDialogs = 0;
+int retryDialogs = 0;
+void CALLBACK answerConflict(HWND, UINT, UINT_PTR, DWORD) {
+    if (!g_message.dlg || g_message.spec.title != L"文件已存在") return;
+    RECT client{}; GetClientRect(g_message.dlg, &client);
+    const auto buttons = msgButtonRects(client, static_cast<int>(g_message.spec.buttons.size()));
+    if (conflictChoice < 0 || conflictChoice >= static_cast<int>(buttons.size())) return;
+    const RECT r = buttons[static_cast<std::size_t>(conflictChoice)];
+    ++conflictDialogs;
+    SendMessageW(g_message.dlg, WM_LBUTTONUP, 0, MAKELPARAM((r.left+r.right)/2, (r.top+r.bottom)/2));
+}
+void CALLBACK answerRetry(HWND, UINT, UINT_PTR, DWORD) {
+    if (!g_message.dlg) return;
+    int selected = -1;
+    if (g_message.spec.title == L"传输详情") selected = 1;
+    else if (g_message.spec.title == L"断点续传") selected = 0;
+    if (selected < 0) return;
+    RECT client{}; GetClientRect(g_message.dlg, &client);
+    const auto buttons = msgButtonRects(client, static_cast<int>(g_message.spec.buttons.size()));
+    if (selected >= static_cast<int>(buttons.size())) return;
+    const RECT r = buttons[static_cast<std::size_t>(selected)];
+    ++retryDialogs;
+    SendMessageW(g_message.dlg, WM_LBUTTONUP, 0, MAKELPARAM((r.left+r.right)/2, (r.top+r.bottom)/2));
+}
 void check(bool value, const char* message) {
     ++checks;
     if (!value) throw std::runtime_error(message);
@@ -308,6 +334,34 @@ void networkRegression(int port, const std::string& upload, const std::string& d
         });
     },
               "nested directory download completes");
+    {
+        std::ofstream extra(fixture / "folder-source" / "new.txt", std::ios::binary);
+        extra << "new-after-conflict";
+    }
+    conflictChoice = 0; conflictDialogs = 0;
+    const UINT_PTR skipTimer = SetTimer(nullptr, 0, 20, answerConflict);
+    auto conflictUpload = std::make_shared<std::atomic<bool>>(false);
+    g_app.fs->uploadDirectory(pathToUtf8(fixture / "folder-source"), "/folder-copy", conflictUpload, false);
+    waitUntil([&] {
+        const auto* task = findDownloadTask("/folder-copy", true, false, conflictUpload);
+        return task && task->state == SessionState::DownloadState::Done;
+    }, "folder upload skips a confirmed conflict and continues");
+    KillTimer(nullptr, skipTimer);
+    const auto* skipped = findDownloadTask("/folder-copy", true, false, conflictUpload);
+    check(conflictDialogs == 1 && skipped && skipped->filesDone == 1 && skipped->filesSkipped == 1,
+          "folder progress distinguishes transferred and skipped files");
+    conflictChoice = 1; conflictDialogs = 0;
+    const UINT_PTR cancelTimer = SetTimer(nullptr, 0, 20, answerConflict);
+    auto conflictDownload = std::make_shared<std::atomic<bool>>(false);
+    addDownloadTask("/folder-copy", L"folder-copy", 0, false, conflictDownload, false,
+                    pathToUtf8(fixture / "folder-download"), true);
+    g_app.fs->downloadDirectory("/folder-copy", pathToUtf8(fixture / "folder-download"), conflictDownload, false);
+    waitUntil([&] {
+        const auto* task = findDownloadTask("/folder-copy", false, false, conflictDownload);
+        return task && task->state == SessionState::DownloadState::Cancelled;
+    }, "folder download cancels at a conflict");
+    KillTimer(nullptr, cancelTimer);
+    check(conflictDialogs == 1, "folder download asks before touching an existing file");
     auto uploadCancel = std::make_shared<std::atomic<bool>>(false);
     g_app.fs->upload(pathToUtf8(fixture / "resume-upload.bin"), "/partial-upload.bin", uploadCancel, true);
     waitUntil([&] { return completed(transferConnection, "/partial-upload.bin"); },
@@ -333,10 +387,67 @@ void networkRegression(int port, const std::string& upload, const std::string& d
     g_app.fs->download("/resume-download.bin", pathToUtf8(fixture / "partial-download.bin"), resumeCancel, true);
     waitUntil([&] { return completed(transferConnection, "/resume-download.bin"); },
               "partial download resumes");
+    auto retryCancel = std::make_shared<std::atomic<bool>>(false);
+    const std::string retryLocal = pathToUtf8(fixture / "retry-upload.bin");
+    g_app.fs->upload(retryLocal, "/retry-upload.bin", retryCancel, true);
+    waitUntil([&] {
+        const auto* task = findDownloadTask("/retry-upload.bin", true, false, retryCancel);
+        return task && task->state == SessionState::DownloadState::Failed;
+    }, "oversized destination records a retryable failure");
+    const auto* failedRetry = findDownloadTask("/retry-upload.bin", true, false, retryCancel);
+    check(failedRetry && !failedRetry->error.empty() && failedRetry->localPath == retryLocal,
+          "failed task retains its source and diagnostic");
+    const int failedId = failedRetry->id;
+    {
+        std::ofstream replacement(utf8ToPath(retryLocal), std::ios::binary | std::ios::trunc);
+        replacement << "prefix-data-finished";
+    }
+    retryDialogs = 0;
+    const UINT_PTR retryTimer = SetTimer(nullptr, 0, 20, answerRetry);
+    showTransferDetails(failedId);
+    KillTimer(nullptr, retryTimer);
+    check(retryDialogs == 2, "retry requires selecting resume and confirming its assumptions");
+    waitUntil([&] {
+        const auto& tasks = state(transferConnection)->downloads;
+        return std::any_of(tasks.begin(), tasks.end(), [failedId](const SessionState::DownloadTask& task) {
+            return task.remote == "/retry-upload.bin" && task.id != failedId &&
+                   task.state == SessionState::DownloadState::Done;
+        });
+    }, "failed upload resumes through the task details action");
+    auto cancelledBeforeStart = std::make_shared<std::atomic<bool>>(true);
+    g_app.fs->upload(retryLocal, "/cancel-preserve.bin", cancelledBeforeStart);
+    waitUntil([&] {
+        const auto* task = findDownloadTask("/cancel-preserve.bin", true, false, cancelledBeforeStart);
+        return task && task->state == SessionState::DownloadState::Cancelled;
+    }, "cancelling a queued upload stops before opening its destination");
+    std::vector<std::shared_ptr<std::atomic<bool>>> queuedTokens;
+    for (int i = 0; i < 8; ++i) {
+        auto token = std::make_shared<std::atomic<bool>>(false);
+        queuedTokens.push_back(token);
+        g_app.fs->upload(retryLocal, "/queued-" + std::to_string(i) + ".bin", token);
+    }
+    waitUntil([&] {
+        for (int i = 0; i < 8; ++i)
+            if (!findDownloadTask("/queued-" + std::to_string(i) + ".bin", true, false,
+                                  queuedTokens[static_cast<std::size_t>(i)])) return false;
+        return true;
+    }, "all queued uploads are visible before they complete");
+    waitUntil([&] {
+        for (int i = 0; i < 8; ++i) {
+            const auto* task = findDownloadTask("/queued-" + std::to_string(i) + ".bin", true, false,
+                                                queuedTokens[static_cast<std::size_t>(i)]);
+            if (!task || task->state != SessionState::DownloadState::Done) return false;
+        }
+        return true;
+    }, "queued uploads finish without losing task identity");
 
     // 断线自动重连：用和读线程失败时完全相同的那条消息模拟掉线
     if (std::getenv("RSHELL_TEST_RECONNECT")) {
         const UINT_PTR before = g_app.connectionId;
+        auto interrupted = std::make_shared<std::atomic<bool>>(false);
+        addDownloadTask("/retry-after-reconnect.bin", L"retry-after-reconnect.bin", 0, false,
+                        interrupted, true, retryLocal, false);
+        const int interruptedId = g_app.downloadSeq;
         // 真的把通道关掉（读线程退出），再补上它掉线时会发的那条消息
         g_app.shell->close();
         PostMessageW(g_app.main, WM_SHELL_CLOSED, before,
@@ -349,6 +460,24 @@ void networkRegression(int port, const std::string& upload, const std::string& d
         check(output(g_app).find("连接已自动恢复") != std::string::npos,
               "terminal reports the recovered connection");
         waitUntil([&] { return g_app.fsReady; }, "file channel comes back after the reconnect");
+        const auto interruptedTask = std::find_if(g_app.downloads.begin(), g_app.downloads.end(),
+            [interruptedId](const SessionState::DownloadTask& task) { return task.id == interruptedId; });
+        check(interruptedTask != g_app.downloads.end() &&
+              interruptedTask->state == SessionState::DownloadState::Failed &&
+              interruptedTask->localPath == retryLocal && !interruptedTask->error.empty(),
+              "interrupted task keeps its source and failure reason after reconnect");
+        retryDialogs = 0;
+        const UINT_PTR reconnectRetryTimer = SetTimer(nullptr, 0, 20, answerRetry);
+        showTransferDetails(interruptedId);
+        KillTimer(nullptr, reconnectRetryTimer);
+        check(retryDialogs == 2, "retry after reconnect asks for resume confirmation");
+        waitUntil([&] {
+            return std::any_of(g_app.downloads.begin(), g_app.downloads.end(),
+                [interruptedId](const SessionState::DownloadTask& task) {
+                    return task.remote == "/retry-after-reconnect.bin" && task.id != interruptedId &&
+                           task.state == SessionState::DownloadState::Done;
+                });
+        }, "interrupted upload can resume after reconnect");
 
         // 文件连接可能比 shell 晚恢复：模拟一次暂时性失败，验证重试确实建立
         // 新的 SFTP/AI 共用连接，而不是只改变界面状态。
@@ -372,6 +501,31 @@ void networkRegression(int port, const std::string& upload, const std::string& d
         },
                   "SFTP directory listing works after the file connection retry");
         closeSessionTab(1);
+        const auto shellBeforeRetry = g_app.shell;
+        const UINT_PTR shellConnection = g_app.connectionId;
+        g_app.fs->stop();
+        FsEvent sftpFailure; sftpFailure.kind = FsEventKind::Ready;
+        sftpFailure.message = "SFTP subsystem unavailable";
+        dispatchFs(g_app.connectionId, sftpFailure);
+        check(g_app.fsFailed && !g_app.fsReady && g_app.shell->running(),
+              "SFTP subsystem failure is separate from the running terminal");
+        check(statusConnectionText().find(L"终端已连 · 文件失败") != std::wstring::npos &&
+              statusDetailsText().find(L"SFTP subsystem unavailable") != std::wstring::npos,
+              "connection status and details expose the file-channel failure");
+        RECT mainClient{}; GetClientRect(g_app.main, &mainClient);
+        const StatusLayout failedStatus = statusGeometry(mainClient);
+        check(!IsRectEmpty(&failedStatus.reconnect), "file-channel retry is available on the status bar");
+        const RECT retry = fileChannelRetryRect(g_app.list);
+        check(!IsRectEmpty(&retry), "file-channel failure offers a retry button");
+        SendMessageW(g_app.list, WM_LBUTTONUP, 0,
+                     MAKELPARAM((retry.left + retry.right) / 2, (retry.top + retry.bottom) / 2));
+        check(g_app.fsRecoveryPending && !g_app.fsFailed, "file retry enters a reconnecting state");
+        waitUntil([&] { return g_app.fsReady && !g_app.fsRecoveryPending; },
+                  "manual retry restores the file channel");
+        check(g_app.shell == shellBeforeRetry && g_app.connectionId == shellConnection && g_app.shell->running(),
+              "retrying the file channel preserves the terminal connection");
+        check(statusConnectionText().find(L"终端已连 · 文件已连") != std::wstring::npos,
+              "connection status shows both channels restored");
         const bool aiWasOpen = g_app.aiOpen;
         if (!aiWasOpen) toggleAiPanel();
         check(g_app.aiTab && g_app.aiTab->resolveHostForTest("") == g_app.fs.get(),
@@ -401,6 +555,32 @@ void networkRegression(int port, const std::string& upload, const std::string& d
                    std::to_string(outcome.exitCode) + " output=[" + outcome.output + "]").c_str());
         }
     }
+}
+
+void sessionButtonBorderRegression() {
+    HDC screen = GetDC(g_app.main);
+    HDC dc = CreateCompatibleDC(screen);
+    const int previousDpi = g_app.dpi;
+    for (int dpi : {96, 144, 192}) {
+        g_app.dpi = dpi;
+        const int width = dp(112), height = dp(32);
+        HBITMAP bitmap = CreateCompatibleBitmap(screen, width, height);
+        HGDIOBJ old = SelectObject(dc, bitmap);
+        const RECT rect{0, 0, width, height};
+        fillRect(dc, rect, dlg::bgCard);
+        dlg::paintButton(dc, rect, L"", false, false, false, false, true);
+        const COLORREF fill = toColorRef(dlg::bgBtn);
+        const COLORREF right = GetPixel(dc, width - 1, height / 2);
+        const COLORREF bottom = GetPixel(dc, width / 2, height - 1);
+        check(right != fill && bottom != fill && right != toColorRef(dlg::bgCard) &&
+              bottom != toColorRef(dlg::bgCard),
+              "button right and bottom borders remain inside their drawing area");
+        SelectObject(dc, old);
+        DeleteObject(bitmap);
+    }
+    g_app.dpi = previousDpi;
+    DeleteDC(dc);
+    ReleaseDC(g_app.main, screen);
 }
 
 void sessionMgrLayoutRegression() {
@@ -760,8 +940,63 @@ void aiUnlockCancelRegression() {
     check(promptsWithoutVault == 0, "no unlock prompt when the vault file does not exist");
     check(direct->settingsOpen(), "without a vault the settings form opens directly");
 
+    // 窄面板和高 DPI 下，下拉框要可用，滚轮和子输入框都能带表单滚到保存按钮。
+    ai::AiTabContext compact = noVault;
+    compact.settingsDpiOverrideForTest = 144;
+    ai::AiTab* compactTab = ai::AiTab::create(g_app.main, compact);
+    check(compactTab != nullptr, "small high-DPI settings panel is created");
+    compactTab->setBounds(RECT{0, 0, 300, 240});
+    compactTab->startSettings(false);
+    check(compactTab->settingsMaxScrollForTest() > 0, "small high-DPI settings can scroll");
+    HWND provider = compactTab->settingsProviderComboForTest();
+    HWND search = compactTab->settingsSearchComboForTest();
+    check(provider && search && SendMessageW(provider, CB_GETCOUNT, 0, 0) == 4 &&
+          SendMessageW(search, CB_GETCOUNT, 0, 0) == 3, "provider and search choices use dropdowns");
+    SendMessageW(provider, CB_SETCURSEL, 1, 0);
+    SendMessageW(compactTab->window(), WM_COMMAND, MAKEWPARAM(0, CBN_SELCHANGE), reinterpret_cast<LPARAM>(provider));
+    wchar_t baseUrl[512]{};
+    GetWindowTextW(compactTab->settingsEditForTest(), baseUrl, 512);
+    check(wcsstr(baseUrl, L"opencode.ai") != nullptr, "selecting a provider fills its API address");
+    SendMessageW(search, CB_SETCURSEL, 2, 0);
+    SendMessageW(compactTab->window(), WM_COMMAND, MAKEWPARAM(0, CBN_SELCHANGE), reinterpret_cast<LPARAM>(search));
+    HWND edit = compactTab->settingsEditForTest();
+    check(edit != nullptr, "settings edit exists");
+    RECT editRect{};
+    GetWindowRect(edit, &editRect);
+    HDC editDc = GetDC(edit);
+    HFONT editFont = reinterpret_cast<HFONT>(SendMessageW(edit, WM_GETFONT, 0, 0));
+    HGDIOBJ oldFont = editFont ? SelectObject(editDc, editFont) : nullptr;
+    TEXTMETRICW editMetrics{};
+    GetTextMetricsW(editDc, &editMetrics);
+    if (oldFont) SelectObject(editDc, oldFont);
+    ReleaseDC(edit, editDc);
+    check(editRect.bottom - editRect.top >= editMetrics.tmHeight &&
+          editRect.bottom - editRect.top <= editMetrics.tmHeight + 2 * GetSystemMetrics(SM_CYEDGE) + 3,
+          "high-DPI single-line input fits the font without excess vertical space");
+    for (int i = 0; i < 30; ++i)
+        SendMessageW(edit, WM_MOUSEWHEEL, MAKEWPARAM(0, static_cast<WORD>(-WHEEL_DELTA)), 0);
+    const RECT save = compactTab->settingsSaveRectForTest();
+    check(compactTab->settingsScrollForTest() == compactTab->settingsMaxScrollForTest() &&
+          save.top >= 0 && save.bottom <= 240 && save.right <= 300,
+          "wheel over an edit reaches the visible save button");
+    const char* oldConfig = std::getenv("RSHELL_AI_CONFIG");
+    const std::string previousConfig = oldConfig ? oldConfig : "";
+    const auto tempConfig = std::filesystem::temp_directory_path() /
+        ("rshell-layout-save-" + std::to_string(GetCurrentProcessId()) + "-" + std::to_string(GetTickCount64()) + ".ini");
+    _putenv_s("RSHELL_AI_CONFIG", pathToUtf8(tempConfig).c_str());
+    SendMessageW(compactTab->window(), WM_LBUTTONUP, 0,
+                 MAKELPARAM((save.left + save.right) / 2, (save.top + save.bottom) / 2));
+    check(!compactTab->settingsOpen(), "save remains clickable after scrolling");
+    const auto saved = ai::loadAiSettings(pathToUtf8(tempConfig));
+    check(saved.provider == "opencode-go" && saved.searchProvider == "exa",
+          "dropdown selections persist when settings are saved");
+    _putenv_s("RSHELL_AI_CONFIG", previousConfig.c_str());
+    std::error_code cleanupError;
+    std::filesystem::remove(tempConfig, cleanupError);
+
     ai::AiTab::destroy(cancelled);
     ai::AiTab::destroy(direct);
+    ai::AiTab::destroy(compactTab);
 }
 
 // 状态栏详情浮窗：悬停时出现，鼠标在状态栏内继续移动不应把它抖没
@@ -1655,6 +1890,41 @@ void reasoningWrapRegression() {
     ReleaseDC(nullptr, screen);
 }
 
+void aiTaskStateRegression() {
+    const char* mode = std::getenv("RSHELL_AI_STATE_TEST");
+    if (!mode) return;
+    const bool approval = std::string(mode) == "approval";
+    ProbeSessionBackend store;
+    ai::AiTabContext context;
+    context.uiFont = g_app.uiFont; context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font; context.captionFont = g_app.tinyFont;
+    context.hosts = [&store]() {
+        ai::AiHostInfo host; host.id = 7; host.label = L"state-probe"; host.backend = &store;
+        return std::vector<ai::AiHostInfo>{host};
+    };
+    context.activeHostId = []() { return static_cast<std::uintptr_t>(7); };
+    context.apiKeyOverride = "test-key";
+    ai::AiTab* tab = ai::AiTab::create(g_app.main, context);
+    check(tab != nullptr, "AI state test panel is created");
+    tab->setBounds(RECT{0, 0, 520, 760});
+    tab->show(true);
+    tab->sendMessage(L"检查状态");
+    check(tab->statusForTest() == L"生成中…", "new AI task reports generating");
+    if (approval) {
+        waitUntil([&] { return tab->statusForTest() == L"等待确认"; }, "AI shows waiting for approval");
+        tab->cancelTurn();
+        waitUntil([&] { return tab->statusForTest() == L"已停止"; }, "stopping during approval reports stopped");
+    } else {
+        waitUntil([&] { return tab->statusForTest() == L"已达到步数上限"; }, "AI reports the step limit");
+        const auto& items = tab->transcript();
+        check(std::any_of(items.begin(), items.end(), [](const ai::ChatItem& item) {
+            return item.body.find(L"调整单次任务最大步数") != std::wstring::npos;
+        }), "step-limit notice explains how to continue");
+    }
+    std::cout << "STATE " << mode << " passed\n";
+    ai::AiTab::destroy(tab);
+}
+
 // 流式平滑：假服务器每 350ms 推一批 25 字，界面必须分很多小步展示。
 // 由 tests/ai_stream_e2e.py 设置环境变量后触发，平时跳过。
 void aiStreamSmoothingRegression() {
@@ -1911,6 +2181,42 @@ void aiPanelPartialPaintRegression() {
     ReleaseDC(nullptr, screen);
 }
 
+void transferListRegression() {
+    auto saved = std::move(g_app.downloads);
+    const bool wasOpen = g_app.downloadsOpen;
+    const int oldScroll = g_app.downloadScroll;
+    g_app.downloads.clear();
+    g_app.downloadsOpen = true;
+    g_app.downloadScroll = 0;
+    for (int i = 0; i < 8; ++i) {
+        SessionState::DownloadTask task;
+        task.id = 800 + i; task.remote = "/same"; task.name = L"item";
+        task.cancel = std::make_shared<std::atomic<bool>>(false);
+        g_app.downloads.push_back(task);
+    }
+    auto layout = downloadsPanelGeometry(g_app.main);
+    check(layout.rows.size() == 5 && layout.rows.front().taskIndex == 0,
+          "transfer list initially shows five tasks");
+    POINT screen{(layout.band.left + layout.band.right) / 2, (layout.band.top + layout.band.bottom) / 2};
+    ClientToScreen(g_app.main, &screen);
+    check(scrollDownloadPanel(screen, -WHEEL_DELTA), "wheel over the transfer panel is handled");
+    layout = downloadsPanelGeometry(g_app.main);
+    check(g_app.downloadScroll == 2 && layout.rows.front().taskIndex == 2,
+          "wheel reveals later tasks and preserves their actual indices");
+    const RECT button = layout.rows.front().cancel;
+    const DownloadHit hit = hitDownloadUi(g_app.main, POINT{(button.left + button.right) / 2,
+                                                            (button.top + button.bottom) / 2});
+    check(hit.cancelIndex == 2, "scrolled cancel action targets the right task");
+    FsEvent progress; progress.kind = FsEventKind::Progress; progress.path = "/same";
+    progress.cancel = g_app.downloads[0].cancel; progress.bytes = 42; progress.total = 100;
+    handleFsEvent(progress);
+    check(g_app.downloads[0].done == 42 && g_app.downloads[7].done == 0,
+          "same-path progress is routed by transfer token");
+    g_app.downloads = std::move(saved);
+    g_app.downloadsOpen = wasOpen;
+    g_app.downloadScroll = oldScroll;
+}
+
 // 检查更新：发现新版本时，标题栏出现可点击的提示胶囊
 void updateCheckRegression() {
     check(!g_app.updateTag.empty(), "the title bar exposes the current version");
@@ -2067,6 +2373,7 @@ int main(int argc, char** argv) {
         stateRegression();
         panelScrollRegression();
         sessionMgrLayoutRegression();
+        sessionButtonBorderRegression();
         aiTabRegression();
         aiSessionHistoryRegression();
         aiUnlockCancelRegression();
@@ -2077,6 +2384,7 @@ int main(int argc, char** argv) {
         fsCollapseRegression();
         pasteFocusRegression();
         aiPanelPaintBench();
+        aiTaskStateRegression();
         aiStreamSmoothingRegression();
         reasoningStreamRegression();
         aiPanelFullButtonRegression();
@@ -2088,6 +2396,7 @@ int main(int argc, char** argv) {
         submenuHoverRegression();
         updateToggleRegression();
         fileEditRegression();
+        transferListRegression();
         updateCheckRegression();
         titleAiButtonRegression();
         terminalDockReflowRegression();

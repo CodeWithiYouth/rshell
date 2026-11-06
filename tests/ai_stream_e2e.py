@@ -16,7 +16,7 @@ from sse_fake_server import full_text, reasoning_text, start_server
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--exe", required=True)
-    parser.add_argument("--mode", choices=["text", "reasoning"], default="text")
+    parser.add_argument("--mode", choices=["text", "reasoning", "limit", "approval"], default="text")
     args = parser.parse_args()
 
     executable = Path(args.exe).resolve()
@@ -31,7 +31,8 @@ def main() -> int:
             "model=fake-model\n"
             "redact_secrets=1\n"
             "auto_approve=0\n"
-            "save_sessions=0\n",
+            "save_sessions=0\n"
+            + ("max_steps=1\nlimit_steps=1\n" if args.mode == "limit" else ""),
             encoding="utf-8",
         )
 
@@ -39,7 +40,10 @@ def main() -> int:
         env["RSHELL_AI_CONFIG"] = str(ini)
         env["RSHELL_AI_PERF"] = "1"
         env["RSHELL_NO_UI_SAVE"] = "1"
-        if args.mode == "reasoning":
+        if args.mode in ("limit", "approval"):
+            env["RSHELL_AI_STATE_TEST"] = args.mode
+            marker = "STATE " + args.mode
+        elif args.mode == "reasoning":
             env["RSHELL_AI_REASON_TEST"] = "1"
             env["RSHELL_AI_EXPECT_REASONING"] = str(len(reasoning_text()))
             marker = "REASON steps="
@@ -63,7 +67,7 @@ def main() -> int:
 
         output = (result.stdout or "") + (result.stderr or "")
         for line in output.splitlines():
-            if "STREAM" in line or "REASON" in line or "PASS" in line or "FAIL" in line or "delta" in line:
+            if "STREAM" in line or "REASON" in line or "STATE" in line or "PASS" in line or "FAIL" in line or "delta" in line:
                 print(line)
         if result.returncode != 0:
             print(output)

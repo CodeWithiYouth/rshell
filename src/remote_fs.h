@@ -75,19 +75,26 @@ struct FsEvent {
     std::string message;
     std::uint64_t bytes = 0;  // Progress：已传输字节
     std::uint64_t total = 0;  // Started/Progress：总字节（0 表示未知）
+    std::string localPath;     // 本地源或目标，供重试使用
+    std::string currentFile;   // 文件夹中正在处理的条目
+    std::uint64_t filesDone = 0;
+    std::uint64_t filesSkipped = 0;
+    bool directory = false;
+    bool queued = false;
     // 方向：true 表示上传。上传和下载可能并发（同一远端路径也有可能出现），
     // UI 侧按 path + 方向两项匹配任务，避免进度写到别的条目上。
     bool upload = false;
-    // Started：拖动下载这一项的取消开关（资源管理器的复制线程是异步的，
-    // 只能让开关跟着事件过来，UI 侧没法按路径回头去找）
+    // 取消开关同时标识一次传输，避免同路径任务的事件混淆。
     std::shared_ptr<std::atomic<bool>> cancel;
     std::vector<RemoteEntry> entries;
 };
 
 struct RemoteFsCallbacks {
-    // 都在工作线程触发，GUI 侧自行 PostMessage 回 UI 线程
+    // 排队通知在调用线程触发，其余通常在工作线程；GUI 侧统一 PostMessage 回 UI。
     std::function<void(const FsEvent&)> onEvent;
     std::function<void(const RemoteStats&)> onStats;
+    // 冲突时返回 true 跳过当前文件，false 取消整个文件夹传输。
+    std::function<bool(const std::string&)> onConflict;
 };
 
 class RemoteFs {

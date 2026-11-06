@@ -64,6 +64,7 @@ struct AiTabContext {
     std::function<int(POINT, const std::vector<std::wstring>&)> pickFromList;
     // 直接指定 API Key（不写保险库）。生产走 vault，这里只给自动化测试和宿主预置用。
     std::string apiKeyOverride;
+    unsigned int settingsDpiOverrideForTest = 0;
 };
 
 class AiTab {
@@ -82,6 +83,7 @@ public:
     std::wstring hostLabel() const { return currentHostLabel(); }
     // 供回归测试观察对话内容与「历史」按钮位置
     const std::vector<ChatItem>& transcript() const { return panel_.items(); }
+    const std::wstring& statusForTest() const { return panel_.statusForTest(); }
     // 上一帧绘制耗时（毫秒）；流式/长文本的性能回归用它观察有没有卡帧
     int lastPaintMs() const;
     // 回归测试：把整个面板画到给定 DC 上并返回耗时（毫秒，QPC 精度）。
@@ -98,6 +100,12 @@ public:
     void startSettings(bool unlockOnly = false);
     // 设置表单是否展开（回归测试用：取消解锁时不能打开）
     bool settingsOpen() const { return settingsOpen_; }
+    RECT settingsSaveRectForTest() const;
+    HWND settingsProviderComboForTest() const;
+    HWND settingsSearchComboForTest() const;
+    HWND settingsEditForTest() const;
+    int settingsScrollForTest() const;
+    int settingsMaxScrollForTest() const;
     // 宿主也可以直接发一条（命令行入口、自动化测试）
     void sendMessage(const std::wstring& text);
     void cancelTurn();

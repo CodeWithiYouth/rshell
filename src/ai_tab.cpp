@@ -24,7 +24,9 @@
 #include "ui_theme.h"
 #include "util.h"
 #include "vault.h"
+#include "win_compat.h"
 
+#include <commctrl.h>
 #include <imm.h>
 #include <windowsx.h>
 
@@ -69,6 +71,24 @@ constexpr int kSaveSessionTop = kAutoTop + kAutoH + 8;
 constexpr int kStepTop = kSaveSessionTop + kAutoH + 8;
 constexpr int kButtonTop = kStepTop + kAutoH + 14;
 constexpr int kButtonHeight = 34;
+
+LRESULT CALLBACK settingsControlProc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
+                                     UINT_PTR, DWORD_PTR data) {
+    const HWND owner = reinterpret_cast<HWND>(data);
+    if (message == WM_MOUSEWHEEL && IsWindow(owner)) {
+        SendMessageW(owner, message, wp, lp);
+        return 0;
+    }
+    if (message == WM_KEYDOWN && wp == VK_TAB && IsWindow(owner)) {
+        HWND current = hwnd;
+        if (GetParent(current) != owner) current = GetParent(current);
+        HWND next = GetNextDlgTabItem(owner, current, (GetKeyState(VK_SHIFT) & 0x8000) != 0);
+        if (next) SetFocus(next);
+        return 0;
+    }
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(hwnd, settingsControlProc, 1);
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
 
 // RSHELL_AI_PERF=1 时把流式节奏写进 ~/.rshell/ai-perf.log：
 // 每次收到多少字、距上次多久、每一帧画了多久。用来区分「网络一段一段给」
@@ -404,7 +424,7 @@ struct AiTab::Impl {
     HWND editKey = nullptr;
     HWND modelCombo = nullptr;
     std::string draftProvider;
-    std::vector<RECT> providerRects;
+    HWND providerCombo = nullptr;
     RECT fetchRect{};
     bool fetching = false;
     std::string fetchStatus;
@@ -417,12 +437,17 @@ struct AiTab::Impl {
     RECT stepRect{};
     bool draftLimitSteps = true;
     HWND editMaxSteps = nullptr;
+    int settingsScroll = 0;
+    int settingsMaxScroll = 0;
+    int settingsDpi = 96;
+    int providerExtra = 0;
+    int searchExtra = 0;
     // 联网搜索：后端 id（空 = 关闭）+ 当前后端的 Key（保险库）
     std::string searchProvider;
     std::string searchKey;
     std::string draftSearchProvider;
     HWND editSearchKey = nullptr;
-    std::vector<RECT> searchProviderRects;  // 关闭 / TinyFish / Exa 三个 chip
+    HWND searchCombo = nullptr;
 };
 
 AiTab* AiTab::create(HWND parent, AiTabContext context) {
@@ -590,6 +615,13 @@ void AiTab::setFullScreen(bool full) {
 int AiTab::lastPaintMs() const {
     return impl_->lastPaintMs;
 }
+
+RECT AiTab::settingsSaveRectForTest() const { return impl_->saveRect; }
+HWND AiTab::settingsProviderComboForTest() const { return impl_->providerCombo; }
+HWND AiTab::settingsSearchComboForTest() const { return impl_->searchCombo; }
+HWND AiTab::settingsEditForTest() const { return impl_->editBase; }
+int AiTab::settingsScrollForTest() const { return impl_->settingsScroll; }
+int AiTab::settingsMaxScrollForTest() const { return impl_->settingsMaxScroll; }
 
 double AiTab::paintForTest(HDC dc, const RECT* dirty) {
     LARGE_INTEGER freq{}, start{};
@@ -849,12 +881,17 @@ void AiTab::sendMessage(const std::wstring& text) {
         if (!impl_->closing) saveSessionSnapshot(turnHost, turnLabel);
 
         std::wstring status;
+        std::wstring guidance;
         bool ok = true;
-        if (turn.cancelled) {
+        if (turn.cancelled || impl_->cancel.load()) {
             status = L"已停止";
             ok = false;
         } else if (turn.aborted) {
             status = L"已终止任务";
+            ok = false;
+        } else if (turn.stepLimit) {
+            status = L"已达到步数上限";
+            guidance = L"任务已暂停。可在 AI 设置中调整单次任务最大步数，或发送消息继续。";
             ok = false;
         } else if (!turn.error.empty()) {
             status = toWideText(turn.error);
@@ -862,7 +899,7 @@ void AiTab::sendMessage(const std::wstring& text) {
         } else {
             status = L"就绪";
         }
-        postEvent(EventKind::TurnDone, status, L"", L"", ok);
+        postEvent(EventKind::TurnDone, status, guidance, L"", ok);
     });
 }
 
@@ -1073,6 +1110,7 @@ void AiTab::handleEvent(Event& event) {
                 impl_->assistantIndex = none;
             }
             panel_.addTool(event.a, event.b, event.ok, event.c);
+            if (impl_->busy && !impl_->cancel.load()) panel_.setStatus(L"生成中…");
             requestRepaint();
             return;
         }
@@ -1101,7 +1139,8 @@ void AiTab::handleEvent(Event& event) {
             turnHostId = 0;  // 这一轮结束，下次重新按当前标签取主机
             panel_.setBusy(false);
             panel_.setStatus(event.a);
-            if (!event.ok && !event.a.empty()) panel_.addNotice(event.a, true);
+            if (!event.ok && !event.a.empty())
+                panel_.addNotice(event.b.empty() ? event.a : event.b, event.a != L"已停止");
             requestRepaint();
             return;
         }
@@ -1154,7 +1193,7 @@ void AiTab::onPanelApproval(std::size_t index, bool allowed) {
         impl_->pending.reset();
     }
     if (!slot) return;
-    panel_.setStatus(allowed ? L"已允许" : L"已拒绝");
+    panel_.setStatus(allowed ? L"正在执行…" : L"生成中…");
     {
         std::lock_guard<std::mutex> lock(slot->mutex);
         slot->decision = allowed ? ApprovalDecision::Allow : ApprovalDecision::Deny;
@@ -1390,9 +1429,18 @@ void AiTab::startSettings(bool unlockOnly) {
     createSettingsControls();
     impl_->draftProvider = impl_->settings.provider;
     impl_->draftSearchProvider = impl_->settings.searchProvider;
+    int providerIndex = 0;
+    const auto& presets = aiProviderPresets();
+    for (std::size_t i = 0; i < presets.size(); ++i)
+        if (presets[i].id == impl_->draftProvider) providerIndex = static_cast<int>(i + 1);
+    SendMessageW(impl_->providerCombo, CB_SETCURSEL, providerIndex, 0);
+    const int searchIndex = impl_->draftSearchProvider == "tinyfish" ? 1 :
+                            impl_->draftSearchProvider == "exa" ? 2 : 0;
+    SendMessageW(impl_->searchCombo, CB_SETCURSEL, searchIndex, 0);
     impl_->draftAutoApprove = impl_->settings.autoApprove;
     impl_->draftSaveSessions = impl_->settings.saveSessions;
     impl_->draftLimitSteps = impl_->settings.limitSteps;
+    impl_->settingsScroll = 0;
     SetWindowTextW(impl_->editMaxSteps, std::to_wstring(impl_->settings.maxSteps).c_str());
     EnableWindow(impl_->editMaxSteps, impl_->draftLimitSteps);
     impl_->fetchStatus.clear();
@@ -1402,7 +1450,7 @@ void AiTab::startSettings(bool unlockOnly) {
     SetWindowTextW(impl_->editSearchKey, L"");  // 已存的 Key 不回显，留空表示不改
 
     layoutSettings();
-    HWND controls[] = {impl_->editBase, impl_->editKey, impl_->modelCombo, impl_->editSearchKey,
+    HWND controls[] = {impl_->providerCombo, impl_->searchCombo, impl_->editBase, impl_->editKey, impl_->modelCombo, impl_->editSearchKey,
                        impl_->editMaxSteps};
     for (HWND control : controls)
         if (control) ShowWindow(control, SW_SHOW);
@@ -1413,10 +1461,11 @@ void AiTab::startSettings(bool unlockOnly) {
 void AiTab::createSettingsControls() {
     auto makeEdit = [this](DWORD style) {
         HWND edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"",
-                                    WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | style, 0, 0, 10, 10,
+                                    WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL | style, 0, 0, 10, 10,
                                     window_, nullptr, GetModuleHandleW(nullptr), nullptr);
         if (edit && context_.uiFont)
             SendMessageW(edit, WM_SETFONT, reinterpret_cast<WPARAM>(context_.uiFont), TRUE);
+        if (edit) SetWindowSubclass(edit, settingsControlProc, 1, reinterpret_cast<DWORD_PTR>(window_));
         return edit;
     };
     if (!impl_->editBase) impl_->editBase = makeEdit(0);
@@ -1426,15 +1475,44 @@ void AiTab::createSettingsControls() {
         impl_->editMaxSteps = makeEdit(ES_NUMBER);
         SendMessageW(impl_->editMaxSteps, EM_SETLIMITTEXT, 5, 0);
     }
+    auto makeChoice = [this]() {
+        HWND combo = CreateWindowExW(0, L"COMBOBOX", L"",
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+            0, 0, 10, 240, window_, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (combo && context_.uiFont)
+            SendMessageW(combo, WM_SETFONT, reinterpret_cast<WPARAM>(context_.uiFont), TRUE);
+        if (combo) SetWindowSubclass(combo, settingsControlProc, 1, reinterpret_cast<DWORD_PTR>(window_));
+        return combo;
+    };
+    if (!impl_->providerCombo) {
+        impl_->providerCombo = makeChoice();
+        SendMessageW(impl_->providerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"自定义"));
+        for (const auto& preset : aiProviderPresets()) {
+            const std::wstring label = toWideText(preset.name);
+            SendMessageW(impl_->providerCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(label.c_str()));
+        }
+    }
+    if (!impl_->searchCombo) {
+        impl_->searchCombo = makeChoice();
+        const SearchProvider providers[] = {SearchProvider::None, SearchProvider::TinyFish, SearchProvider::Exa};
+        for (SearchProvider provider : providers)
+            SendMessageW(impl_->searchCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(searchProviderName(provider)));
+    }
     if (!impl_->modelCombo) {
         impl_->modelCombo = CreateWindowExW(0, L"COMBOBOX", L"",
-                                            WS_CHILD | WS_VISIBLE | WS_VSCROLL | CBS_DROPDOWN |
+                                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWN |
                                                 CBS_AUTOHSCROLL,
                                             0, 0, 10, 240, window_, nullptr,
                                             GetModuleHandleW(nullptr), nullptr);
         if (impl_->modelCombo && context_.uiFont)
             SendMessageW(impl_->modelCombo, WM_SETFONT,
                          reinterpret_cast<WPARAM>(context_.uiFont), TRUE);
+        if (impl_->modelCombo) {
+            SetWindowSubclass(impl_->modelCombo, settingsControlProc, 1, reinterpret_cast<DWORD_PTR>(window_));
+            COMBOBOXINFO info{}; info.cbSize = sizeof(info);
+            if (GetComboBoxInfo(impl_->modelCombo, &info) && info.hwndItem)
+                SetWindowSubclass(info.hwndItem, settingsControlProc, 1, reinterpret_cast<DWORD_PTR>(window_));
+        }
     }
 }
 
@@ -1442,58 +1520,57 @@ void AiTab::layoutSettings() {
     if (!impl_->editBase) return;
     RECT client{};
     GetClientRect(window_, &client);
-    const int left = 24;
-    const int width = std::max(120, static_cast<int>(client.right) - left * 2);
+    impl_->settingsDpi = static_cast<int>(context_.settingsDpiOverrideForTest
+        ? context_.settingsDpiOverrideForTest : wincompat::windowDpi(window_));
+    const auto px = [this](int value) { return MulDiv(value, impl_->settingsDpi, 96); };
+    const int left = std::min(px(24), std::max(2, static_cast<int>(client.right) / 10));
+    const int width = std::max(1, static_cast<int>(client.right) - left * 2 - px(10));
 
-    // 预设 chips：自定义 + 内置三家
-    impl_->providerRects.clear();
-    int chipX = left;
-    const std::wstring labels[] = {L"自定义", L"OpenCode Go", L"Command Code", L"Cline"};
-    HDC dc = GetDC(window_);
-    for (const std::wstring& label : labels) {
-        const int chipW = textWidthOf(dc, label, context_.uiFont) + 20;
-        impl_->providerRects.push_back(RECT{chipX, kProviderTop, chipX + chipW,
-                                            kProviderTop + kProviderH});
-        chipX += chipW + 6;
+    impl_->providerExtra = 0;
+    impl_->searchExtra = px(kFieldGap);
+    const int fieldTop = px(kFieldTop);
+    const int comboTop = fieldTop + px(kFieldGap * 2 + kEditOffset);
+    const int fetchW = std::min(px(kFetchW), std::max(1, width / 2));
+    impl_->fetchRect = RECT{left + width - fetchW, comboTop, left + width, comboTop + px(kEditHeight)};
+    const int searchTop = fieldTop + px(kFieldGap * 3);
+    const int extra = impl_->searchExtra;
+    impl_->settingsMaxScroll = std::max(0, px(kButtonTop + kButtonHeight + 42) + extra -
+                                           static_cast<int>(client.bottom));
+    impl_->settingsScroll = std::clamp(impl_->settingsScroll, 0, impl_->settingsMaxScroll);
+    const int scroll = impl_->settingsScroll;
+    OffsetRect(&impl_->fetchRect, 0, -scroll);
+    // 单行 EDIT 的文字从顶部开始绘制；按实际字体收紧高度，避免多余空间堆在文字下方。
+    int editHeight = px(kEditHeight);
+    HDC editDc = GetDC(impl_->editBase);
+    if (editDc) {
+        HFONT font = reinterpret_cast<HFONT>(SendMessageW(impl_->editBase, WM_GETFONT, 0, 0));
+        HGDIOBJ oldFont = font ? SelectObject(editDc, font) : nullptr;
+        TEXTMETRICW metrics{};
+        if (GetTextMetricsW(editDc, &metrics))
+            editHeight = std::min(editHeight, static_cast<int>(metrics.tmHeight) +
+                                  2 * GetSystemMetrics(SM_CYEDGE) + px(2));
+        if (oldFont) SelectObject(editDc, oldFont);
+        ReleaseDC(impl_->editBase, editDc);
     }
-    ReleaseDC(window_, dc);
-
-    MoveWindow(impl_->editBase, left, kFieldTop + kEditOffset, width, kEditHeight, TRUE);
-    MoveWindow(impl_->editKey, left, kFieldTop + kFieldGap + kEditOffset, width, kEditHeight,
-               TRUE);
-    const int comboTop = kFieldTop + kFieldGap * 2 + kEditOffset;
-    impl_->fetchRect = RECT{left + width - kFetchW, comboTop, left + width,
-                            comboTop + kEditHeight};
-    MoveWindow(impl_->modelCombo, left, comboTop, width - kFetchW - 8, 240, TRUE);
-
-    // 第四行：联网搜索 Key（密码框），同一行的右侧放后端 chip
-    const int searchTop = kFieldTop + kFieldGap * 3;
-    MoveWindow(impl_->editSearchKey, left, searchTop + kEditOffset, width, kEditHeight, TRUE);
-
-    impl_->searchProviderRects.clear();
-    {
-        const SearchProvider providers[] = {SearchProvider::None, SearchProvider::TinyFish,
-                                            SearchProvider::Exa};
-        int chipX = left + width;  // 右对齐往回排
-        HDC dc = GetDC(window_);
-        for (int i = 2; i >= 0; --i) {
-            const int chipW = textWidthOf(dc, searchProviderName(providers[i]), context_.captionFont) + 18;
-            chipX -= chipW;
-            impl_->searchProviderRects.resize(3);
-            impl_->searchProviderRects[static_cast<std::size_t>(i)] =
-                RECT{chipX, searchTop, chipX + chipW, searchTop + 22};
-            chipX -= 6;
-        }
-        ReleaseDC(window_, dc);
-    }
-
-    impl_->autoRect = RECT{left, kAutoTop, left + width, kAutoTop + kAutoH};
-    impl_->saveSessionRect = RECT{left, kSaveSessionTop, left + width, kSaveSessionTop + kAutoH};
-    impl_->stepRect = RECT{left, kStepTop, left + width - 76, kStepTop + kAutoH};
-    MoveWindow(impl_->editMaxSteps, left + width - 70, kStepTop, 70, kAutoH, TRUE);
-    impl_->saveRect = RECT{left, kButtonTop, left + 96, kButtonTop + kButtonHeight};
-    impl_->cancelRect = RECT{left + 108, kButtonTop, left + 108 + 96,
-                             kButtonTop + kButtonHeight};
+    const int editInset = (px(kEditHeight) - editHeight) / 2;
+    const int stepInset = std::max(0, (px(kAutoH) - editHeight) / 2);
+    MoveWindow(impl_->providerCombo, left, px(kProviderTop) - scroll, width, px(240), TRUE);
+    MoveWindow(impl_->searchCombo, left, searchTop + px(kEditOffset) - scroll, width, px(240), TRUE);
+    MoveWindow(impl_->editBase, left, fieldTop + px(kEditOffset) + editInset - scroll, width, editHeight, TRUE);
+    MoveWindow(impl_->editKey, left, fieldTop + px(kFieldGap + kEditOffset) + editInset - scroll, width, editHeight, TRUE);
+    MoveWindow(impl_->modelCombo, left, comboTop - scroll, std::max(1, width - fetchW - px(8)), px(240), TRUE);
+    MoveWindow(impl_->editSearchKey, left, searchTop + px(kEditOffset) + impl_->searchExtra + editInset - scroll,
+               width, editHeight, TRUE);
+    impl_->autoRect = RECT{left, px(kAutoTop) + extra - scroll, left + width, px(kAutoTop + kAutoH) + extra - scroll};
+    impl_->saveSessionRect = RECT{left, px(kSaveSessionTop) + extra - scroll, left + width, px(kSaveSessionTop + kAutoH) + extra - scroll};
+    const int stepWidth = std::min(px(70), std::max(1, width / 3));
+    impl_->stepRect = RECT{left, px(kStepTop) + extra - scroll, left + width - stepWidth - px(6), px(kStepTop + kAutoH) + extra - scroll};
+    MoveWindow(impl_->editMaxSteps, left + width - stepWidth, px(kStepTop) + extra + stepInset - scroll,
+               stepWidth, std::min(editHeight, px(kAutoH)), TRUE);
+    const int buttonW = std::min(px(96), std::max(1, (width - px(12)) / 2));
+    const int buttonTop = px(kButtonTop) + extra - scroll;
+    impl_->saveRect = RECT{left, buttonTop, left + buttonW, buttonTop + px(kButtonHeight)};
+    impl_->cancelRect = RECT{left + buttonW + px(12), buttonTop, left + buttonW * 2 + px(12), buttonTop + px(kButtonHeight)};
 }
 
 void AiTab::startModelFetch() {
@@ -1636,6 +1713,8 @@ void AiTab::finishSettings(bool save) {
     }
 
     settingsOpen_ = false;
+    ShowWindow(impl_->providerCombo, SW_HIDE);
+    ShowWindow(impl_->searchCombo, SW_HIDE);
     ShowWindow(impl_->editBase, SW_HIDE);
     ShowWindow(impl_->editKey, SW_HIDE);
     ShowWindow(impl_->modelCombo, SW_HIDE);
@@ -1669,6 +1748,50 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             if (settingsOpen_) layoutSettings();
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
+        }
+
+        case WM_COMMAND: {
+            if (settingsOpen_ && HIWORD(wParam) == CBN_SELCHANGE) {
+                const HWND control = reinterpret_cast<HWND>(lParam);
+                if (control == impl_->providerCombo) {
+                    const int selected = static_cast<int>(SendMessageW(control, CB_GETCURSEL, 0, 0));
+                    const auto& presets = aiProviderPresets();
+                    if (selected <= 0) impl_->draftProvider.clear();
+                    else if (static_cast<std::size_t>(selected - 1) < presets.size()) {
+                        impl_->draftProvider = presets[selected - 1].id;
+                        SetWindowTextW(impl_->editBase, toWideText(presets[selected - 1].baseUrl).c_str());
+                    }
+                    impl_->fetchStatus.clear();
+                } else if (control == impl_->searchCombo) {
+                    const int selected = static_cast<int>(SendMessageW(control, CB_GETCURSEL, 0, 0));
+                    static const char* ids[] = {"", "tinyfish", "exa"};
+                    impl_->draftSearchProvider = ids[selected >= 0 && selected < 3 ? selected : 0];
+                }
+            }
+            if (settingsOpen_ && lParam &&
+                (HIWORD(wParam) == EN_SETFOCUS || HIWORD(wParam) == CBN_SETFOCUS)) {
+                const HWND control = reinterpret_cast<HWND>(lParam);
+                if (control == impl_->providerCombo || control == impl_->searchCombo ||
+                    control == impl_->editBase || control == impl_->editKey ||
+                    control == impl_->modelCombo || control == impl_->editSearchKey ||
+                    control == impl_->editMaxSteps) {
+                    RECT controlRect{}, client{};
+                    GetWindowRect(control, &controlRect);
+                    MapWindowPoints(nullptr, window_, reinterpret_cast<POINT*>(&controlRect), 2);
+                    GetClientRect(window_, &client);
+                    const int margin = MulDiv(8, impl_->settingsDpi, 96);
+                    int shift = 0;
+                    if (controlRect.top < margin) shift = controlRect.top - margin;
+                    else if (controlRect.bottom > client.bottom - margin)
+                        shift = controlRect.bottom - (client.bottom - margin);
+                    if (shift) {
+                        impl_->settingsScroll = std::clamp(impl_->settingsScroll + shift, 0, impl_->settingsMaxScroll);
+                        layoutSettings();
+                        InvalidateRect(window_, nullptr, TRUE);
+                    }
+                }
+            }
+            return DefWindowProcW(window_, message, wParam, lParam);
         }
 
         case kAiEventMessage: {
@@ -1878,21 +2001,6 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         case WM_LBUTTONUP: {
             POINT pt{GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
             if (settingsOpen_) {
-                // 服务商预设
-                const auto& presets = aiProviderPresets();
-                for (std::size_t i = 0; i < impl_->providerRects.size(); ++i) {
-                    if (!PtInRect(&impl_->providerRects[i], pt)) continue;
-                    if (i == 0) {
-                        impl_->draftProvider.clear();
-                    } else if (i - 1 < presets.size()) {
-                        impl_->draftProvider = presets[i - 1].id;
-                        SetWindowTextW(impl_->editBase,
-                                       toWideText(presets[i - 1].baseUrl).c_str());
-                    }
-                    impl_->fetchStatus.clear();
-                    InvalidateRect(window_, nullptr, FALSE);
-                    return 0;
-                }
                 if (PtInRect(&impl_->fetchRect, pt)) {
                     startModelFetch();
                     return 0;
@@ -1913,13 +2021,6 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                     InvalidateRect(window_, nullptr, FALSE);
                     return 0;
                 }
-                for (std::size_t i = 0; i < impl_->searchProviderRects.size(); ++i) {
-                    if (!PtInRect(&impl_->searchProviderRects[i], pt)) continue;
-                    static const char* ids[] = {"", "tinyfish", "exa"};
-                    impl_->draftSearchProvider = ids[i < 3 ? i : 0];
-                    InvalidateRect(window_, nullptr, FALSE);
-                    return 0;
-                }
                 if (PtInRect(&impl_->saveRect, pt)) {
                     finishSettings(true);
                     return 0;
@@ -1935,7 +2036,17 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_MOUSEWHEEL: {
-            if (settingsOpen_) return 0;
+            if (settingsOpen_) {
+                const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
+                const int step = MulDiv(64, impl_->settingsDpi, 96);
+                if (delta != 0) {
+                    impl_->settingsScroll = std::clamp(impl_->settingsScroll -
+                        (delta > 0 ? step : -step), 0, impl_->settingsMaxScroll);
+                    layoutSettings();
+                    InvalidateRect(window_, nullptr, TRUE);
+                }
+                return 0;
+            }
             const int delta = GET_WHEEL_DELTA_WPARAM(wParam);
             if (panel_.onMouseWheel(delta)) InvalidateRect(window_, nullptr, FALSE);
             return 0;
@@ -1995,71 +2106,38 @@ void AiTab::paint(HDC dc, const RECT* dirty) {
     RECT client{};
     GetClientRect(window_, &client);
     fillRect(dc, client, ui::bgApp);
-
-    RECT header{client.left, client.top, client.right, client.top + 42};
+    const auto px = [this](int value) { return MulDiv(value, impl_->settingsDpi, 96); };
+    const int scroll = impl_->settingsScroll;
+    const int extra = impl_->providerExtra + impl_->searchExtra;
+    RECT header{client.left, -scroll, client.right, px(42) - scroll};
     fillRect(dc, header, ui::bgPanel);
-    drawText(dc, L"AI 设置", RECT{24, header.top, header.right - 24, header.bottom}, ui::text,
+    drawText(dc, L"AI 设置", RECT{px(24), header.top, header.right - px(24), header.bottom}, ui::text,
              context_.boldFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    const int left = 24;
-    const int width = std::max(120, static_cast<int>(client.right) - left * 2);
+    const int left = std::min(px(24), std::max(2, static_cast<int>(client.right) / 10));
+    const int width = std::max(1, static_cast<int>(client.right) - left * 2 - px(10));
 
     // 服务商预设：选一个就把地址填好，只差 Key
-    drawText(dc, L"服务商", RECT{left, kProviderTop - 22, left + width, kProviderTop - 2},
+    drawText(dc, L"服务商", RECT{left, px(kProviderTop - 22) - scroll, left + width, px(kProviderTop - 2) - scroll},
              ui::textDim, context_.captionFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
-    const auto& presets = aiProviderPresets();
-    const std::wstring chipLabels[] = {L"自定义", L"OpenCode Go", L"Command Code", L"Cline"};
-    for (std::size_t i = 0; i < impl_->providerRects.size(); ++i) {
-        const bool selected =
-            (i == 0) ? impl_->draftProvider.empty()
-                     : (i - 1 < presets.size() && impl_->draftProvider == presets[i - 1].id);
-        const RECT& chip = impl_->providerRects[i];
-        HBRUSH fill = CreateSolidBrush(toColorRef(selected ? ui::bgActive : ui::bgCard));
-        FillRect(dc, &chip, fill);
-        DeleteObject(fill);
-        HBRUSH border = CreateSolidBrush(toColorRef(selected ? ui::accent : ui::borderSoft));
-        FrameRect(dc, &chip, border);
-        DeleteObject(border);
-        drawText(dc, chipLabels[i], chip, selected ? ui::text : ui::textDim,
-                 context_.captionFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-    }
 
     const wchar_t* labels[4] = {
         L"API 地址（baseURL）",
         L"API Key（保存在主密码保险库；留空表示不修改）",
         L"模型（可先点「获取模型」再选）",
-        L"搜索 Key（留空 = 关闭联网搜索）",
+        L"联网搜索服务",
     };
     for (int i = 0; i < 4; ++i) {
-        const int top = kFieldTop + i * kFieldGap;
+        const int top = px(kFieldTop + i * kFieldGap) + impl_->providerExtra - scroll;
         int right = left + width;
-        // 第四行的右侧是后端 chip，标签别压上去
-        if (i == 3 && !impl_->searchProviderRects.empty())
-            right = impl_->searchProviderRects.front().left - 8;
-        drawText(dc, labels[i], RECT{left, top, right, top + 20}, ui::textDim,
+        drawText(dc, labels[i], RECT{left, top, right, top + px(20)}, ui::textDim,
                  context_.captionFont,
                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     }
 
-    // 搜索后端 chip：关闭 / TinyFish / Exa（和上面的模型服务商同一套观感）
-    {
-        const SearchProvider providers[] = {SearchProvider::None, SearchProvider::TinyFish,
-                                            SearchProvider::Exa};
-        for (std::size_t i = 0; i < impl_->searchProviderRects.size() && i < 3; ++i) {
-            const RECT& chip = impl_->searchProviderRects[i];
-            const bool selected = impl_->draftSearchProvider == searchProviderId(providers[i]);
-            HBRUSH fill = CreateSolidBrush(toColorRef(selected ? ui::bgActive : ui::bgCard));
-            FillRect(dc, &chip, fill);
-            DeleteObject(fill);
-            HBRUSH border = CreateSolidBrush(toColorRef(selected ? ui::accent : ui::borderSoft));
-            FrameRect(dc, &chip, border);
-            DeleteObject(border);
-            drawText(dc, searchProviderName(providers[i]), chip,
-                     selected ? ui::text : ui::textDim, context_.captionFont,
-                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-    }
+    const int searchKeyTop = px(kFieldTop + kFieldGap * 3) + impl_->searchExtra - scroll;
+    drawText(dc, L"搜索 Key（留空表示不修改）", RECT{left, searchKeyTop, left + width, searchKeyTop + px(20)},
+             ui::textDim, context_.captionFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
     auto button = [&](const RECT& rc, const std::wstring& text, std::uint32_t fill,
                       std::uint32_t color) {
@@ -2074,7 +2152,7 @@ void AiTab::paint(HDC dc, const RECT* dirty) {
 
     // 两个勾选框共用一段绘制：状态位 + 一行说明
     auto checkbox = [&](const RECT& row, bool on, const wchar_t* label) {
-        const int box = 16;
+        const int box = px(16);
         RECT check{row.left, row.top + (row.bottom - row.top - box) / 2, row.left + box,
                    row.top + (row.bottom - row.top - box) / 2 + box};
         HBRUSH boxBrush = CreateSolidBrush(toColorRef(on ? ui::action : ui::bgApp));
@@ -2087,7 +2165,7 @@ void AiTab::paint(HDC dc, const RECT* dirty) {
             drawText(dc, L"✓", check, 0xFFFFFF, context_.captionFont,
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         }
-        drawText(dc, label, RECT{check.right + 8, row.top, row.right, row.bottom}, ui::text,
+        drawText(dc, label, RECT{check.right + px(8), row.top, row.right, row.bottom}, ui::text,
                  context_.captionFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     };
 
@@ -2107,10 +2185,17 @@ void AiTab::paint(HDC dc, const RECT* dirty) {
             ? toWideText(impl_->fetchStatus)
             : std::wstring(L"选服务商 → 填 API Key → 获取模型 → 保存");
     drawText(dc, hint,
-             RECT{left, kButtonTop + kButtonHeight + 12, left + width,
-                  kButtonTop + kButtonHeight + 38},
+             RECT{left, px(kButtonTop + kButtonHeight + 12) + extra - scroll, left + width,
+                  px(kButtonTop + kButtonHeight + 38) + extra - scroll},
              impl_->fetchStatus.empty() ? ui::textFaint : ui::accent, context_.captionFont,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    if (impl_->settingsMaxScroll > 0 && client.bottom > px(24)) {
+        const int trackH = static_cast<int>(client.bottom) - px(16);
+        const int contentH = static_cast<int>(client.bottom) + impl_->settingsMaxScroll;
+        const int thumbH = std::max(px(20), MulDiv(trackH, static_cast<int>(client.bottom), contentH));
+        const int thumbTop = px(8) + MulDiv(trackH - thumbH, impl_->settingsScroll, impl_->settingsMaxScroll);
+        fillRect(dc, RECT{client.right - px(6), thumbTop, client.right - px(3), thumbTop + thumbH}, ui::textFaint);
+    }
 }
 
 }  // namespace rshell::ai

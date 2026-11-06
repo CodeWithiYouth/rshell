@@ -117,6 +117,7 @@ public:
     void setBusy(bool busy);
     bool busy() const { return busy_; }
     void setStatus(const std::wstring& status);
+    const std::wstring& statusForTest() const { return status_; }
     void setModelName(const std::wstring& name);
     // 目标主机：可点击时表示还有别的主机可切
     void setHostLabel(std::wstring label, bool clickable);

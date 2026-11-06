@@ -1107,8 +1107,8 @@ void fileEditRegression() {
               uploadGroup->children[1].text == L"上传文件夹…" && uploadGroup->children[1].enabled,
           "upload folder follows upload file");
     check(resumeGroup->children.size() == 3, "the resume submenu holds upload, folder and download");
-    const int resumeIds[3] = {IDM_FS_UPLOAD_RESUME, IDM_FS_UPLOAD_DIR_RESUME, IDM_FS_DOWNLOAD_RESUME};
-    const wchar_t* resumeTexts[3] = {L"续传文件…", L"续传文件夹上传…", L"续传下载…"};
+    const int resumeIds[3] = {IDM_FS_UPLOAD_RESUME, IDM_FS_DOWNLOAD_RESUME, IDM_FS_UPLOAD_DIR_RESUME};
+    const wchar_t* resumeTexts[3] = {L"续传文件…", L"续传下载…", L"续传文件夹上传…"};
     for (int i = 0; i < 3; ++i) {
         check(resumeGroup->children[i].id == resumeIds[i] &&
                   resumeGroup->children[i].text == resumeTexts[i] &&

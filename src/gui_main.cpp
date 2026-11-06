@@ -7273,8 +7273,8 @@ std::vector<popup::Item> buildFileContextMenu() {
         resumeGroup.children.push_back(std::move(item));
     };
     addResume(IDM_FS_UPLOAD_RESUME, L"续传文件…", ready);
-    addResume(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…", ready);
     addResume(IDM_FS_DOWNLOAD_RESUME, L"续传下载…", ready && entry != nullptr);
+    addResume(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…", ready);
     items.push_back(std::move(resumeGroup));
     // 新建文件 / 新建文件夹收进二级菜单，右键菜单顶层保持精简
     popup::Item createGroup;

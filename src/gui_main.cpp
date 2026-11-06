@@ -7225,7 +7225,7 @@ void beginDragOut(HWND hwnd) {
 }
 
 
-// 文件面板右键菜单：上传 / 新建文件夹 / 下载 / 编辑 / 删除 / 复制路径 / 刷新 / 断开
+// 文件面板右键菜单：上传 ▸ / 新建 ▸ / 下载 / 编辑 / 删除 / 复制路径 / 刷新 / 断开
 std::vector<popup::Item> buildFileContextMenu() {
     const RemoteEntry* entry = selectedFileEntry();
     const bool ready = g_app.fsReady;
@@ -7249,10 +7249,21 @@ std::vector<popup::Item> buildFileContextMenu() {
         items.push_back(std::move(item));
     };
 
-    add(IDM_FS_UPLOAD, L"上传文件…", L"", ready);
-    add(IDM_FS_UPLOAD_DIR, L"上传文件夹…", L"", ready);
-    add(IDM_FS_UPLOAD_RESUME, L"续传文件…", L"", ready);
-    add(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…", L"", ready);
+    // 上传和续传上传共用一个二级菜单，顶层保持精简
+    popup::Item uploadGroup;
+    uploadGroup.text = L"上传";
+    auto addUpload = [&uploadGroup, ready](int id, const wchar_t* text) {
+        popup::Item item;
+        item.id = id;
+        item.text = text;
+        item.enabled = ready;
+        uploadGroup.children.push_back(std::move(item));
+    };
+    addUpload(IDM_FS_UPLOAD, L"上传文件…");
+    addUpload(IDM_FS_UPLOAD_DIR, L"上传文件夹…");
+    addUpload(IDM_FS_UPLOAD_RESUME, L"续传文件…");
+    addUpload(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…");
+    items.push_back(std::move(uploadGroup));
     // 新建文件 / 新建文件夹收进二级菜单，右键菜单顶层保持精简
     popup::Item createGroup;
     createGroup.text = L"新建";

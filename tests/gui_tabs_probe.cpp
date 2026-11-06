@@ -1087,6 +1087,27 @@ void fileEditRegression() {
     check(findItem(items, IDM_FS_EDIT_SYSTEM) == nullptr,
           "the system-default entry only appears after an editor is configured");
 
+    // 上传和续传上传共用一个二级菜单，顶层不再各占一行
+    const popup::Item* uploadGroup = nullptr;
+    for (const auto& item : items) {
+        if (item.text == L"上传" && !item.children.empty()) uploadGroup = &item;
+        check(item.id != IDM_FS_UPLOAD && item.id != IDM_FS_UPLOAD_DIR &&
+                  item.id != IDM_FS_UPLOAD_RESUME && item.id != IDM_FS_UPLOAD_DIR_RESUME,
+              "upload and resume commands only live in the upload submenu");
+    }
+    check(uploadGroup != nullptr, "the upload submenu exists");
+    check(uploadGroup->children.size() == 4, "the upload submenu has both upload and resume commands");
+    const int uploadIds[4] = {IDM_FS_UPLOAD, IDM_FS_UPLOAD_DIR, IDM_FS_UPLOAD_RESUME,
+                              IDM_FS_UPLOAD_DIR_RESUME};
+    const wchar_t* uploadTexts[4] = {L"上传文件…", L"上传文件夹…", L"续传文件…",
+                                     L"续传文件夹上传…"};
+    for (int i = 0; i < 4; ++i) {
+        check(uploadGroup->children[i].id == uploadIds[i] &&
+                  uploadGroup->children[i].text == uploadTexts[i] &&
+                  uploadGroup->children[i].enabled,
+              "upload submenu keeps upload and resume in order");
+    }
+
     // 新建文件 / 新建文件夹共用一个二级菜单，顶层不再各占一行
     const popup::Item* createGroup = nullptr;
     bool topLevelNewFile = false;
@@ -1112,6 +1133,9 @@ void fileEditRegression() {
     const popup::Item* disabledNewFile = findItem(items, IDM_FS_NEW_FILE);
     check(disabledNewFile != nullptr && !disabledNewFile->enabled,
           "new file waits for the SFTP channel");
+    const popup::Item* disabledUploadResume = findItem(items, IDM_FS_UPLOAD_RESUME);
+    check(disabledUploadResume != nullptr && !disabledUploadResume->enabled,
+          "resume upload waits for the SFTP channel");
     g_app.fsReady = true;
     items = buildFileContextMenu();
 

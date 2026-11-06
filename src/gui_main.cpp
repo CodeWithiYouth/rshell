@@ -232,6 +232,15 @@ struct SessionState {
     std::string pendingKeyCredentialTarget, pendingKeyCredentialSession;
 };
 
+// 上次关闭时的窗口几何：位置用物理像素（虚拟屏幕坐标），尺寸用 96dpi 逻辑像素。
+// 这样换缩放比例后位置不会漂，尺寸也会按目标显示器的 DPI 重新折算。
+struct SavedWindowPlacement {
+    bool valid = false;
+    POINT pos{};
+    SIZE size{};
+    bool maximized = false;
+};
+
 struct App : SessionState {
     HINSTANCE inst = nullptr;
     // AI 面板是全局的一份：所有标签共用一个对话，工具调用的目标主机跟着当前标签走
@@ -242,6 +251,7 @@ struct App : SessionState {
     int sidebarWanted = 0;  // 拖拽后的期望宽度（0 = 自动）
     int aiDockWanted = 0;
     bool fsCollapsed = false;  // 远端文件面板折叠成一条窄栏
+    SavedWindowPlacement windowPlacement;  // 主窗口上次关闭时的位置/尺寸
     // 新版本提示：标签栏右侧的小胶囊
     std::string updateTag;
     std::string updateUrl;
@@ -7240,7 +7250,7 @@ void beginDragOut(HWND hwnd) {
 }
 
 
-// 文件面板右键菜单：上传 / 新建文件夹 / 下载 / 编辑 / 删除 / 复制路径 / 刷新 / 断开
+// 文件面板右键菜单：上传 ▸ / 续传 ▸ / 新建 ▸ / 下载 / 编辑 / 删除 / 复制路径 / 刷新 / 断开
 std::vector<popup::Item> buildFileContextMenu() {
     const RemoteEntry* entry = selectedFileEntry();
     const bool ready = g_app.fsReady;
@@ -7264,10 +7274,33 @@ std::vector<popup::Item> buildFileContextMenu() {
         items.push_back(std::move(item));
     };
 
-    add(IDM_FS_UPLOAD, L"上传文件…", L"", ready);
-    add(IDM_FS_UPLOAD_DIR, L"上传文件夹…", L"", ready);
-    add(IDM_FS_UPLOAD_RESUME, L"续传文件…", L"", ready);
-    add(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…", L"", ready);
+    // 上传和续传分开成两个二级菜单：上传只放正常传输，续传放按已有长度继续的入口
+    popup::Item uploadGroup;
+    uploadGroup.text = L"上传";
+    auto addUpload = [&uploadGroup, ready](int id, const wchar_t* text) {
+        popup::Item item;
+        item.id = id;
+        item.text = text;
+        item.enabled = ready;
+        uploadGroup.children.push_back(std::move(item));
+    };
+    addUpload(IDM_FS_UPLOAD, L"上传文件…");
+    addUpload(IDM_FS_UPLOAD_DIR, L"上传文件夹…");
+    items.push_back(std::move(uploadGroup));
+
+    popup::Item resumeGroup;
+    resumeGroup.text = L"续传";
+    auto addResume = [&resumeGroup](int id, const wchar_t* text, bool enabled) {
+        popup::Item item;
+        item.id = id;
+        item.text = text;
+        item.enabled = enabled;
+        resumeGroup.children.push_back(std::move(item));
+    };
+    addResume(IDM_FS_UPLOAD_RESUME, L"续传文件…", ready);
+    addResume(IDM_FS_DOWNLOAD_RESUME, L"续传下载…", ready && entry != nullptr);
+    addResume(IDM_FS_UPLOAD_DIR_RESUME, L"续传文件夹上传…", ready);
+    items.push_back(std::move(resumeGroup));
     // 新建文件 / 新建文件夹收进二级菜单，右键菜单顶层保持精简
     popup::Item createGroup;
     createGroup.text = L"新建";
@@ -7284,7 +7317,6 @@ std::vector<popup::Item> buildFileContextMenu() {
     items.push_back(std::move(createGroup));
     sep();
     add(IDM_FS_DOWNLOAD, L"下载到本地…", L"", ready && entry != nullptr);
-    add(IDM_FS_DOWNLOAD_RESUME, L"续传下载…", L"", ready && entry != nullptr);
     add(IDM_FS_EDIT, L"编辑", L"", editable);
     // 已经设置过编辑器时，额外给一个不走自定义编辑器的入口
     if (!g_app.editorPath.empty()) add(IDM_FS_EDIT_SYSTEM, L"用系统默认程序编辑", L"", editable);
@@ -7900,7 +7932,146 @@ void handleFsEvent(const FsEvent& event) {
 
 // ---------------------------------------------------------------- 分栏宽度
 
-std::string uiIniPath() { return homeDirectory() + "/.rshell/ui.ini"; }
+std::string uiIniPath() {
+    // 回归测试可用环境变量指向临时文件，避免读写用户真实布局
+    if (const char* custom = std::getenv("RSHELL_UI_CONFIG")) {
+        if (*custom) return custom;
+    }
+    return homeDirectory() + "/.rshell/ui.ini";
+}
+
+// 解析窗口几何 "left,top,width,height"（位置物理像素，尺寸 96dpi 逻辑像素）
+bool parseWindowGeometry(const std::string& raw, SavedWindowPlacement& out) {
+    std::vector<std::string> parts;
+    std::size_t start = 0;
+    while (true) {
+        const std::size_t comma = raw.find(',', start);
+        parts.push_back(trim(raw.substr(start, comma == std::string::npos ? std::string::npos
+                                                                         : comma - start)));
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    if (parts.size() != 4) return false;
+    int values[4]{};
+    for (int i = 0; i < 4; ++i) {
+        if (parts[i].empty()) return false;
+        try {
+            std::size_t used = 0;
+            values[i] = std::stoi(parts[i], &used);
+            if (used != parts[i].size()) return false;
+        } catch (const std::exception&) {
+            return false;
+        }
+    }
+    if (values[2] <= 0 || values[3] <= 0) return false;
+    out.valid = true;
+    out.pos = POINT{values[0], values[1]};
+    out.size = SIZE{values[2], values[3]};
+    return true;
+}
+
+// 取显示器 DPI：Win8.1+ 才有 GetDpiForMonitor，旧系统退回系统 DPI
+UINT monitorDpi(HMONITOR monitor) {
+    using GetDpiForMonitorFn = HRESULT(WINAPI*)(HMONITOR, int, UINT*, UINT*);
+    static const GetDpiForMonitorFn getDpiForMonitor = [] {
+        const HMODULE shcore = LoadLibraryW(L"Shcore.dll");
+        return shcore ? reinterpret_cast<GetDpiForMonitorFn>(
+                            GetProcAddress(shcore, "GetDpiForMonitor"))
+                      : nullptr;
+    }();
+    UINT dpiX = 0, dpiY = 0;
+    // 0 = MDT_EFFECTIVE_DPI
+    if (getDpiForMonitor && SUCCEEDED(getDpiForMonitor(monitor, 0, &dpiX, &dpiY)) && dpiX > 0)
+        return dpiX;
+    return wincompat::systemDpi();
+}
+
+// 把保存的几何换算成物理矩形，并保证标题栏留在某块显示器的工作区内。
+// 返回 false 表示上次的位置已经不在任何屏幕上了（拔掉显示器、分辨率变小），
+// 调用方应回退到默认位置和尺寸。
+bool resolveWindowPlacement(const SavedWindowPlacement& saved, RECT& rect) {
+    if (!saved.valid || saved.size.cx <= 0 || saved.size.cy <= 0) return false;
+    // 先用保存的位置找显示器，再按这块显示器的当前 DPI 折算尺寸，
+    // 换过缩放比例后窗口的视觉大小仍然接近上次。
+    RECT probe{saved.pos.x, saved.pos.y, saved.pos.x + saved.size.cx,
+               saved.pos.y + saved.size.cy};
+    HMONITOR monitor = MonitorFromRect(&probe, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return false;
+
+    const int dpi = static_cast<int>(monitorDpi(monitor));
+    int width = MulDiv(saved.size.cx, dpi, 96);
+    int height = MulDiv(saved.size.cy, dpi, 96);
+    if (width <= 0 || height <= 0) return false;
+    // 和 WM_GETMINMAXINFO 的最小尺寸保持一致，损坏/过小的旧值不会还原成没法操作的窗口
+    width = std::max(width, dp(760));
+    height = std::max(height, dp(460));
+
+    const RECT want{saved.pos.x, saved.pos.y, saved.pos.x + width, saved.pos.y + height};
+    RECT visible{};
+    if (!IntersectRect(&visible, &want, &info.rcWork)) return false;
+    // 只露出一条边不算恢复成功，至少能看到一小块标题栏
+    if (visible.right - visible.left < dp(80) || visible.bottom - visible.top < dp(40))
+        return false;
+
+    // 尺寸不超过工作区，位置往工作区内收，避免标题栏跑到屏幕外
+    const RECT& work = info.rcWork;
+    width = std::min(width, static_cast<int>(work.right - work.left));
+    height = std::min(height, static_cast<int>(work.bottom - work.top));
+    const int minVisibleX = std::min(dp(120), width);
+    const int minVisibleY = std::min(dp(40), height);
+    int lowLeft = static_cast<int>(work.left) - width + minVisibleX;
+    const int highLeft = static_cast<int>(work.right) - minVisibleX;
+    if (lowLeft > highLeft) lowLeft = highLeft;
+    const int left = std::clamp(static_cast<int>(saved.pos.x), lowLeft, highLeft);
+    const int lowTop = static_cast<int>(work.top);
+    const int highTop = std::max(lowTop, static_cast<int>(work.bottom) - minVisibleY);
+    const int top = std::clamp(static_cast<int>(saved.pos.y), lowTop, highTop);
+    rect = RECT{left, top, left + width, top + height};
+    return true;
+}
+
+// 启动建窗口前读一次：位置要在 CreateWindowExW 之前交给系统，
+// 窗口尺寸也要按保存的显示器 DPI 还原，不能等 WM_CREATE。
+void loadWindowPlacement() {
+    if (std::getenv("RSHELL_NO_UI_SAVE")) return;
+    std::ifstream in(utf8ToPath(uiIniPath()));
+    if (!in) return;
+    std::string line;
+    while (std::getline(in, line)) {
+        const auto eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = trim(line.substr(0, eq));
+        const std::string raw = line.substr(eq + 1);
+        if (key == "window") parseWindowGeometry(raw, g_app.windowPlacement);
+        else if (key == "windowmax") g_app.windowPlacement.maximized = std::atoi(raw.c_str()) != 0;
+    }
+}
+
+// 从当前窗口抓一份几何。最大化时 GetWindowPlacement 给出的还原矩形仍然有效，
+// 所以下次取消最大化能回到最大化之前的大小。
+void rememberWindowPlacement() {
+    if (!g_app.main || !IsWindow(g_app.main)) return;
+    WINDOWPLACEMENT placement{};
+    placement.length = sizeof(placement);
+    if (!GetWindowPlacement(g_app.main, &placement)) return;
+    RECT normal{};
+    // 普通窗口直接用屏幕坐标；最大化/最小化时当前矩形不是还原后的位置，
+    // 这时取 rcNormalPosition（取消最大化后回到这里）
+    if (IsZoomed(g_app.main) || IsIconic(g_app.main)) normal = placement.rcNormalPosition;
+    else GetWindowRect(g_app.main, &normal);
+    const int width = normal.right - normal.left;
+    const int height = normal.bottom - normal.top;
+    if (width <= 0 || height <= 0) return;
+    const int dpi = g_app.dpi > 0 ? g_app.dpi : 96;
+    g_app.windowPlacement.valid = true;
+    g_app.windowPlacement.pos = POINT{normal.left, normal.top};
+    g_app.windowPlacement.size = SIZE{MulDiv(width, 96, dpi), MulDiv(height, 96, dpi)};
+    // 最小化时 showCmd 是 SW_SHOWMINIMIZED，原本是否最大化看 WPF_RESTORETOMAXIMIZED
+    g_app.windowPlacement.maximized =
+        placement.showCmd == SW_SHOWMAXIMIZED || (placement.flags & WPF_RESTORETOMAXIMIZED) != 0;
+}
 
 // 宽度按 96dpi 的逻辑像素存，换显示器/缩放比例后不会一下子撑爆
 void loadUiLayout() {
@@ -7933,10 +8104,11 @@ void loadUiLayout() {
 void saveUiLayout() {
     // 回归测试里不要改用户真实的布局文件
     if (std::getenv("RSHELL_NO_UI_SAVE")) return;
-    const std::string dir = homeDirectory() + "/.rshell";
+    rememberWindowPlacement();  // 窗口还活着时抓一次几何，退出前也能写到最新位置
+    const fs::path target = utf8ToPath(uiIniPath());
     std::error_code ec;
-    std::filesystem::create_directories(utf8ToPath(dir), ec);
-    std::ofstream out(utf8ToPath(uiIniPath()), std::ios::trunc);
+    std::filesystem::create_directories(target.parent_path(), ec);
+    std::ofstream out(target, std::ios::trunc);
     if (!out) return;
     const double scale = g_app.dpi > 0 ? 96.0 / g_app.dpi : 1.0;
     // 只记住「用户设过的」宽度：0 表示还是自动，不要把手动布局算出来的值写进去
@@ -7950,6 +8122,13 @@ void saveUiLayout() {
     out << "fscollapsed=" << (g_app.fsCollapsed ? 1 : 0) << "\n";
     out << "updatecheck=" << (g_app.updateCheckOnStart ? 1 : 0) << "\n";
     if (!g_app.editorPath.empty()) out << "editor=" << toUtf8(g_app.editorPath) << "\n";
+    // 位置为物理像素，尺寸为 96dpi 逻辑像素；读取时按目标显示器 DPI 折算
+    if (g_app.windowPlacement.valid) {
+        const auto& placement = g_app.windowPlacement;
+        out << "window=" << placement.pos.x << "," << placement.pos.y << ","
+            << placement.size.cx << "," << placement.size.cy << "\n";
+        out << "windowmax=" << (placement.maximized ? 1 : 0) << "\n";
+    }
 }
 
 // 拖拽中的分隔条：1=文件面板 2=AI 面板 0=没有
@@ -10024,6 +10203,18 @@ bool handleSessionTabClick(POINT pt) {
     return true;
 }
 
+// 「关于」正文：版本号来自编译期 RSHELL_VERSION，和标题栏胶囊/更新检查共用同一来源
+std::wstring aboutText() {
+    return std::wstring(L"rshell GUI ") + toWide(appVersion()) +
+        L"\n\n基于 libssh2 的 SSH 终端与 SFTP 文件管理器。\n"
+        L"会话保存在 ~/.rshell/sessions.ini；勾选「记住密码」的会话，"
+        L"口令存在密码保险库里（%LOCALAPPDATA%\\rshell\\vault.dat）。\n"
+        L"主菜单的「密码保险库」用主密码加密保存口令（本机支持时可用 TPM 解锁）；"
+        L"不勾「记住密码」时口令只留在内存里，断开即失效。\n\n"
+        L"快捷键：Ctrl+Shift+C 复制，Ctrl+V 粘贴，"
+        L"Ctrl++ / Ctrl+- 缩放字体。";
+}
+
 LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     const bool sessionMessage = msg == WM_SHELL_DATA || msg == WM_SHELL_CLOSED ||
         msg == WM_CONNECT_OK || msg == WM_CONNECT_FAIL || msg == WM_FS_EVENT || msg == WM_FS_STATS ||
@@ -10684,14 +10875,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               false, 8000);
                     return 0;
                 case IDM_ABOUT:
-                    messageInfo(L"关于 rshell",
-                                L"rshell GUI\n\n基于 libssh2 的 SSH 终端与 SFTP 文件管理器。\n"
-                                L"会话保存在 ~/.rshell/sessions.ini；勾选「记住密码」的会话，"
-                                L"口令存在密码保险库里（%LOCALAPPDATA%\\rshell\\vault.dat）。\n"
-                                L"主菜单的「密码保险库」用主密码加密保存口令（本机支持时可用 TPM 解锁）；"
-                                L"不勾「记住密码」时口令只留在内存里，断开即失效。\n\n"
-                                L"快捷键：Ctrl+Shift+C 复制，Ctrl+V 粘贴，"
-                                L"Ctrl++ / Ctrl+- 缩放字体。");
+                    messageInfo(L"关于 rshell", aboutText());
                     return 0;
                 case IDM_EXIT:
                     DestroyWindow(hwnd);
@@ -11013,6 +11197,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_DESTROY:
+            saveUiLayout();  // 退出前记住窗口位置/尺寸和分栏宽度
             KillTimer(hwnd, 1);
             g_applicationClosing.store(true);
             if (g_app.aiTab) {  // 全局 AI 面板：停掉工作线程再退出
@@ -11241,6 +11426,12 @@ int runGui(HINSTANCE inst, int showCommand) {
     mainClass.lpszClassName = kMainClass;
     if (!RegisterClassExW(&mainClass)) return 1;
 
+    // 恢复上次关闭时的窗口几何：位置必须在这里交给 CreateWindowExW，
+    // 放进 WM_CREATE 就晚了（窗口已经按默认位置创建出来）。
+    loadWindowPlacement();
+    RECT restoredRect{};
+    const bool restored = resolveWindowPlacement(g_app.windowPlacement, restoredRect);
+
     // 初始尺寸随工作区收敛：小屏（1024x768）上 1120x720 会被系统夹住，
     // 客户区尺寸在启动时抖动还会让终端多做一次 resize。
     RECT work{};
@@ -11249,13 +11440,23 @@ int runGui(HINSTANCE inst, int showCommand) {
                                                              dp(40)));
     const int initH = std::min(dp(720), std::max(dp(460), static_cast<int>(work.bottom - work.top) -
                                                             dp(40)));
+    const int windowX = restored ? restoredRect.left : CW_USEDEFAULT;
+    const int windowY = restored ? restoredRect.top : CW_USEDEFAULT;
+    const int windowW = restored ? restoredRect.right - restoredRect.left : initW;
+    const int windowH = restored ? restoredRect.bottom - restoredRect.top : initH;
     HWND window = CreateWindowExW(0, kMainClass, L"rshell - SSH 终端",
-                                  WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT,
-                                  CW_USEDEFAULT, initW, initH, nullptr, nullptr, inst, nullptr);
+                                  WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, windowX,
+                                  windowY, windowW, windowH, nullptr, nullptr, inst, nullptr);
     if (!window) return 1;
     applyDarkFrame(window);
 
-    ShowWindow(window, showCommand);
+    // 上次是最大化就还原最大化；启动参数明确要求最小化时仍然尊重启动参数
+    if (restored && g_app.windowPlacement.maximized && showCommand != SW_SHOWMINIMIZED &&
+        showCommand != SW_SHOWMINNOACTIVE) {
+        ShowWindow(window, SW_SHOWMAXIMIZED);
+    } else {
+        ShowWindow(window, showCommand);
+    }
     UpdateWindow(window);
 
     // 布局定稿前会经历几次临时 resize（10x10 → 极小 → 正常），

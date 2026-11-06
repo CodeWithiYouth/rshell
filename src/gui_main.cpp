@@ -9978,6 +9978,18 @@ bool handleSessionTabClick(POINT pt) {
     return true;
 }
 
+// 「关于」正文：版本号来自编译期 RSHELL_VERSION，和标题栏胶囊/更新检查共用同一来源
+std::wstring aboutText() {
+    return std::wstring(L"rshell GUI ") + toWide(appVersion()) +
+        L"\n\n基于 libssh2 的 SSH 终端与 SFTP 文件管理器。\n"
+        L"会话保存在 ~/.rshell/sessions.ini；勾选「记住密码」的会话，"
+        L"口令存在密码保险库里（%LOCALAPPDATA%\\rshell\\vault.dat）。\n"
+        L"主菜单的「密码保险库」用主密码加密保存口令（本机支持时可用 TPM 解锁）；"
+        L"不勾「记住密码」时口令只留在内存里，断开即失效。\n\n"
+        L"快捷键：Ctrl+Shift+C 复制，Ctrl+V 粘贴，"
+        L"Ctrl++ / Ctrl+- 缩放字体。";
+}
+
 LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     const bool sessionMessage = msg == WM_SHELL_DATA || msg == WM_SHELL_CLOSED ||
         msg == WM_CONNECT_OK || msg == WM_CONNECT_FAIL || msg == WM_FS_EVENT || msg == WM_FS_STATS;
@@ -10610,14 +10622,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               false, 8000);
                     return 0;
                 case IDM_ABOUT:
-                    messageInfo(L"关于 rshell",
-                                L"rshell GUI\n\n基于 libssh2 的 SSH 终端与 SFTP 文件管理器。\n"
-                                L"会话保存在 ~/.rshell/sessions.ini；勾选「记住密码」的会话，"
-                                L"口令存在密码保险库里（%LOCALAPPDATA%\\rshell\\vault.dat）。\n"
-                                L"主菜单的「密码保险库」用主密码加密保存口令（本机支持时可用 TPM 解锁）；"
-                                L"不勾「记住密码」时口令只留在内存里，断开即失效。\n\n"
-                                L"快捷键：Ctrl+Shift+C 复制，Ctrl+V 粘贴，"
-                                L"Ctrl++ / Ctrl+- 缩放字体。");
+                    messageInfo(L"关于 rshell", aboutText());
                     return 0;
                 case IDM_EXIT:
                     DestroyWindow(hwnd);

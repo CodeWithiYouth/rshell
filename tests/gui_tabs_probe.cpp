@@ -1915,6 +1915,8 @@ void aiPanelPartialPaintRegression() {
 void updateCheckRegression() {
     check(!g_app.updateTag.empty(), "the title bar exposes the current version");
     check(!g_app.updateNewer, "the current version is not marked as an update");
+    check(aboutText().find(toWide(appVersion())) != std::wstring::npos,
+          "the About dialog shows the current version");
 
     ReleaseInfo newer;
     newer.ok = true;

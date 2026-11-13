@@ -20,8 +20,9 @@
 ```powershell
 .\build.ps1                 # Windows 10/11 版 -> build\modern\rshell-gui.exe
 .\build.ps1 -Win7           # Win7 兼容版 -> build\win7\rshell-gui.exe
-.\build.ps1 -Test           # 构建后跑单元测试
+.\build.ps1 -Test           # 构建测试/探针并运行 ctest
 .\build.ps1 -Clean -Test    # 删除构建目录后干净重建并测试
+.\build.ps1 -Diagnostics -BuildDir build\diagnostics  # 包含离屏渲染等诊断入口
 ```
 
 （`-Modern` 仍可显式使用，等同于默认。）
@@ -30,6 +31,17 @@
 `-Win7` 要求 MSVC 14.44 或更早（优先仓库内 `build_tmp\msvc143`，否则用 VS 已安装的
 v143 14.44），并在链接后自动跑导入表检查。脚本结束时打印产物目录。
 `-BuildDir` 可改目录；换过工具链或生成器导致缓存不匹配时加 `-Clean`。
+普通构建只编译 CLI 和 GUI；加 `-Test` 才构建测试与探针。
+发布 GUI 默认不包含离屏渲染、图标预览和离线演示入口；开发时用 `-Diagnostics`，
+或在手动 CMake 配置时加 `-DRSHELL_ENABLE_DIAGNOSTICS=ON`。
+GUI 回归探针始终启用这些入口，独立于发布 GUI 的开关。
+
+主窗口动效复用 Win32/GDI 绘制与无分配的时间插值，不增加运行库或素材。
+按钮颜色过渡为 70–120ms，连接状态反馈在 600ms 内结束，AI 面板滑入为 170ms。
+AI 面板先应用最终布局，动画帧仅移动固定尺寸的子窗口，不重复调整终端网格或历史。
+动效遵循系统 `SPI_GETCLIENTAREAANIMATION` 设置，也可用环境变量
+`RSHELL_DISABLE_ANIMATIONS=1` 关闭；隐藏、最小化、缩放和销毁时停止动画。
+主窗口复用离屏位图并按脏区域绘制，过渡完成后停止专用计时器。
 
 需要 Visual Studio 生成器时可以手动 CMake，请用单独的目录，不要和脚本共用：
 
@@ -58,8 +70,8 @@ curve25519-sha256 KEX（`-Win7` 兼容构建也有），所以只开放 curve255
 | --- | --- |
 | `build\modern\rshell.exe` | 命令行工具（Windows 10/11） |
 | `build\modern\rshell-gui.exe` | 图形界面（Windows 10/11） |
-| `build\modern\rshell_tests.exe` | 单元测试 |
-| `build\modern\rshell_shell_probe.exe` | 无界面的 shell 通道冒烟测试 |
+| `build\modern\rshell_tests.exe` | 单元测试（`-Test` 构建） |
+| `build\modern\rshell_shell_probe.exe` | 无界面的 shell 通道冒烟测试（`-Test` 构建） |
 | `build\win7\rshell*.exe` | 同上，`-Win7` 兼容构建的输出 |
 
 下文示例统一用 `build\modern`；Win7 兼容版把路径换成 `build\win7` 即可。
@@ -109,7 +121,20 @@ Win7 兼容构建的 KEX 有 `diffie-hellman-*` 和 `curve25519-sha256`（内嵌
 `shell32` `bcrypt` `ws2_32` `crypt32` `KERNEL32`。libssh2 静态链接，加密走系统 WinCNG
 （`bcrypt.dll`），不带 OpenSSL。
 
-分发包体积（Release 实测）：
+上一轮体积基线（2026-11-13，尚未包含传输交互调度，MSVC 14.51、Release、WinCNG、`/MT`）：桌面版
+1,805,312 字节，命令行版 796,160 字节。同源码开启诊断后桌面版为 1,825,280 字节，
+默认隔离诊断代码节省 19,968 字节（19.5 KiB）。相对本轮优化前源码重新构建的产物，
+加入取消与历史加载等可靠性逻辑后，桌面版净增 4 KiB，命令行版净增 12 KiB。
+
+轻量动效实测（2026-11-13，同工具链与发布选项，基线已含传输交互调度）：
+桌面版由 1,814,528 增至 1,823,232 字节，新增 8.5 KiB，低于 30 KiB 预算；
+命令行版保持 798,720 字节。产物在 `build\animations`。
+
+随后 AI 面板可靠性与交互优化（同日、同工具链与发布选项）由 1,823,232 增至
+1,825,792 字节，新增 2.5 KiB；与前次动效合计新增 11 KiB。
+命令行版仍为 798,720 字节，本轮产物在 `build\ai-panel`。
+
+以下 CRT 分发方式对照是早期版本的 Release 实测，用于比较部署取舍：
 
 | 方式 | 单文件 | 未压缩总量 | zip | 目标机额外要求 |
 | --- | --- | --- | --- | --- |
@@ -490,8 +515,10 @@ IMM/TSF 兼容输入路径，造成微软拼音无法组字，而原生编辑框
 （终端输出 + 一份假的文件列表和远端指标，用来检查左右分栏与状态栏）：
 
 ```powershell
+.\build.ps1 -Diagnostics -BuildDir build\diagnostics
 $env:RSHELL_GUI_DEMO = "1"
-.\build\modern\rshell-gui.exe
+.\build\diagnostics\rshell-gui.exe
+Remove-Item Env:RSHELL_GUI_DEMO
 ```
 
 TUI 显示异常时，可以设置 `RSHELL_TERM_DUMP=<文件路径>` 启动 GUI，程序会把
@@ -508,14 +535,15 @@ $env:RSHELL_TERM_DUMP = "$env:TEMP\rshell-dump.bin"
 # 文本网格（列对齐、光标位置、属性统计）
 .\build\modern\rshell_term_replay.exe "$env:TEMP\rshell-dump.bin" 92 34
 
-# 像素级出图（与 GUI 共用同一份 GDI 绘制代码）
-.\build\modern\rshell-gui.exe --render "$env:TEMP\rshell-dump.bin" .\dump.bmp 92 34
+# 像素级出图：先用 -Diagnostics 构建（与 GUI 共用同一份 GDI 绘制代码）
+.\build.ps1 -Diagnostics -BuildDir build\diagnostics
+.\build\diagnostics\rshell-gui.exe --render "$env:TEMP\rshell-dump.bin" .\dump.bmp 92 34
 
 # 想知道某个字符用了哪个字体（缺字形会退回 Consolas 画 .notdef 方框）
 $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe UI Symbol
 
 # 文件类型图标总览（16/24/32/48 四档 × 12 种类型），调图标时用
-.\build\modern\rshell-gui.exe --icons .\icons.bmp
+.\build\diagnostics\rshell-gui.exe --icons .\icons.bmp
 ```
 
 字形回退：正文字体是 `Consolas`，它没有 `❯`（U+276F）、`▶`、`⏵`、`✓` 和中文，
@@ -526,6 +554,10 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
 
 受限说明：
 
+- 文件连接由单个工作线程使用。上传、下载及目录树传输在安全的 SFTP 请求边界让出执行权，
+  优先处理目录、AI 工具和拖放读取，并执行到期状态采样；其他传输保持 FIFO，不在让出期间递归启动。
+  取消状态按任务隔离，交互结束后恢复传输的取消和阻塞模式。较慢的远端交互会让当前传输等待。
+  内嵌 libssh2 会补齐预读队列中的半发送请求后才允许切换，不增加 SSH 连接；系统 libssh2 构建不启用此扩展。
 - 每个已连接标签分别维持终端与 SFTP 后端；同时打开更多标签会增加连接数和终端历史的内存占用。
 - 文件通道是**第二条 SSH 连接**：服务器 `MaxSessions < 2`（或禁止多路）时文件面板
   连不上，终端仍可正常使用，左侧会显示原因。
@@ -587,11 +619,15 @@ $env:RSHELL_FONT_DEBUG = "1"    # 输出 .\dump.bmp.fonts.txt：U+276F -> Segoe 
 审批时工作线程阻塞在条件变量上，界面点「允许/拒绝」后唤醒——不会阻塞终端，也不会并发压两条 SSH 会话。
 
 注意「AI 在别的线程」不等于界面不会卡：排版和绘制都在界面线程。工作线程只是把 SSE 增量放进
-`pendingText` / `pendingReasoning`，`kAiFlushMessage` 到界面线程后才进 `ChatPanel`，
+有序事件队列，`kAiFlushMessage` 到界面线程后才进 `ChatPanel`。
+同类连续增量合并，工具、审批和结束事件保留其边界；取出事件批次与复位通知标记在同一锁内完成。
 之后的高度计算与 `WM_PAINT` 全是界面线程的活。
 
 ### 长文本与帧率
 
+- 上滚后记录第一条可见消息及其局部偏移，流式增高、插入消息和窗口缩放后保持该位置；贴底时继续跟随，审批卡片仍主动定位。
+- 面板收起、主窗口隐藏或最小化时，后台语义事件照常处理，跳过逐字展示并停止视觉计时；恢复时同步内容并重画。
+  历史菜单使用独立的展示代次，收起前发出的列表请求不在重新打开后迟到弹出。
 - 助手回答走 `md::LayoutCache`（块级缓存 + 显示列表）：内容不变只回放，流式追加只重排变化的尾块。
 - 思考过程（默认展开）走 `WrapCache`：按宽度把文本切成行缓存，追加时只从最后一个未完成行继续切，
   绘制是逐行 `TextOutW` 并按可视区跳过上面的行；正文没动过（同一缓冲、同样长度）时直接返回。
@@ -672,6 +708,11 @@ AI 面板全局面板只有一份，工具的目标主机跟着当前标签走�
   顶部提示「已接上上次对话……」。每台主机只自动接一次；点「新建」开始新对话（旧对话留在历史里，远端文件不删）后不会被立刻载回来。
 - 面板头部的主机 chip 旁边有「历史」（只在连上主机时出现）：列出最近 20 段，
   一行是「标题 · 条数 · 时间 · #标签」，点一段就切换过去（面板和模型上下文一起换）。
+- 保存正文后另写同名 `.meta.json` 小摘要，列表仅读取摘要，选中后异步加载单份正文。
+  旧记录没有摘要时先显示文件名和时间，打开与继续对话不受影响；再次保存会补摘要。
+  摘要写入失败不影响正文保存，正文读取失败或超限时保留当前面板并提示。
+- 正文保存与读取共用 512 KiB 上限，包含 JSON 转义、格式与结尾换行。
+  保存前先检查最终序列化字节数；超限不写正文或摘要，保留旧的可读记录并提示，面板中的当前聊天不截断。
 - 列表用宿主提供的自绘菜单（`AiTabContext::pickFromList`），不引入新窗口类型。
 - 对话记录只存在远端，本机不写；没有连接时读不到历史，按钮也不会出现。
 - 模型可以用本地工具 `name_session(title, tags)` 给对话起名打标签（读级、免审批、不发任何远程命令）；
@@ -742,9 +783,10 @@ API Key 只存在保险库条目 `ai.apiKey`，配置文件里不出现明文；
 .\build.ps1 -Test                                  # 单元测试 + GUI 状态回归
 python tests/sftp_test_server.py --root build_tmp/airoot --port 2299 --user tester --password testpass
 build\modern\rshell_ai_probe.exe 127.0.0.1 2299 tester testpass   # 真实 SSH/SFTP 工具链
-rshell-gui.exe --ai-preview out.bmp    # 离屏渲染演示对话
-rshell-gui.exe --ai-paths out.bmp      # 长路径压力测试
-rshell-gui.exe --ai-welcome out.bmp    # 空状态
+.\build.ps1 -Diagnostics -BuildDir build\diagnostics
+build\diagnostics\rshell-gui.exe --ai-preview out.bmp    # 离屏渲染演示对话
+build\diagnostics\rshell-gui.exe --ai-paths out.bmp      # 长路径压力测试
+build\diagnostics\rshell-gui.exe --ai-welcome out.bmp    # 空状态
 ```
 
 ### 保活

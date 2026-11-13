@@ -13,6 +13,7 @@
 #include <thread>
 
 #include "ai_ssh_backend.h"
+#include "ai_session.h"
 #include "ai_tools.h"
 #include "remote_fs.h"
 #include "ssh_session.h"
@@ -104,6 +105,44 @@ int main(int argc, char** argv) {
     const ai::ToolResult missing =
         registry.execute("read_file", R"({"path":"/ai_probe_missing.txt"})");
     expect(!missing.ok && !missing.denied, "不存在的文件报错而不是静默成功");
+
+    // The real SFTP backend must distinguish exact EOF from one byte too many.
+    const std::string historyDir = "/ai-history-boundary";
+    std::string historyError;
+    expect(backend.makeDir(historyDir, historyError), "create temporary history directory");
+    ai::SessionRecord history;
+    history.title = "history boundary";
+    history.created = history.updated = 1700014400;
+    history.messages.push_back({true, "中文🙂\"\\\n"});
+    const std::size_t overhead = ai::serializeSession(history).size();
+    history.messages.back().text.append(ai::kMaxSessionFileBytes - overhead, 'x');
+    const std::string exactJson = ai::serializeSession(history);
+    const std::string historyFile = ai::sessionFileName(history, history.created);
+    expect(exactJson.size() == ai::kMaxSessionFileBytes, "history fixture is exactly 512 KiB");
+    expect(ai::writeSessionFile(backend, historyDir, historyFile, history, historyError),
+           "save exact-limit history over SFTP");
+    ai::StoredSession restored;
+    expect(ai::readSessionFile(backend, historyDir, historyFile, restored, historyError) &&
+               ai::serializeSession(restored.record) == exactJson,
+           "reopen exact-limit history without false truncation");
+    history.messages.back().text.push_back('x');
+    expect(!ai::writeSessionFile(backend, historyDir, historyFile, history, historyError),
+           "reject history one byte over the budget");
+    expect(ai::readSessionFile(backend, historyDir, historyFile, restored, historyError) &&
+               ai::serializeSession(restored.record) == exactJson,
+           "rejected history keeps the original remote record readable");
+    const std::string oversized = ai::serializeSession(history);
+    expect(backend.writeFile(historyDir + "/" + historyFile, oversized, historyError, ""),
+           "create oversized legacy fixture over SFTP");
+    std::string bounded;
+    bool truncated = false;
+    expect(backend.readFile(historyDir + "/" + historyFile, ai::kMaxSessionFileBytes,
+                            bounded, truncated, historyError, "") &&
+               bounded.size() == ai::kMaxSessionFileBytes && truncated,
+           "real SFTP identifies one extra byte as truncation");
+    expect(!ai::readSessionFile(backend, historyDir, historyFile, restored, historyError) &&
+               ai::serializeSession(restored.record) == exactJson,
+           "oversized remote history does not replace the open conversation");
 
     fs.stop();
     std::cout << (failures == 0 ? "PASS" : "FAIL") << "\n";

@@ -8,6 +8,7 @@
 // 所以可以在单元测试里直接跑。
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -15,6 +16,9 @@
 #include "ai_tools.h"
 
 namespace rshell::ai {
+
+// Final serialized UTF-8 JSON bytes, including escaping and the trailing newline.
+inline constexpr std::size_t kMaxSessionFileBytes = 512u * 1024u;
 
 // 一条对话记录。只存纯文本轮次：工具卡片不进文件，
 // 免得把命令输出（可能几十 KB）一起搬到远端。
@@ -61,6 +65,8 @@ bool parseSession(const std::string& json, SessionRecord& out, std::string* erro
 struct StoredSession {
     std::string file;  // 文件名（不是全路径）
     SessionRecord record;
+    std::size_t messageCount = 0;
+    bool summaryAvailable = false;  // 旧文件没有摘要时，列表不显示未知的消息条数
 };
 
 // 取远端家目录并建好 <home>/.rshell/sessions；dir 作为缓存传给后续调用
@@ -70,7 +76,15 @@ bool ensureSessionDir(ToolBackend& backend, std::string& dir, std::string& error
 std::vector<StoredSession> readSessions(ToolBackend& backend, std::string& dir, int limit,
                                         std::string& error);
 
-// 写一段对话（覆盖同名文件）
+// 历史列表只读小型 .meta.json；旧文件或坏摘要按文件名/时间展示，不预读正文。
+std::vector<StoredSession> listSessions(ToolBackend& backend, std::string& dir, int limit,
+                                       std::string& error);
+// 用户选中后才读取这一份正文；失败/截断不改变 out。
+bool readSessionFile(ToolBackend& backend, const std::string& dir, const std::string& file,
+                     StoredSession& out, std::string& error);
+
+// 序列化正文超过 kMaxSessionFileBytes 时不写任何文件，record 保持完整。
+// 写正文后尽力保存列表摘要。正文成功但摘要失败时仍返回 true，error 为提示。
 bool writeSessionFile(ToolBackend& backend, const std::string& dir, const std::string& file,
                       const SessionRecord& record, std::string& error);
 

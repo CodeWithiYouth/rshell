@@ -2,6 +2,8 @@
 #include "../src/gui_main.cpp"
 #include "../src/md_render.h"
 #include "../src/ai_settings.h"
+#include "../src/ui_animation.h"
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 
@@ -36,6 +38,242 @@ void check(bool value, const char* message) {
     ++checks;
     if (!value) throw std::runtime_error(message);
 }
+
+void tweenRegression() {
+    const auto closeEnough = [](float a, float b) { return std::abs(a - b) < 0.00001f; };
+    ui::Tween stable(0.25f);
+    check(closeEnough(stable.value(0), 0.25f) && closeEnough(stable.value(999999), 0.25f) && !stable.active(0),
+          "an idle tween keeps its initial value without scheduling frames");
+    stable.to(1.0f, 1000, 100);
+    check(closeEnough(stable.value(999), 0.25f) && closeEnough(stable.value(1000), 0.25f) && stable.active(999),
+          "the start boundary and an earlier timestamp do not underflow or jump");
+    bool increasing = true;
+    float previous = stable.value(1000);
+    for (std::uint64_t now = 1005; now <= 1100; now += 5) {
+        const float value = stable.value(now);
+        increasing = increasing && value >= previous && value >= 0.25f && value <= 1.0f;
+        previous = value;
+    }
+    check(increasing && stable.active(1099) && !stable.active(1100) && closeEnough(stable.value(1100), 1.0f),
+          "a tween advances monotonically and stops exactly at its endpoint");
+
+    ui::Tween repeated;
+    repeated.to(1.0f, 1000, 100);
+    const float middle = repeated.value(1050);
+    repeated.to(1.0f, 1050, 100);
+    check(closeEnough(repeated.value(1050), middle) && closeEnough(repeated.value(1100), 1.0f) && !repeated.active(1100),
+          "repeated hover notifications do not extend an existing transition");
+
+    ui::Tween reversed;
+    reversed.to(1.0f, 1000, 100);
+    const float turning = reversed.value(1040);
+    reversed.to(0.0f, 1040, 100);
+    check(closeEnough(reversed.value(1040), turning) && reversed.value(1090) < turning &&
+              reversed.value(1090) > 0.0f && closeEnough(reversed.value(1140), 0.0f) && !reversed.active(1140),
+          "leaving halfway through hover reverses smoothly from the displayed value");
+    reversed.to(1.0f, 1200, 100);
+    const float beforeRetarget = reversed.value(1230);
+    reversed.to(0.5f, 1230, 100);
+    check(closeEnough(reversed.value(1230), beforeRetarget), "rapid target changes preserve visual continuity");
+    reversed.finish();
+    check(closeEnough(reversed.value(1230), 0.5f) && !reversed.active(1230),
+          "finishing for hide or minimize immediately settles at the requested target");
+    reversed.to(0.75f, 1300, 0);
+    check(closeEnough(reversed.value(1300), 0.75f) && !reversed.active(1300),
+          "disabled motion uses an immediate endpoint without a timer");
+    reversed.to(1.0f, 1400, 100);
+    reversed.snap(0.125f);
+    check(closeEnough(reversed.value(1450), 0.125f) && closeEnough(reversed.value(999999), 0.125f) && !reversed.active(1450),
+          "snap clears a pending transition and remains stable");
+    ui::Tween zeroEpoch;
+    zeroEpoch.to(1.0f, 0, 1);
+    check(closeEnough(zeroEpoch.value(0), 0.0f) && zeroEpoch.active(0) &&
+              closeEnough(zeroEpoch.value(1), 1.0f) && !zeroEpoch.active(1),
+          "a transition starting at timestamp zero still completes correctly");
+}
+
+void buttonAndConnectionAnimationRegression() {
+    const auto closeEnough = [](float a, float b) { return std::abs(a - b) < 0.00001f; };
+    const UiMotion savedMotion = g_uiMotion;
+    const int savedHover = g_app.hoverButton, savedPress = g_app.pressButton;
+    const int savedTitleHover = g_app.hoverTitleBtn, savedTitlePress = g_app.pressTitleBtn;
+    const bool savedAiHover = g_app.hoverTitleAi, savedAiPress = g_app.pressTitleAi;
+    const bool savedConnecting = g_app.connecting, savedError = g_app.statusError;
+    finishUiAnimations();
+    g_uiMotion = UiMotion{};
+    g_app.hoverButton = g_app.pressButton = g_app.hoverTitleBtn = g_app.pressTitleBtn = -1;
+    g_app.hoverTitleAi = g_app.pressTitleAi = false;
+    g_app.connecting = g_app.statusError = false;
+    syncUiAnimationTargets(1000, false);
+    check(!g_uiMotion.timerArmed && !uiAnimationsActive(1000), "initial UI colors do not arm an idle animation timer");
+    const auto toggle = std::find_if(g_app.buttons.begin(), g_app.buttons.end(),
+        [](const App::UiButton& button) { return button.id == ID_BTN_FS_TOGGLE; });
+    check(toggle != g_app.buttons.end(), "the file-panel toggle is available for hover animation checks");
+    const POINT at{(toggle->rc.left + toggle->rc.right) / 2, (toggle->rc.top + toggle->rc.bottom) / 2};
+    check(hitButton(at) == ID_BTN_FS_TOGGLE, "the animation test uses the real toggle hit area");
+    const LPARAM position = MAKELPARAM(at.x, at.y);
+
+    SendMessageW(g_app.main, WM_MOUSEMOVE, 0, position);
+    syncUiAnimationTargets(1100, true);
+    check(g_app.hoverButton == ID_BTN_FS_TOGGLE && g_uiMotion.timerArmed &&
+              closeEnough(buttonMotionAmount(ID_BTN_FS_TOGGLE, false, 1100), 0.0f),
+          "hover starts a finite transition from the current button color");
+    updateUiAnimations(1130);
+    const float entering = buttonMotionAmount(ID_BTN_FS_TOGGLE, false, 1130);
+    check(entering > 0.0f && entering < 1.0f, "hover passes through an intermediate color");
+    syncUiAnimationTargets(1160, true);
+    updateUiAnimations(1220);
+    check(closeEnough(buttonMotionAmount(ID_BTN_FS_TOGGLE, false, 1220), 1.0f) && !g_uiMotion.timerArmed,
+          "repeated hover state stops at the original transition endpoint");
+
+    SendMessageW(g_app.main, WM_LBUTTONDOWN, MK_LBUTTON, position);
+    syncUiAnimationTargets(1230, true);
+    updateUiAnimations(1300);
+    check(g_app.pressButton == ID_BTN_FS_TOGGLE && closeEnough(buttonMotionAmount(ID_BTN_FS_TOGGLE, true, 1300), 1.0f),
+          "a real button press reaches the pressed color without activating its action");
+    SendMessageW(g_app.main, WM_LBUTTONUP, 0, MAKELPARAM(-10, -10));
+    syncUiAnimationTargets(1320, true);
+    updateUiAnimations(1390);
+    check(g_app.pressButton == -1 && closeEnough(buttonMotionAmount(ID_BTN_FS_TOGGLE, true, 1390), 0.0f),
+          "releasing outside a button restores its pressed color");
+    SendMessageW(g_app.main, WM_MOUSELEAVE, 0, 0);
+    syncUiAnimationTargets(1400, true);
+    updateUiAnimations(1460);
+    const float leaving = buttonMotionAmount(ID_BTN_FS_TOGGLE, false, 1460);
+    check(leaving > 0.0f && leaving < 1.0f, "mouse leave fades through the hover color instead of sticking");
+    updateUiAnimations(1520);
+    check(closeEnough(buttonMotionAmount(ID_BTN_FS_TOGGLE, false, 1520), 0.0f) &&
+              !g_uiMotion.timerArmed && !uiAnimationsActive(1520),
+          "hover leave ends completely and removes the shared animation timer");
+
+    SendMessageW(g_app.main, WM_MOUSEMOVE, 0, position);
+    syncUiAnimationTargets(1600, true);
+    const float beforeReverse = buttonMotionAmount(ID_BTN_FS_TOGGLE, false, 1640);
+    SendMessageW(g_app.main, WM_MOUSELEAVE, 0, 0);
+    syncUiAnimationTargets(1640, true);
+    check(closeEnough(buttonMotionAmount(ID_BTN_FS_TOGGLE, false, 1640), beforeReverse),
+          "quick enter-and-leave retargets from the displayed color without a jump");
+    updateUiAnimations(1760);
+
+    g_app.connecting = true;
+    syncUiAnimationTargets(2000, true);
+    const int connectingKey = g_uiMotion.connectionKey;
+    check(g_uiMotion.connectionTo == ui::warn && g_uiMotion.feedback.active(2000) && g_uiMotion.timerArmed,
+          "entering the connecting state starts a brief state feedback transition");
+    const auto connectionBeforeRetarget = animatedConnectionColor(2110);
+    g_app.connecting = false;
+    g_app.statusError = true;
+    syncUiAnimationTargets(2110, true);
+    check(g_uiMotion.connectionKey != connectingKey && g_uiMotion.connectionTo == ui::danger &&
+              animatedConnectionColor(2110) == connectionBeforeRetarget,
+          "an arriving connection error retargets continuously to the error color");
+    updateUiAnimations(2710);
+    check(animatedConnectionColor(2710) == ui::danger && !g_uiMotion.feedback.active(2710) &&
+              !g_uiMotion.timerArmed && !uiAnimationsActive(2710),
+          "connection feedback settles and never leaves a permanent frame timer");
+
+    g_app.hoverButton = ID_BTN_FS_TOGGLE;
+    syncUiAnimationTargets(3000, true);
+    check(g_uiMotion.timerArmed, "the visibility guard test starts with a pending animation");
+    SendMessageW(g_app.main, WM_TIMER, kUiAnimationTimer, 0);
+    check(!g_uiMotion.timerArmed && !uiAnimationsActive(3000),
+          "the real animation timer handler settles motion when the main window is hidden");
+    g_app.hoverButton = -1;
+    syncUiAnimationTargets(3100, false);
+    g_app.hoverButton = ID_BTN_FS_TOGGLE;
+    syncUiAnimationTargets(3200, true);
+    SendMessageW(g_app.main, WM_SIZE, SIZE_MINIMIZED, 0);
+    check(!g_uiMotion.timerArmed && !uiAnimationsActive(3200),
+          "minimize settles pending button and connection transitions");
+    finishUiAnimations();
+    g_app.hoverButton = savedHover; g_app.pressButton = savedPress;
+    g_app.hoverTitleBtn = savedTitleHover; g_app.pressTitleBtn = savedTitlePress;
+    g_app.hoverTitleAi = savedAiHover; g_app.pressTitleAi = savedAiPress;
+    g_app.connecting = savedConnecting; g_app.statusError = savedError;
+    g_uiMotion = savedMotion;
+    g_uiMotion.timerArmed = false;
+}
+
+void saveDcBmp(HDC dc, int width, int height, const char* path);
+
+void mainPartialPaintRegression() {
+    const int oldHover = g_app.hoverButton, oldPress = g_app.pressButton;
+    g_app.hoverButton = g_app.pressButton = -1;
+    finishUiAnimations();
+    RECT client{};
+    GetClientRect(g_app.main, &client);
+    HDC screen = GetDC(nullptr);
+    const bool buffered = g_mainBackBuffer.ensure(screen, client.right, client.bottom);
+    ReleaseDC(nullptr, screen);
+    check(buffered, "create the main paint buffer from a real display DC");
+    syncUiAnimationTargets(1000, false);
+    drawMain(g_mainBackBuffer.dc, client);
+    const HBITMAP reusable = g_mainBackBuffer.bitmap;
+    check(reusable != nullptr, "the main window owns a reusable paint buffer");
+    const auto capture = [&]() {
+        const int width = g_mainBackBuffer.width, height = g_mainBackBuffer.height;
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = -height;
+        info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+        HDC copy = CreateCompatibleDC(g_mainBackBuffer.dc);
+        void* pixels = nullptr;
+        HBITMAP bitmap = CreateDIBSection(copy, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        check(copy && bitmap && pixels, "create a pixel capture for clipped main-window repaint");
+        HGDIOBJ old = SelectObject(copy, bitmap);
+        BitBlt(copy, 0, 0, width, height, g_mainBackBuffer.dc, 0, 0, SRCCOPY);
+        GdiFlush();
+        std::vector<std::uint32_t> result(static_cast<std::size_t>(width) * height);
+        std::memcpy(result.data(), pixels, result.size() * sizeof(result[0]));
+        SelectObject(copy, old); DeleteObject(bitmap); DeleteDC(copy);
+        return result;
+    };
+    const auto toggle = std::find_if(g_app.buttons.begin(), g_app.buttons.end(),
+        [](const App::UiButton& button) { return button.id == ID_BTN_FS_TOGGLE; });
+    check(toggle != g_app.buttons.end(), "the partial paint regression finds the animated button");
+    const auto before = capture();
+    g_app.hoverButton = ID_BTN_FS_TOGGLE;
+    syncUiAnimationTargets(1100, false);
+    const int saved = SaveDC(g_mainBackBuffer.dc);
+    const RECT dirty = buttonPaintBounds(toggle->rc);
+    IntersectClipRect(g_mainBackBuffer.dc, dirty.left, dirty.top, dirty.right, dirty.bottom);
+    drawMain(g_mainBackBuffer.dc, client);
+    RestoreDC(g_mainBackBuffer.dc, saved);
+    const auto partial = capture();
+    const char* preview = std::getenv("RSHELL_ANIMATION_PREVIEW");
+    if (preview) saveDcBmp(g_mainBackBuffer.dc, g_mainBackBuffer.width, g_mainBackBuffer.height, preview);
+    drawMain(g_mainBackBuffer.dc, client);
+    const auto full = capture();
+    if (preview) {
+        const std::string fullPath = std::string(preview) + ".full.bmp";
+        saveDcBmp(g_mainBackBuffer.dc, g_mainBackBuffer.width, g_mainBackBuffer.height, fullPath.c_str());
+    }
+    check(partial != before, "the clipped paint actually updates the hovered button pixels");
+    if (partial != full) {
+        std::size_t differences = 0;
+        RECT bounds{g_mainBackBuffer.width, g_mainBackBuffer.height, 0, 0};
+        for (std::size_t i = 0; i < std::min(partial.size(), full.size()); ++i) {
+            if (partial[i] == full[i]) continue;
+            ++differences;
+            const LONG x = static_cast<LONG>(i % g_mainBackBuffer.width);
+            const LONG y = static_cast<LONG>(i / g_mainBackBuffer.width);
+            bounds.left = std::min(bounds.left, x); bounds.right = std::max(bounds.right, x + 1);
+            bounds.top = std::min(bounds.top, y); bounds.bottom = std::max(bounds.bottom, y + 1);
+        }
+        std::cerr << "main partial/full pixel differences=" << differences << " bounds=["
+                  << bounds.left << ',' << bounds.top << ',' << bounds.right << ',' << bounds.bottom
+                  << "] button=[" << toggle->rc.left << ',' << toggle->rc.top << ','
+                  << toggle->rc.right << ',' << toggle->rc.bottom << "]\n";
+    }
+    check(partial == full, "clipped button repaint matches the complete main-window paint pixel for pixel");
+    screen = GetDC(nullptr);
+    const bool reused = g_mainBackBuffer.ensure(screen, client.right, client.bottom) &&
+                        g_mainBackBuffer.bitmap == reusable;
+    ReleaseDC(nullptr, screen);
+    check(reused, "animation frames reuse the same main-window bitmap");
+    g_app.hoverButton = oldHover; g_app.pressButton = oldPress;
+    InvalidateRect(g_app.main, nullptr, FALSE);
+}
 std::string output(const SessionState& state) {
     std::string text;
     for (std::size_t i = 0; i < state.termData.lineCount(); ++i)
@@ -51,6 +289,247 @@ void dispatchText(UINT_PTR connection, const std::string& text) {
 }
 void dispatchFs(UINT_PTR connection, const FsEvent& event) {
     SendMessageW(g_app.main, WM_FS_EVENT, connection, reinterpret_cast<LPARAM>(new FsEvent(event)));
+}
+
+void shellOutputBufferRegression() {
+    ShellOutputBuffer buffer(32);
+    std::atomic<int> notices{0};
+    std::atomic<bool> finished{false};
+    const std::string expected = std::string(1000, 'a') + "中文🙂TAIL";
+    std::thread producer([&]() {
+        buffer.push(expected, [&]() { ++notices; return true; });
+        finished = true;
+    });
+    std::string received;
+    bool bounded = true;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while ((!finished || buffer.pendingBytes()) && std::chrono::steady_clock::now() < until) {
+        bounded = bounded && buffer.pendingBytes() <= 32;
+        received += buffer.take(7);
+        buffer.finishBatch();
+        std::this_thread::yield();
+    }
+    buffer.close();
+    producer.join();
+    check(bounded && received == expected, "bounded receive buffer preserves every byte and ordering under backpressure");
+
+    ShellOutputBuffer merged;
+    int notifications = 0;
+    std::string expectedMerged;
+    for (int i = 0; i < 100; ++i) {
+        merged.push("chunk", [&]() { ++notifications; return true; });
+        expectedMerged += "chunk";
+    }
+    check(notifications == 1, "many received chunks share one pending notification");
+    check(merged.take(500) == expectedMerged, "coalescing preserves all chunk boundaries and data");
+    merged.finishBatch();
+    merged.push("retry", []() { return false; });
+    check(merged.take(500) == "retry", "a failed notification does not discard received data");
+
+    ShellOutputBuffer stopped(1);
+    stopped.push("x", []() { return true; });
+    std::atomic<bool> entered{false};
+    bool accepted = true;
+    std::thread blocked([&]() {
+        entered = true;
+        accepted = stopped.push("y", []() { return true; });
+    });
+    while (!entered.load()) std::this_thread::yield();
+    stopped.close();
+    blocked.join();
+    check(!accepted, "closing releases a receive callback waiting for buffer space");
+}
+
+void terminalReceiveRegression() {
+    const UINT_PTR previousConnection = g_app.connectionId;
+    newSessionTab();
+    const UINT_PTR currentConnection = g_app.connectionId;
+    SessionState* previous = findSessionState(previousConnection, true);
+    check(previous != nullptr, "receive regression keeps the previous tab");
+    ValidateRect(g_app.term, nullptr);
+    previous->shellOutput->push("QUEUED_BACKGROUND\r\n", []() { return true; });
+    SendMessageW(g_app.main, WM_SHELL_FLUSH, previousConnection, 0);
+    check(output(*findSessionState(previousConnection, true)).find("QUEUED_BACKGROUND") != std::string::npos,
+          "queued background output reaches the owning terminal");
+    check(!GetUpdateRect(g_app.term, nullptr, FALSE), "background output does not invalidate the visible terminal");
+
+    std::string stream;
+    for (int i = 0; i < 4000; ++i) stream += "RECORD " + std::to_string(i) + " 中文🙂\r\n";
+    stream += "FINAL_TAIL\r\n";
+    g_app.shellOutput->push(stream, []() { return false; });
+    SendMessageW(g_app.main, WM_SHELL_CLOSED, currentConnection,
+                 reinterpret_cast<LPARAM>(new std::string("远端会话已结束（退出码 0）")));
+    check(g_app.pendingShellClose != nullptr, "close waits for already received output");
+    while (g_app.shellOutput->pendingBytes())
+        SendMessageW(g_app.main, WM_SHELL_FLUSH, currentConnection, 0);
+    MSG message{};
+    while (PeekMessageW(&message, g_app.main, WM_SHELL_CLOSED, WM_SHELL_CLOSED, PM_REMOVE))
+        DispatchMessageW(&message);
+    const std::string text = output(g_app);
+    const auto tail = text.find("FINAL_TAIL");
+    const auto ended = text.find("远端会话已结束");
+    check(text.find("RECORD 0 中文🙂") != std::string::npos && tail != std::string::npos && ended > tail,
+          "received chunks remain complete and precede their close marker even after a notification failure");
+    closeSessionTab(g_activeTab);
+}
+
+void terminalPartialPaintRegression() {
+    const std::string savedSession = g_app.currentSession;
+    const bool savedCursor = g_app.cursorOn;
+    Terminal savedTerminal = std::move(g_app.termData);
+    g_app.termData = Terminal(60, 18);
+    g_app.termData.feed("first row\r\n中文🙂 wide\r\n\x1b[31mcolored\x1b[0m\r\ncursor");
+    g_app.currentSession = "paint-test";
+    constexpr int width = 640, height = 400;
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = width; info.bmiHeader.biHeight = -height;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+    HDC reference = CreateCompatibleDC(nullptr), partial = CreateCompatibleDC(nullptr);
+    void* refPixels = nullptr; void* partialPixels = nullptr;
+    HBITMAP refBitmap = CreateDIBSection(reference, &info, DIB_RGB_COLORS, &refPixels, nullptr, 0);
+    HBITMAP partialBitmap = CreateDIBSection(partial, &info, DIB_RGB_COLORS, &partialPixels, nullptr, 0);
+    HGDIOBJ refOld = SelectObject(reference, refBitmap), partOld = SelectObject(partial, partialBitmap);
+    g_app.cursorOn = true;
+    drawTerminalGrid(partial, width, height, true, true);
+    g_app.cursorOn = false;
+    const int top = g_app.termPadY + g_app.termData.cursorRow() * g_app.cellH;
+    const RECT row{g_app.termPadX, top, width - g_app.scrollbarW, top + g_app.cellH};
+    const int saved = SaveDC(partial);
+    IntersectClipRect(partial, row.left, row.top, row.right, row.bottom);
+    drawTerminalGrid(partial, width, height, true, true, &row);
+    RestoreDC(partial, saved);
+    drawTerminalGrid(reference, width, height, true, true);
+    GdiFlush();
+    const bool equal = refPixels && partialPixels &&
+        std::memcmp(refPixels, partialPixels, width * height * 4) == 0;
+    SelectObject(reference, refOld); SelectObject(partial, partOld);
+    DeleteObject(refBitmap); DeleteObject(partialBitmap); DeleteDC(reference); DeleteDC(partial);
+    g_app.termData = std::move(savedTerminal);
+    g_app.currentSession = savedSession; g_app.cursorOn = savedCursor;
+    check(equal, "partial cursor repaint matches a full repaint pixel for pixel");
+}
+
+void aiOpenAnimationRegression() {
+    // A second terminal makes accidental per-frame reflow of background tabs observable.
+    const std::size_t previousTab = g_activeTab;
+    newSessionTab();
+    for (int i = 0; i < 64; ++i) g_app.termData.feed("animation history " + std::to_string(i) + " 中文🙂\r\n");
+    struct TerminalSnapshot {
+        SessionState* state;
+        int cols, rows;
+        std::size_t history;
+        std::string text;
+    };
+    std::vector<TerminalSnapshot> terminals;
+    const auto remember = [&](SessionState& state) {
+        terminals.push_back({&state, state.termData.cols(), state.termData.rows(),
+                             state.termData.scrollbackCount(), output(state)});
+    };
+    remember(g_app);
+    for (auto& state : g_tabs) if (state) remember(*state);
+    RECT terminalBounds{};
+    GetWindowRect(g_app.term, &terminalBounds);
+    const auto terminalsUnchanged = [&]() {
+        RECT current{};
+        GetWindowRect(g_app.term, &current);
+        if (!EqualRect(&terminalBounds, &current)) return false;
+        for (const auto& saved : terminals)
+            if (saved.state->termData.cols() != saved.cols || saved.state->termData.rows() != saved.rows ||
+                saved.state->termData.scrollbackCount() != saved.history || output(*saved.state) != saved.text)
+                return false;
+        return true;
+    };
+
+    ai::AiTabContext context;
+    context.uiFont = g_app.uiFont; context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font; context.captionFont = g_app.tinyFont;
+    std::unique_ptr<ai::AiTab, decltype(&ai::AiTab::destroy)> tab(
+        ai::AiTab::create(g_app.main, context), &ai::AiTab::destroy);
+    check(tab != nullptr, "create a hidden-parent animation panel");
+    const auto childBounds = [&]() {
+        RECT bounds{};
+        GetWindowRect(tab->window(), &bounds);
+        MapWindowPoints(nullptr, g_app.main, reinterpret_cast<POINT*>(&bounds), 2);
+        return bounds;
+    };
+    const auto hasClip = [&]() {
+        HRGN region = CreateRectRgn(0, 0, 0, 0);
+        const bool clipped = GetWindowRgn(tab->window(), region) != ERROR;
+        DeleteObject(region);
+        return clipped;
+    };
+    RECT logical{20, 30, 440, 430};
+    tab->setBounds(logical);
+    tab->show(true);
+    const HWND focusBefore = GetFocus();
+    tab->animateOpen();
+    check(!tab->openAnimationActiveForTest() && !hasClip(),
+          "normal opening does not start a timer for an invisible parent");
+    tab->animateOpenForTest(1000);
+    check(tab->openAnimationActiveForTest() && tab->openAnimationOffsetForTest() > 0 && hasClip(),
+          "explicit animation starts with a bounded reveal region");
+    int previousOffset = tab->openAnimationOffsetForTest();
+    for (std::uint64_t now = 1000; now <= 1170; now += 17) {
+        tab->advanceOpenAnimationForTest(now);
+        const RECT actual = childBounds();
+        const RECT intended = tab->logicalBoundsForTest();
+        const int offset = tab->openAnimationOffsetForTest();
+        check(EqualRect(&logical, &intended) && actual.left == logical.left + offset &&
+                  actual.top == logical.top && actual.right - actual.left == logical.right - logical.left &&
+                  actual.bottom - actual.top == logical.bottom - logical.top && offset <= previousOffset,
+              "AI reveal moves monotonically without changing the final bounds or panel size");
+        check(terminalsUnchanged(), "AI animation frames never resize or reflow foreground/background terminals");
+        check(GetFocus() == focusBefore, "AI reveal frames never steal input focus");
+        previousOffset = offset;
+    }
+    RECT actual = childBounds();
+    check(!tab->openAnimationActiveForTest() && tab->openAnimationOffsetForTest() == 0 &&
+              EqualRect(&actual, &logical) && !hasClip(),
+          "AI reveal finishes at the exact bounds and removes its timer state and crop");
+    tab->advanceOpenAnimationForTest(999999);
+    actual = childBounds();
+    check(EqualRect(&actual, &logical) && !tab->openAnimationActiveForTest(),
+          "late animation ticks cannot restart a completed reveal");
+
+    tab->animateOpenForTest(2000);
+    tab->advanceOpenAnimationForTest(2040);
+    const int beforeSameBounds = tab->openAnimationOffsetForTest();
+    tab->setBounds(logical);
+    tab->show(true);
+    check(tab->openAnimationActiveForTest() && tab->openAnimationOffsetForTest() == beforeSameBounds,
+          "repeating the same final layout does not restart or cancel the reveal");
+    logical = RECT{30, 35, 490, 455};
+    tab->setBounds(logical);
+    actual = childBounds();
+    check(!tab->openAnimationActiveForTest() && EqualRect(&actual, &logical) && !hasClip(),
+          "a real layout change settles animation before resizing and leaves no crop");
+
+    tab->animateOpenForTest(3000);
+    tab->advanceOpenAnimationForTest(3030);
+    tab->show(false);
+    actual = childBounds();
+    check(!tab->openAnimationActiveForTest() && tab->openAnimationOffsetForTest() == 0 &&
+              !(GetWindowLongPtrW(tab->window(), GWL_STYLE) & WS_VISIBLE) &&
+              EqualRect(&actual, &logical) && !hasClip(),
+          "rapid close restores bounds and cancels the reveal before hiding");
+    tab->show(true);
+    tab->animateOpenForTest(3100);
+    check(tab->openAnimationActiveForTest(), "a quickly reopened panel can animate afresh");
+    tab->animateOpen(false);
+    actual = childBounds();
+    check(!tab->openAnimationActiveForTest() && EqualRect(&actual, &logical) && !hasClip(),
+          "disabled motion immediately restores the complete panel");
+    tab->animateOpenForTest(3200);
+    tab->finishOpenAnimation();
+    tab->finishOpenAnimation();
+    check(!tab->openAnimationActiveForTest() && tab->openAnimationOffsetForTest() == 0 && !hasClip() &&
+              GetFocus() == focusBefore && terminalsUnchanged(),
+          "finishing for minimize is idempotent and preserves terminal geometry and focus");
+    tab.reset();
+    closeSessionTab(g_activeTab);
+    if (g_activeTab != previousTab) switchSessionTab(previousTab);
+    check(g_activeTab == previousTab, "animation regression restores the original active session");
 }
 void stateRegression() {
     check(g_tabs.size() == 1, "initial blank tab exists");
@@ -663,7 +1142,7 @@ void panelScrollRegression() {
     check(panel.scrollOffset() >= parked, "new content does not yank a scrolled-up view");
 
     // 贴底状态下新增内容要跟随
-    panel.onMouseWheel(-WHEEL_DELTA);
+    panel.onMouseWheel(-10000 * WHEEL_DELTA);
     panel.paint(mem);
     panel.addTool(L"读取 /etc/os-release", L"NAME=Linux", true, L"0.2 KB");
     panel.paint(mem);
@@ -700,6 +1179,125 @@ void panelScrollRegression() {
     DeleteObject(bmp);
     DeleteDC(mem);
     ReleaseDC(nullptr, screen);
+}
+
+void panelReasoningGroupingRegression() {
+    ai::ChatPanel panel;
+    panel.appendReasoning(L"first ");
+    panel.appendReasoning(L"thought");
+    check(panel.items().size() == 1 && panel.items()[0].body == L"first thought",
+          "consecutive reasoning deltas stay in a single contiguous group");
+    const auto answer = panel.beginAssistant();
+    panel.appendAssistant(answer, L"answer");
+    panel.appendReasoning(L"second thought");
+    check(panel.items().size() == 3 && panel.items()[0].body == L"first thought" &&
+              panel.items()[1].kind == ai::ItemKind::Assistant && panel.items()[2].body == L"second thought",
+          "reasoning after text creates a new item instead of modifying an older group");
+    panel.addTool(L"tool", L"result", true, L"");
+    panel.appendReasoning(L"after tool");
+    check(panel.items().size() == 5 && panel.items()[3].kind == ai::ItemKind::Tool &&
+              panel.items()[4].body == L"after tool" && panel.items()[2].body == L"second thought",
+          "a tool boundary keeps subsequent reasoning after the tool card");
+    panel.addUser(L"next round");
+    panel.appendReasoning(L"new round thought");
+    check(panel.items().size() == 7 && panel.items()[5].kind == ai::ItemKind::User &&
+              panel.items()[6].body == L"new round thought" && panel.items()[4].body == L"after tool",
+          "a new user turn never appends reasoning into the previous turn");
+}
+
+void panelReadingAnchorRegression() {
+    ai::ChatPanel panel;
+    ai::PanelFonts fonts;
+    fonts.ui = g_app.uiFont; fonts.bold = g_app.uiFontBold;
+    fonts.mono = g_app.font; fonts.caption = g_app.tinyFont;
+    panel.setFonts(fonts);
+    panel.setBounds(RECT{0, 0, 520, 600});
+    for (int i = 0; i < 24; ++i) {
+        panel.addUser(L"Question " + std::to_wstring(i) +
+                      L" keeps enough wrapping text to exercise an anchor when the panel becomes narrower.");
+        const auto answer = panel.beginAssistant();
+        panel.appendAssistant(answer, L"Answer " + std::to_wstring(i) +
+                              L"\n\nA completed answer with 中文 content before the live tail.");
+    }
+    const auto tail = panel.beginAssistant();
+    panel.appendAssistant(tail, L"The live answer begins here.\n");
+    HDC screen = GetDC(nullptr), dc = CreateCompatibleDC(screen);
+    HBITMAP bitmap = CreateCompatibleBitmap(screen, 520, 700);
+    HGDIOBJ old = SelectObject(dc, bitmap);
+    panel.paint(dc);
+    panel.onMouseWheel(10000 * WHEEL_DELTA);
+    panel.paint(dc);
+    panel.onMouseWheel(-10 * WHEEL_DELTA);
+    panel.paint(dc);
+    const RECT view = panel.viewRect();
+    std::size_t anchor = 0;
+    for (; anchor < panel.items().size(); ++anchor)
+        if (panel.itemRectForTest(anchor).bottom > view.top) break;
+    check(anchor > 0 && anchor < tail && !panel.stickToBottom(),
+          "reading anchor starts in existing history away from the live tail");
+    const int anchoredTop = panel.itemRectForTest(anchor).top;
+    check(panel.itemRectForTest(tail).top > view.bottom, "the streaming tail is outside the reader's viewport");
+    const auto unchanged = [&]() {
+        return panel.itemRectForTest(anchor).top == anchoredTop && !panel.stickToBottom();
+    };
+    std::wstring growth;
+    for (int i = 0; i < 120; ++i) growth += L"Additional streamed line " + std::to_wstring(i) + L".\n";
+    panel.appendAssistant(tail, growth);
+    const RECT composer = panel.composerRect();
+    panel.paint(dc, &composer);  // The first layout after hidden/offscreen output may be a caret repaint.
+    check(unchanged(), "a late composer repaint cannot move the historical reading position after tail growth");
+    panel.paint(dc);
+    panel.paint(dc);
+    check(unchanged(), "subsequent full repaints never apply the growth compensation twice");
+    panel.addTool(L"Read remote file", L"New tool details below the current reading position", true, L"");
+    panel.paint(dc);
+    check(unchanged(), "a new tool card keeps the historical message at the same screen position");
+    panel.addNotice(L"A background task completed.");
+    panel.paint(dc);
+    check(unchanged(), "a new notice preserves the reading anchor");
+    panel.addUser(L"A new user message can arrive while the reader remains in older history.");
+    panel.paint(dc);
+    check(unchanged(), "adding a new message does not force a scrolled-up reader to the bottom");
+
+    panel.setBounds(RECT{0, 0, 340, 600});
+    panel.paint(dc);
+    check(unchanged(), "narrowing the panel preserves the same message and local reading offset");
+    panel.setBounds(RECT{0, 0, 520, 700});
+    panel.paint(dc);
+    check(unchanged(), "width and height changes preserve the reading message instead of its distance from the bottom");
+    panel.onMouseWheel(-WHEEL_DELTA);
+    panel.paint(dc);
+    check(panel.itemRectForTest(anchor).top != anchoredTop,
+          "reading anchors never prevent an explicit user scroll");
+    panel.onMouseWheel(-10000 * WHEEL_DELTA);
+    panel.paint(dc);
+    check(panel.stickToBottom() && panel.scrollOffset() == 0, "scrolling back to the bottom resumes normal following");
+    const auto next = panel.beginAssistant();
+    panel.appendAssistant(next, growth);
+    panel.paint(dc);
+    check(panel.stickToBottom() && panel.scrollOffset() == 0, "a pinned reader continues following streamed output");
+
+    panel.onMouseWheel(WHEEL_DELTA);
+    panel.paint(dc);
+    panel.addApproval(L"Confirm remote command", L"echo test", false);
+    panel.paint(dc);
+    check(panel.stickToBottom() && panel.scrollOffset() == 0,
+          "a pending approval intentionally remains visible even when the reader had scrolled up");
+    panel.onMouseWheel(WHEEL_DELTA);
+    panel.paint(dc);
+    panel.clear();
+    panel.paint(dc);
+    check(panel.items().empty() && panel.scrollOffset() == 0 && panel.stickToBottom(),
+          "clearing history removes stale anchors and resets normal bottom following");
+    panel.addUser(L"short");
+    panel.paint(dc);
+    check(!panel.contentOverflows() && panel.scrollOffset() == 0, "short content starts without a stale historical offset");
+    const auto overflow = panel.beginAssistant();
+    panel.appendAssistant(overflow, growth);
+    panel.paint(dc);
+    check(panel.contentOverflows() && panel.scrollOffset() == 0 && panel.stickToBottom(),
+          "the first transition from short content to overflow keeps the normal pinned behavior");
+    SelectObject(dc, old); DeleteObject(bitmap); DeleteDC(dc); ReleaseDC(nullptr, screen);
 }
 
 void aiTabRegression() {    auto visible = [](HWND window) {
@@ -766,6 +1364,122 @@ void aiTabRegression() {    auto visible = [](HWND window) {
     if (g_app.aiOpen) toggleAiPanel();  // 留下干净状态给后面的用例
 }
 
+void aiStreamQueueRegression() {
+    ai::AiTabContext context;
+    context.uiFont = g_app.uiFont; context.boldFont = g_app.uiFontBold;
+    context.monoFont = g_app.font; context.captionFont = g_app.tinyFont;
+    using Tab = std::unique_ptr<ai::AiTab, decltype(&ai::AiTab::destroy)>;
+    const auto create = [&]() {
+        Tab tab(ai::AiTab::create(g_app.main, context), &ai::AiTab::destroy);
+        check(tab != nullptr, "create a panel for deterministic stream-queue checks");
+        tab->setBounds(RECT{0, 0, 460, 640});
+        return tab;
+    };
+    const auto pump = [](ai::AiTab& tab) {
+        MSG message{};
+        while (PeekMessageW(&message, tab.window(), 0, 0, PM_REMOVE))
+            DispatchMessageW(&message);
+    };
+    const auto assistantText = [](const ai::AiTab& tab) {
+        std::wstring text;
+        for (const auto& item : tab.transcript())
+            if (item.kind == ai::ItemKind::Assistant) text += item.body;
+        return text;
+    };
+
+    {
+        auto tab = create();
+        check(!tab->visualTimersActiveForTest(), "a never-shown panel starts without visual timers");
+        tab->enqueueStreamForTest(L"prefix");
+        check(tab->pendingStreamForTest() == 6 && tab->flushPostedForTest(),
+              "the first stream prefix owns one pending flush notification");
+        tab->flushStreamForTest([&]() { tab->enqueueStreamForTest(L"suffix"); });
+        check(assistantText(*tab) == L"prefix" && tab->pendingStreamForTest() == 6 && tab->flushPostedForTest(),
+              "a delta arriving immediately after detach retains its own pending wake-up");
+        tab->flushStreamForTest();
+        pump(*tab);
+        check(assistantText(*tab) == L"prefixsuffix" && tab->pendingStreamForTest() == 0 &&
+                  !tab->flushPostedForTest() && !tab->visualTimersActiveForTest(),
+              "coalesced notifications deliver every character once and leave no hidden frame timer");
+    }
+    {
+        auto tab = create();
+        tab->enqueueStreamForTest(L"before tool");
+        tab->enqueueToolForTest(L"tool boundary", L"tool result");
+        tab->enqueueStreamForTest(L"before approval");
+        tab->enqueueApprovalForTest(L"approval boundary", L"review this operation");
+        tab->enqueueStreamForTest(L"after approval");
+        pump(*tab);
+        const auto& items = tab->transcript();
+        check(items.size() == 5 && items[0].kind == ai::ItemKind::Assistant && items[0].body == L"before tool" &&
+                  items[1].kind == ai::ItemKind::Tool && items[1].body == L"tool result" &&
+                  items[2].kind == ai::ItemKind::Assistant && items[2].body == L"before approval" &&
+                  items[3].kind == ai::ItemKind::Approval && items[4].kind == ai::ItemKind::Assistant &&
+                  items[4].body == L"after approval",
+              "one queued batch preserves text/tool/text/approval/text order before any UI dispatch");
+        check(tab->pendingStreamForTest() == 0 && !tab->flushPostedForTest(),
+              "structural events never strand a later text delta behind an obsolete notification");
+    }
+    {
+        auto tab = create();
+        tab->enqueueStreamForTest(L"reason one", true);
+        tab->enqueueStreamForTest(L"answer one");
+        tab->enqueueStreamForTest(L"reason two", true);
+        tab->enqueueToolForTest(L"tool", L"result");
+        tab->enqueueStreamForTest(L"answer two");
+        pump(*tab);
+        const auto& items = tab->transcript();
+        check(items.size() == 5 && items[0].kind == ai::ItemKind::Reasoning && items[0].body == L"reason one" &&
+                  items[1].kind == ai::ItemKind::Assistant && items[1].body == L"answer one" &&
+                  items[2].kind == ai::ItemKind::Reasoning && items[2].body == L"reason two" &&
+                  items[3].kind == ai::ItemKind::Tool && items[4].body == L"answer two",
+              "alternating reasoning and answer segments retain their visible semantic boundaries");
+    }
+    {
+        auto tab = create();
+        tab->enqueueStreamForTest(L"stale prefix");
+        tab->enqueueToolForTest(L"stale tool");
+        tab->flushStreamForTest([&]() {
+            tab->resetStreamForTest();
+            tab->enqueueStreamForTest(L"fresh turn");
+        });
+        tab->flushStreamForTest();
+        pump(*tab);
+        check(tab->transcript().size() == 1 && assistantText(*tab) == L"fresh turn",
+              "resetting a conversation rejects the already-detached old text and structural prefix");
+    }
+    {
+        auto tab = create();
+        tab->show(true);
+        check(tab->visualTimersActiveForTest(), "a shown standalone panel can model active visual work");
+        const std::wstring first(4096, L'a'), second(1024, L'b'), minimized(1024, L'c');
+        tab->enqueueStreamForTest(first);
+        tab->flushStreamForTest();
+        tab->show(false);
+        check(assistantText(*tab) == first && !tab->visualTimersActiveForTest(),
+              "hiding flushes reveal buffers once and stops repaint/reveal/caret timers");
+        tab->enqueueStreamForTest(second);
+        tab->flushStreamForTest();
+        pump(*tab);
+        check(assistantText(*tab) == first + second && !tab->visualTimersActiveForTest(),
+              "hidden streaming appends complete batches without scheduling animation frames");
+        tab->setHostVisible(false);
+        tab->show(true);
+        tab->enqueueStreamForTest(minimized);
+        tab->flushStreamForTest();
+        pump(*tab);
+        check(assistantText(*tab) == first + second + minimized && !tab->visualTimersActiveForTest(),
+              "a minimized host keeps the conversation current with no visual timers");
+        tab->setHostVisible(true);
+        check(assistantText(*tab) == first + second + minimized && tab->visualTimersActiveForTest(),
+              "restoring the host synchronizes complete content and resumes visual work");
+        tab->show(false);
+        pump(*tab);
+        check(!tab->visualTimersActiveForTest() && tab->pendingStreamForTest() == 0,
+              "closing again leaves no stale text or permanent visual timer");
+    }
+}
+
 // 停靠 AI 面板会把终端压窄：必须折行（不是截断），收起后要能并回原样
 void terminalDockReflowRegression() {
     std::string original;
@@ -796,6 +1510,12 @@ void terminalDockReflowRegression() {
 class ProbeSessionBackend : public ai::ToolBackend {
 public:
     std::map<std::string, std::string> files;
+    std::atomic<int> bodyReads{0};
+    std::atomic<int> metadataReads{0};
+    std::atomic<bool> holdBodyReads{false};
+    std::atomic<bool> bodyReadWaiting{false};
+    std::atomic<bool> holdListings{false};
+    std::atomic<bool> listingWaiting{false};
 
     std::string homeDir() override { return "/home/probe"; }
     bool makeDir(const std::string&, std::string&) override { return true; }
@@ -804,6 +1524,16 @@ public:
     }
     bool readFile(const std::string& path, std::size_t, std::string& out, bool& truncated,
                   std::string& error, const std::string&) override {
+        if (endsWith(path, ".meta.json")) ++metadataReads;
+        else {
+            ++bodyReads;
+            if (holdBodyReads.load()) {
+                bodyReadWaiting = true;
+                // 有限等待，探针断言失败时也不会把清理线程永久卡住。
+                for (int i = 0; i < 3000 && holdBodyReads.load(); ++i) Sleep(1);
+                bodyReadWaiting = false;
+            }
+        }
         const auto it = files.find(path);
         if (it == files.end()) {
             error = "missing " + path;
@@ -820,6 +1550,11 @@ public:
     }
     bool listDir(const std::string& path, std::vector<ai::DirEntryView>& out, std::string&,
                  const std::string&) override {
+        if (holdListings.load()) {
+            listingWaiting = true;
+            for (int i = 0; i < 3000 && holdListings.load(); ++i) Sleep(1);
+            listingWaiting = false;
+        }
         const std::string prefix = path + "/";
         for (const auto& entry : files) {
             if (entry.first.compare(0, prefix.size(), prefix) != 0) continue;
@@ -852,8 +1587,11 @@ void aiSessionHistoryRegression() {
     newer.messages.push_back({true, "新的问题"});
     newer.messages.push_back({false, "新回答"});
 
-    store.files[dir + "/" + ai::sessionFileName(older, older.created)] = ai::serializeSession(older);
-    store.files[dir + "/" + ai::sessionFileName(newer, newer.created)] = ai::serializeSession(newer);
+    std::string saveError;
+    check(ai::writeSessionFile(store, dir, ai::sessionFileName(older, older.created), older, saveError),
+          "older history and its summary are stored");
+    check(ai::writeSessionFile(store, dir, ai::sessionFileName(newer, newer.created), newer, saveError),
+          "newer history and its summary are stored");
 
     ai::AiTabContext context;
     context.uiFont = g_app.uiFont;
@@ -873,6 +1611,7 @@ void aiSessionHistoryRegression() {
     context.pickFromList = [&](POINT, const std::vector<std::wstring>& list) {
         labels = list;
         ++picks;
+        check(store.bodyReads.load() == 1, "opening the picker does not fetch conversation bodies");
         return 1;  // 选第二行（较旧的那段）
     };
 
@@ -886,6 +1625,8 @@ void aiSessionHistoryRegression() {
               "the newest conversation is restored automatically");
     check(tab->transcript().front().kind == ai::ItemKind::User, "restored log starts with the user turn");
     check(tab->transcript().front().body == L"新的问题", "the newest conversation is the one restored");
+    check(store.bodyReads.load() == 1, "auto-restore only reads the latest body");
+    store.holdBodyReads = true;
 
     // 「历史」按钮：连上主机才有，点一下弹列表。
     // 探针窗口是隐藏的，RedrawWindow 不会派发 WM_PAINT，所以直接发一次让面板算出按钮位置。
@@ -900,11 +1641,47 @@ void aiSessionHistoryRegression() {
     check(labels[0].find(L"新对话") != std::wstring::npos, "newest conversation is listed first");
     check(labels[0].find(L"2 条") != std::wstring::npos, "list shows the message count");
     check(labels[0].find(L"#磁盘") != std::wstring::npos, "list shows the tags");
+    check(store.metadataReads.load() == 2, "the list reads only the two small metadata files");
+    waitUntil([&]() { return store.bodyReadWaiting.load(); }, "selected body is read in the background");
+    check(tab->transcript().front().body == L"新的问题", "the current log remains while the chosen body loads");
+    check(tab->statusForTest() == L"载入历史对话…", "the loading state stays responsive");
+    store.holdBodyReads = false;
 
     // 选第二行 → 换成旧对话
     waitUntil([&]() { return tab->transcript().front().body == L"旧的问题"; },
               "picking an older conversation replaces the log");
     check(tab->transcript().size() == 2, "the replaced log holds the stored turns only");
+    check(store.bodyReads.load() == 2, "selection fetches exactly one additional body");
+
+    // Close while metadata is still loading. A joined fake loader gives an
+    // exact barrier before dispatching its late SessionList event.
+    // applySession cleared the hit list; hidden windows do not repaint it automatically.
+    HDC screen = GetDC(nullptr), historyDc = CreateCompatibleDC(screen);
+    HBITMAP historyBitmap = CreateCompatibleBitmap(screen, 460, 640);
+    HGDIOBJ historyOld = SelectObject(historyDc, historyBitmap);
+    tab->paintForTest(historyDc);
+    SelectObject(historyDc, historyOld); DeleteObject(historyBitmap); DeleteDC(historyDc); ReleaseDC(nullptr, screen);
+    const RECT refreshedButton = tab->historyButton();
+    check(!IsRectEmpty(&refreshedButton), "restored history renders its current history-button hit area");
+    const LPARAM nextHistory = MAKELPARAM((refreshedButton.left + refreshedButton.right) / 2,
+                                          (refreshedButton.top + refreshedButton.bottom) / 2);
+    store.holdListings = true;
+    SendMessageW(tab->window(), WM_LBUTTONDOWN, MK_LBUTTON, nextHistory);
+    SendMessageW(tab->window(), WM_LBUTTONUP, 0, nextHistory);
+    waitUntil([&]() { return store.listingWaiting.load(); }, "history lookup is held before its result is delivered");
+    tab->show(false);
+    store.holdListings = false;
+    tab->waitSessionReadForTest();
+    tab->flushStreamForTest();
+    MSG pending{};
+    while (PeekMessageW(&pending, tab->window(), 0, 0, PM_REMOVE)) DispatchMessageW(&pending);
+    check(picks == 1 && !tab->visualTimersActiveForTest(),
+          "a history lookup finishing after close cannot open a hidden popup or restart frame timers");
+    tab->show(true);
+    tab->flushStreamForTest();
+    while (PeekMessageW(&pending, tab->window(), 0, 0, PM_REMOVE)) DispatchMessageW(&pending);
+    check(picks == 1 && tab->transcript().size() == 2 && tab->transcript().front().body == L"旧的问题",
+          "reopening cannot resurrect the old history menu or replace the current conversation");
 
     ai::AiTab::destroy(tab);
 }
@@ -1054,13 +1831,22 @@ void fsLoadingRegression() {
     g_app.fsReady = true;
     g_app.store.upsert(Session{});
     fsNavigate("/");
+    const auto oldRequest = g_app.fsRequestId;
     fsNavigate("/tmp");
     check(g_app.fsLoading, "a directory switch marks the panel as loading");
     check(g_app.fsEntries.empty(), "the old listing is cleared while loading");
+    FsEvent stale;
+    stale.kind = FsEventKind::Listing; stale.path = "/"; stale.requestId = oldRequest;
+    dispatchFs(connection, stale);
+    check(g_app.fsLoading && g_app.fsPath == "/tmp", "late listings do not replace the latest navigation or stop its loading state");
+    stale.kind = FsEventKind::Error; stale.message = "old failure";
+    dispatchFs(connection, stale);
+    check(g_app.fsLoading && g_app.fsError.empty(), "late navigation errors do not affect the current directory");
 
     FsEvent listing;
     listing.kind = FsEventKind::Listing;
     listing.path = "/tmp";
+    listing.requestId = g_app.fsRequestId;
     dispatchFs(connection, listing);
     check(!g_app.fsLoading, "the listing result clears the loading state");
 
@@ -1069,6 +1855,7 @@ void fsLoadingRegression() {
     fsRefresh();
     check(g_app.fsLoading, "a refresh is marked as loading too");
     FsEvent refreshed = listing;
+    refreshed.requestId = g_app.fsRequestId;
     refreshed.entries = {RemoteEntry{}};
     dispatchFs(connection, refreshed);
     check(!g_app.fsLoading, "a refresh result clears the loading state");
@@ -2403,7 +3190,7 @@ void windowPlacementRegression() {
     const auto path = std::filesystem::temp_directory_path() /
         ("rshell-ui-" + std::to_string(GetCurrentProcessId()) + "-" +
          std::to_string(GetTickCount64()) + ".ini");
-    SetEnvironmentVariableW(L"RSHELL_UI_CONFIG", path.c_str());
+    _putenv_s("RSHELL_UI_CONFIG", pathToUtf8(path).c_str());
     _putenv_s("RSHELL_NO_UI_SAVE", "");  // 只让这一项测试真正写临时布局文件
     RECT before{};
     GetWindowRect(g_app.main, &before);
@@ -2449,7 +3236,9 @@ int main(int argc, char** argv) {
     HWND window = nullptr;
     const auto settings=std::filesystem::temp_directory_path() / ("rshell-tabs-"+std::to_string(GetCurrentProcessId())+"-"+std::to_string(GetTickCount64())+".ini");
     const auto aiSettings=std::filesystem::temp_directory_path() / ("rshell-ai-"+std::to_string(GetCurrentProcessId())+".ini");
-    SetEnvironmentVariableW(L"RSHELL_AI_CONFIG", aiSettings.c_str());
+    const char* inheritedAiConfig = std::getenv("RSHELL_AI_CONFIG");
+    const std::string runnerAiConfig = inheritedAiConfig ? inheritedAiConfig : "";
+    _putenv_s("RSHELL_AI_CONFIG", pathToUtf8(aiSettings).c_str());
     try {
         _putenv_s("RSHELL_NO_UI_SAVE", "1");  // 探针不改用户真实布局
         g_app.inst = GetModuleHandleW(nullptr); g_app.dpi = 96;
@@ -2461,11 +3250,18 @@ int main(int argc, char** argv) {
         window = CreateWindowExW(0,kMainClass,L"tab-regression",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,
             0,0,1120,720,nullptr,nullptr,g_app.inst,nullptr);
         check(window != nullptr,"create hidden GUI window");
+        tweenRegression();
         stateRegression();
+        shellOutputBufferRegression();
+        terminalReceiveRegression();
+        terminalPartialPaintRegression();
         panelScrollRegression();
+        panelReasoningGroupingRegression();
+        panelReadingAnchorRegression();
         sessionMgrLayoutRegression();
         sessionButtonBorderRegression();
         aiTabRegression();
+        aiStreamQueueRegression();
         aiSessionHistoryRegression();
         aiUnlockCancelRegression();
         statusHintRegression();
@@ -2475,9 +3271,16 @@ int main(int argc, char** argv) {
         fsCollapseRegression();
         pasteFocusRegression();
         aiPanelPaintBench();
-        aiTaskStateRegression();
-        aiStreamSmoothingRegression();
-        reasoningStreamRegression();
+        {
+            struct RestoreAiConfig {
+                std::string isolated;
+                ~RestoreAiConfig() { _putenv_s("RSHELL_AI_CONFIG", isolated.c_str()); }
+            } restore{pathToUtf8(aiSettings)};
+            if (!runnerAiConfig.empty()) _putenv_s("RSHELL_AI_CONFIG", runnerAiConfig.c_str());
+            aiTaskStateRegression();
+            aiStreamSmoothingRegression();
+            reasoningStreamRegression();
+        }
         aiPanelFullButtonRegression();
         markdownCacheRegression();
         reasoningWrapRegression();
@@ -2492,15 +3295,22 @@ int main(int argc, char** argv) {
         titleAiButtonRegression();
         terminalDockReflowRegression();
         windowPlacementRegression();
+        buttonAndConnectionAnimationRegression();
+        aiOpenAnimationRegression();
+        mainPartialPaintRegression();
         if (argc == 5) networkRegression(std::stoi(argv[1]),argv[2],argv[3],argv[4]);
         DestroyWindow(window); window = nullptr;
         stopGdiplus(); g_app.runtime.reset();
         std::error_code error; std::filesystem::remove(settings,error);
+        std::filesystem::remove(aiSettings, error);
+        _putenv_s("RSHELL_AI_CONFIG", runnerAiConfig.c_str());
         std::cout << "PASS: " << checks << " multi-tab state, event routing, cleanup and DPI checks\n";
         return 0;
     } catch (const std::exception& ex) {
         if (window) DestroyWindow(window);
         std::error_code error; std::filesystem::remove(settings,error);
+        std::filesystem::remove(aiSettings, error);
+        _putenv_s("RSHELL_AI_CONFIG", runnerAiConfig.c_str());
         std::cerr << "FAIL after " << checks << " checks: " << ex.what() << '\n';
         return 1;
     }

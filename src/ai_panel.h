@@ -113,6 +113,7 @@ public:
     // 面板内容是否超过一屏（用于切换滚动条显示）
     bool contentOverflows() const { return contentHeight_ > viewportHeight_; }
     int contentHeight() const { return contentHeight_; }
+    RECT itemRectForTest(std::size_t index) const;
 
     void setBusy(bool busy);
     bool busy() const { return busy_; }
@@ -293,8 +294,10 @@ private:
     std::size_t selectStampTail_ = 0;
 };
 
+#ifdef RSHELL_ENABLE_DIAGNOSTICS
 // 离屏渲染一段演示对话到 32bpp BMP，用于人工核对界面（rshell-gui.exe --ai-preview <out.bmp>）
-// mode: 0=演示对话 1=空状态 2=长路径压力测试
+// mode: 0=演示对话 1=空状态 2=长路径压力测试 3=Markdown
 bool renderPreview(const wchar_t* bmpPath, int width, int height, int mode = 0);
+#endif
 
 }  // namespace rshell::ai

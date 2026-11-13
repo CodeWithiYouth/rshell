@@ -5,15 +5,18 @@
 #include <cstring>
 #include <fstream>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "progress.h"
+#include "operation_cancel.h"
 #include "util.h"
 
 #ifdef _WIN32
 #include <winsock2.h>
 #else
 #include <sys/select.h>
+#include <sys/socket.h>
 #endif
 
 namespace rshell {
@@ -21,8 +24,6 @@ namespace rshell {
 namespace {
 
 void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
-
-bool wouldBlock(int rc) { return rc == LIBSSH2_ERROR_EAGAIN; }
 
 std::string sftpStatusText(unsigned long code) {
     switch (code) {
@@ -70,28 +71,118 @@ fs::perms permsFromMode(unsigned int mode) {
     return p;
 }
 
-struct SftpHandleGuard {
-    LIBSSH2_SFTP_HANDLE* handle = nullptr;
-    bool keep = false;
-    explicit SftpHandleGuard(LIBSSH2_SFTP_HANDLE* h) : handle(h) {}
-    ~SftpHandleGuard() {
-        if (handle && !keep) libssh2_sftp_close_handle(handle);
-    }
-    SftpHandleGuard(const SftpHandleGuard&) = delete;
-    SftpHandleGuard& operator=(const SftpHandleGuard&) = delete;
-};
-
-// 传输期间切到非阻塞（配合 waitSocket），离开作用域时恢复阻塞模式
+// 网络调用期间使用非阻塞 IO，离开作用域时恢复原模式（支持嵌套）。
 struct BlockingModeGuard {
-    explicit BlockingModeGuard(LIBSSH2_SESSION* session) : session_(session) {
+    explicit BlockingModeGuard(LIBSSH2_SESSION* session)
+        : session_(session), previous_(libssh2_session_get_blocking(session)) {
         libssh2_session_set_blocking(session_, 0);
     }
-    ~BlockingModeGuard() { libssh2_session_set_blocking(session_, 1); }
+    ~BlockingModeGuard() { libssh2_session_set_blocking(session_, previous_); }
     BlockingModeGuard(const BlockingModeGuard&) = delete;
     BlockingModeGuard& operator=(const BlockingModeGuard&) = delete;
 
 private:
     LIBSSH2_SESSION* session_;
+    int previous_;
+};
+
+void interruptSocket(SshSession& session) {
+#ifdef _WIN32
+    shutdown(session.socketFd(), SD_BOTH);
+#else
+    shutdown(session.socketFd(), SHUT_RDWR);
+#endif
+}
+
+void waitSessionSocket(SshSession& session, int timeoutMs) {
+    const auto sock = session.socketFd();
+    const int directions = libssh2_session_block_directions(session.raw());
+    fd_set reads, writes;
+    FD_ZERO(&reads);
+    FD_ZERO(&writes);
+    if (directions & LIBSSH2_SESSION_BLOCK_INBOUND) FD_SET(sock, &reads);
+    if (directions & LIBSSH2_SESSION_BLOCK_OUTBOUND) FD_SET(sock, &writes);
+    timeval timeout{};
+    timeout.tv_sec = timeoutMs / 1000;
+    timeout.tv_usec = (timeoutMs % 1000) * 1000;
+    if (!directions) { sleepMs(timeoutMs); return; }
+    select(static_cast<int>(sock + 1), &reads, &writes, nullptr, &timeout);
+}
+
+// Never let a nonblocking EAGAIN loop outlive cancellation or an idle timeout.
+// An EAGAIN may leave a partially sent SSH packet, which libssh2 requires to be
+// retried with identical arguments. Retire that transport before switching to
+// CLOSE; cancellation between completed requests can still reuse the session.
+template <typename Call>
+auto retrySftp(SshSession& session, bool& interrupted, Call call)
+    -> decltype(call()) {
+    BlockingModeGuard mode(session.raw());
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::seconds(std::max(session.options().timeoutSec, 1));
+    bool pending = false;
+    for (;;) {
+        const bool cancelled = operationCancelled();
+        if (cancelled || std::chrono::steady_clock::now() >= deadline) {
+            if (pending) {
+                interrupted = true;
+                interruptSocket(session);
+                // Finish the failed send with its original buffers still alive.
+                // A CLOSE packet must never resume a different EAGAIN write.
+                auto terminal = call();
+                if constexpr (std::is_pointer_v<decltype(terminal)>) {
+                    // A response already buffered before shutdown can complete
+                    // OPEN; give ownership back to the caller for normal cleanup.
+                    if (terminal) return terminal;
+                }
+            }
+            throw Error(cancelled ? "操作已取消" : "等待 SFTP 响应超时");
+        }
+        auto result = call();
+        int code;
+        if constexpr (std::is_pointer_v<decltype(result)>)
+            code = result ? 0 : libssh2_session_last_errno(session.raw());
+        else
+            code = static_cast<int>(result);
+        if (code != LIBSSH2_ERROR_EAGAIN) return result;
+        pending = true;
+        waitSessionSocket(session, 50);
+    }
+}
+
+int closeSftpHandle(SshSession& session, bool& interrupted, LIBSSH2_SFTP_HANDLE* handle) {
+    if (!handle) return 0;
+    BlockingModeGuard mode(session.raw());
+    auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(operationCancelled() ? 500 : std::max(session.options().timeoutSec, 1) * 1000);
+    int result;
+    while ((result = libssh2_sftp_close_handle(handle)) == LIBSSH2_ERROR_EAGAIN) {
+        if (operationCancelled())
+            deadline = std::min(deadline, std::chrono::steady_clock::now() + std::chrono::milliseconds(500));
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // Shutdown wakes libssh2 without touching it from another thread.
+            // The SFTP/session destructor will reclaim any remaining handle.
+            interrupted = true;
+            interruptSocket(session);
+            result = libssh2_sftp_close_handle(handle);
+            break;
+        }
+        waitSessionSocket(session, 25);
+    }
+    return result;
+}
+
+struct SftpHandleGuard {
+    SshSession& session;
+    bool& interrupted;
+    LIBSSH2_SFTP_HANDLE* handle = nullptr;
+    bool keep = false;
+    SftpHandleGuard(SshSession& s, bool& failed, LIBSSH2_SFTP_HANDLE* h)
+        : session(s), interrupted(failed), handle(h) {}
+    ~SftpHandleGuard() {
+        if (handle && !keep) closeSftpHandle(session, interrupted, handle);
+    }
+    SftpHandleGuard(const SftpHandleGuard&) = delete;
+    SftpHandleGuard& operator=(const SftpHandleGuard&) = delete;
 };
 
 SftpEntry entryFromAttrs(const std::string& name, const std::string& fullPath,
@@ -116,10 +207,62 @@ SftpClient::SftpClient(SshSession& session) : session_(session) {}
 
 SftpClient::~SftpClient() { close(); }
 
+bool SftpClient::readyToYield() const {
+#ifdef RSHELL_LIBSSH2_QUIESCENT
+    return sftp_ && !interrupted_ && libssh2_sftp_quiescent(sftp_) != 0;
+#else
+    return false;
+#endif
+}
+
+void SftpClient::flushPendingRequests(LIBSSH2_SFTP_HANDLE* handle) {
+#ifdef RSHELL_LIBSSH2_QUIESCENT
+    if (readyToYield()) return;
+    try {
+        const int result = retrySftp(session_, interrupted_, [&]() {
+            return libssh2_sftp_flush_pending_requests(handle);
+        });
+        if (result != 0) fail("无法完成待发送的 SFTP 请求");
+    } catch (...) {
+        // A positive read can have left an unfinished request before this
+        // helper was first called. Even a cancellation before its first retry
+        // must retire that transport before the caller switches to CLOSE.
+        interrupted_ = true;
+        interruptSocket(session_);
+        BlockingModeGuard mode(session_.raw());
+        libssh2_sftp_flush_pending_requests(handle);
+        throw;
+    }
+#else
+    (void)handle;
+#endif
+}
+
+void SftpClient::yieldAtBoundary(LIBSSH2_SFTP_HANDLE* handle,
+                                  const std::function<void()>& callback) {
+    if (!callback) return;
+    flushPendingRequests(handle);
+    if (!readyToYield()) return;
+    // Nested metadata/exec calls can change blocking mode; restore exactly the
+    // mode used by the paused transfer, including when a callback throws.
+    struct RestoreMode {
+        LIBSSH2_SESSION* session;
+        int blocking;
+        ~RestoreMode() { libssh2_session_set_blocking(session, blocking); }
+    } restore{session_.raw(), libssh2_session_get_blocking(session_.raw())};
+    callback();
+    if (interrupted_ || operationCancelled()) throw Error("传输已取消");
+    if (!readyToYield()) {
+        interrupted_ = true;
+        interruptSocket(session_);
+        throw Error("文件通道存在未完成请求，已停止传输");
+    }
+}
+
 void SftpClient::open() {
     if (sftp_) return;
     if (!session_.raw()) throw Error("SSH 会话尚未建立，无法启动 SFTP");
-    sftp_ = libssh2_sftp_init(session_.raw());
+    sftp_ = retrySftp(session_, interrupted_, [&]() { return libssh2_sftp_init(session_.raw()); });
     if (!sftp_) {
         const char* msg = nullptr;
         int len = 0;
@@ -132,8 +275,19 @@ void SftpClient::open() {
 
 void SftpClient::close() {
     if (!sftp_) return;
+    // libssh2_sftp_shutdown does not reclaim outstanding file handles. Readers
+    // may have queued their asynchronous CLOSE just before this worker stops.
+    for (auto* handle : readers_) closeSftpHandle(session_, interrupted_, handle);
+    readers_.clear();
+    const long previous = libssh2_session_get_timeout(session_.raw());
     libssh2_session_set_blocking(session_.raw(), 1);
-    libssh2_sftp_shutdown(sftp_);
+    libssh2_session_set_timeout(session_.raw(), 500);
+    const int result = libssh2_sftp_shutdown(sftp_);
+    if (result == LIBSSH2_ERROR_TIMEOUT || result == LIBSSH2_ERROR_EAGAIN) {
+        interruptSocket(session_);
+        libssh2_sftp_shutdown(sftp_);
+    }
+    libssh2_session_set_timeout(session_.raw(), previous);
     sftp_ = nullptr;
 }
 
@@ -143,30 +297,13 @@ void SftpClient::fail(const std::string& what) const {
     throw Error(msg);
 }
 
-void SftpClient::waitSocket(int timeoutMs) const {
-    libssh2_socket_t sock = session_.socketFd();
-    int dir = libssh2_session_block_directions(session_.raw());
-    fd_set readfds;
-    fd_set writefds;
-    FD_ZERO(&readfds);
-    FD_ZERO(&writefds);
-    if (dir & LIBSSH2_SESSION_BLOCK_INBOUND) FD_SET(sock, &readfds);
-    if (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) FD_SET(sock, &writefds);
-    timeval tv{};
-    tv.tv_sec = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-#ifdef _WIN32
-    select(0, &readfds, &writefds, nullptr, &tv);
-#else
-    select(sock + 1, &readfds, &writefds, nullptr, &tv);
-#endif
-}
-
 // ---------------------------------------------------------------- 查询
 std::string SftpClient::realPath(const std::string& path) {
     if (!sftp_) throw Error("SFTP 未打开");
     char buf[4096];
-    int rc = libssh2_sftp_realpath(sftp_, path.empty() ? "." : path.c_str(), buf, sizeof(buf) - 1);
+    int rc = retrySftp(session_, interrupted_, [&]() {
+        return libssh2_sftp_realpath(sftp_, path.empty() ? "." : path.c_str(), buf, sizeof(buf) - 1);
+    });
     if (rc < 0) fail("无法解析远端路径 " + path);
     buf[rc] = '\0';
     return std::string(buf);
@@ -183,7 +320,9 @@ std::string SftpClient::homeDir() {
 bool SftpClient::stat(const std::string& path, SftpEntry& out) {
     if (!sftp_) throw Error("SFTP 未打开");
     LIBSSH2_SFTP_ATTRIBUTES attrs{};
-    if (libssh2_sftp_stat(sftp_, path.c_str(), &attrs) != 0) {
+    if (retrySftp(session_, interrupted_, [&]() {
+            return libssh2_sftp_stat(sftp_, path.c_str(), &attrs);
+        }) != 0) {
         if (libssh2_sftp_last_error(sftp_) == LIBSSH2_FX_NO_SUCH_FILE) return false;
         // 其他错误（权限等）也视为“拿不到信息”
         return false;
@@ -198,24 +337,30 @@ bool SftpClient::exists(const std::string& path) {
 }
 
 // ---------------------------------------------------------------- 目录
-std::vector<SftpEntry> SftpClient::listDir(const std::string& path) {
+std::vector<SftpEntry> SftpClient::listDir(const std::string& path,
+                                         const std::function<void()>& onYield) {
     if (!sftp_) throw Error("SFTP 未打开");
     const std::string dir = path.empty() ? "." : path;
-    LIBSSH2_SFTP_HANDLE* handle = libssh2_sftp_opendir(sftp_, dir.c_str());
+    LIBSSH2_SFTP_HANDLE* handle = retrySftp(session_, interrupted_, [&]() {
+        return libssh2_sftp_opendir(sftp_, dir.c_str());
+    });
     if (!handle) fail("无法打开远端目录 " + dir);
-    SftpHandleGuard guard(handle);
+    SftpHandleGuard guard(session_, interrupted_, handle);
 
     std::vector<SftpEntry> entries;
     std::vector<char> nameBuf(512);
     for (;;) {
         LIBSSH2_SFTP_ATTRIBUTES attrs{};
-        int rc = libssh2_sftp_readdir(handle, nameBuf.data(), nameBuf.size() - 1, &attrs);
+        int rc = retrySftp(session_, interrupted_, [&]() {
+            return libssh2_sftp_readdir(handle, nameBuf.data(), nameBuf.size() - 1, &attrs);
+        });
         if (rc == 0) break;
         if (rc < 0) fail("读取远端目录 " + dir + " 失败");
         std::string name(nameBuf.data(), static_cast<size_t>(rc));
         if (name == "." || name == "..") continue;
         std::string full = (dir == ".") ? name : remoteJoin(dir, name);
         entries.push_back(entryFromAttrs(name, full, attrs));
+        yieldAtBoundary(handle, onYield);
     }
 
     std::sort(entries.begin(), entries.end(), [](const SftpEntry& a, const SftpEntry& b) {
@@ -272,7 +417,9 @@ void SftpClient::mkdir(const std::string& path, int mode, bool parents) {
     if (path.empty()) throw Error("目录名为空");
 
     if (!parents) {
-        if (libssh2_sftp_mkdir(sftp_, path.c_str(), static_cast<long>(mode)) != 0)
+        if (retrySftp(session_, interrupted_, [&]() {
+                return libssh2_sftp_mkdir(sftp_, path.c_str(), static_cast<long>(mode));
+            }) != 0)
             fail("创建目录 " + path + " 失败");
         return;
     }
@@ -282,7 +429,9 @@ void SftpClient::mkdir(const std::string& path, int mode, bool parents) {
     for (const std::string& part : split(path, '/')) {
         if (part.empty() || part == ".") continue;
         current = current.empty() ? (absolute ? "/" + part : part) : current + "/" + part;
-        if (libssh2_sftp_mkdir(sftp_, current.c_str(), static_cast<long>(mode)) == 0) continue;
+        if (retrySftp(session_, interrupted_, [&]() {
+                return libssh2_sftp_mkdir(sftp_, current.c_str(), static_cast<long>(mode));
+            }) == 0) continue;
         SftpEntry entry;
         if (stat(current, entry) && entry.isDir()) continue;  // 已存在
         fail("创建目录 " + current + " 失败");
@@ -291,17 +440,19 @@ void SftpClient::mkdir(const std::string& path, int mode, bool parents) {
 
 void SftpClient::rmdir(const std::string& path) {
     if (!sftp_) throw Error("SFTP 未打开");
-    if (libssh2_sftp_rmdir(sftp_, path.c_str()) != 0) fail("删除目录 " + path + " 失败");
+    if (retrySftp(session_, interrupted_, [&]() { return libssh2_sftp_rmdir(sftp_, path.c_str()); }) != 0)
+        fail("删除目录 " + path + " 失败");
 }
 
 void SftpClient::removeFile(const std::string& path) {
     if (!sftp_) throw Error("SFTP 未打开");
-    if (libssh2_sftp_unlink(sftp_, path.c_str()) != 0) fail("删除文件 " + path + " 失败");
+    if (retrySftp(session_, interrupted_, [&]() { return libssh2_sftp_unlink(sftp_, path.c_str()); }) != 0)
+        fail("删除文件 " + path + " 失败");
 }
 
 void SftpClient::rename(const std::string& from, const std::string& to) {
     if (!sftp_) throw Error("SFTP 未打开");
-    if (libssh2_sftp_rename(sftp_, from.c_str(), to.c_str()) != 0)
+    if (retrySftp(session_, interrupted_, [&]() { return libssh2_sftp_rename(sftp_, from.c_str(), to.c_str()); }) != 0)
         fail("重命名 " + from + " -> " + to + " 失败");
 }
 
@@ -310,7 +461,7 @@ void SftpClient::chmod(const std::string& path, unsigned int mode) {
     LIBSSH2_SFTP_ATTRIBUTES attrs{};
     attrs.flags = LIBSSH2_SFTP_ATTR_PERMISSIONS;
     attrs.permissions = static_cast<unsigned long>(mode & 07777);
-    if (libssh2_sftp_setstat(sftp_, path.c_str(), &attrs) != 0)
+    if (retrySftp(session_, interrupted_, [&]() { return libssh2_sftp_setstat(sftp_, path.c_str(), &attrs); }) != 0)
         fail("修改权限 " + path + " 失败");
 }
 
@@ -327,7 +478,9 @@ std::string SftpClient::resolveRemoteTarget(const std::string& remotePath,
 // ---------------------------------------------------------------- 底层 IO
 LIBSSH2_SFTP_HANDLE* SftpClient::openFile(const std::string& path, unsigned long flags,
                                           long mode) {
-    LIBSSH2_SFTP_HANDLE* handle = libssh2_sftp_open(sftp_, path.c_str(), flags, mode);
+    LIBSSH2_SFTP_HANDLE* handle = retrySftp(session_, interrupted_, [&]() {
+        return libssh2_sftp_open(sftp_, path.c_str(), flags, mode);
+    });
     if (!handle) fail("无法打开远端文件 " + path);
     return handle;
 }
@@ -336,11 +489,10 @@ void SftpClient::writeAll(LIBSSH2_SFTP_HANDLE* handle, const char* data, std::si
                           std::uint64_t& written) {
     std::size_t off = 0;
     while (off < len) {
-        auto n = libssh2_sftp_write(handle, data + off, len - off);
-        if (wouldBlock(static_cast<int>(n))) {
-            waitSocket(100);
-            continue;
-        }
+        auto n = retrySftp(session_, interrupted_, [&]() {
+            const auto result = libssh2_sftp_write(handle, data + off, len - off);
+            return result == 0 ? static_cast<ssize_t>(LIBSSH2_ERROR_EAGAIN) : result;
+        });
         if (n < 0) fail("写入远端文件失败");
         off += static_cast<std::size_t>(n);
         written += static_cast<std::uint64_t>(n);
@@ -348,15 +500,12 @@ void SftpClient::writeAll(LIBSSH2_SFTP_HANDLE* handle, const char* data, std::si
 }
 
 std::size_t SftpClient::readSome(LIBSSH2_SFTP_HANDLE* handle, char* buf, std::size_t cap) {
-    for (;;) {
-        auto n = libssh2_sftp_read(handle, buf, cap);
-        if (wouldBlock(static_cast<int>(n))) {
-            waitSocket(100);
-            continue;
-        }
-        if (n < 0) fail("读取远端文件失败");
-        return static_cast<std::size_t>(n);
-    }
+    const auto n = retrySftp(session_, interrupted_, [&]() { return libssh2_sftp_read(handle, buf, cap); });
+    if (n < 0) fail("读取远端文件失败");
+    // Also covers Reader/readFileSync invoked inside a transfer's callback.
+    // Their successful return must not leave half a READ request in the stream.
+    flushPendingRequests(handle);
+    return static_cast<std::size_t>(n);
 }
 
 // ---------------------------------------------------------------- 按需顺序读（拖动下载）
@@ -368,36 +517,41 @@ LIBSSH2_SFTP_HANDLE* SftpClient::openReadHandle(const std::string& path,
     if (!stat(path, entry)) throw Error("远端文件不存在：" + path);
     if (entry.isDir()) throw Error("远端路径是目录，不能直接下载：" + path);
     sizeOut = entry.size;
-    return openFile(path, LIBSSH2_FXF_READ, 0);
+    auto* handle = openFile(path, LIBSSH2_FXF_READ, 0);
+    readers_.push_back(handle);
+    return handle;
 }
 
 std::size_t SftpClient::readHandle(LIBSSH2_SFTP_HANDLE* handle, char* buffer,
                                    std::size_t capacity) {
     if (!handle) return 0;
+    if (std::find(readers_.begin(), readers_.end(), handle) == readers_.end())
+        throw Error("远端文件所属连接已关闭");
     return readSome(handle, buffer, capacity);
 }
 
 void SftpClient::closeReadHandle(LIBSSH2_SFTP_HANDLE* handle) {
-    if (handle) libssh2_sftp_close(handle);
+    const auto found = std::find(readers_.begin(), readers_.end(), handle);
+    if (found == readers_.end()) return;
+    readers_.erase(found);
+    closeSftpHandle(session_, interrupted_, handle);
 }
 
 void SftpClient::writeFileContent(const std::string& path, const std::string& content) {
     LIBSSH2_SFTP_HANDLE* handle = openFile(
         path, LIBSSH2_FXF_WRITE | LIBSSH2_FXF_CREAT | LIBSSH2_FXF_TRUNC, 0644);
+    SftpHandleGuard guard(session_, interrupted_, handle);
     std::uint64_t written = 0;
-    try {
-        writeAll(handle, content.data(), content.size(), written);
-    } catch (...) {
-        libssh2_sftp_close(handle);
-        throw;
-    }
-    libssh2_sftp_close(handle);
+    writeAll(handle, content.data(), content.size(), written);
+    guard.keep = true;
+    if (closeSftpHandle(session_, interrupted_, handle) != 0) fail("关闭远端文件失败");
 }
 
 // ---------------------------------------------------------------- 上传
 TransferResult SftpClient::upload(const std::string& localPath,
                                   const std::string& remotePath,
                                   const TransferOptions& options) {
+    OperationCancelScope cancellation(options.cancelled);
     if (!sftp_) throw Error("SFTP 未打开");
 
     std::error_code ec;
@@ -428,7 +582,7 @@ TransferResult SftpClient::upload(const std::string& localPath,
     if (offset == 0) flags |= LIBSSH2_FXF_TRUNC;
     const long mode = options.mode > 0 ? options.mode : 0644;
 
-    SftpHandleGuard guard(openFile(target, flags, mode));
+    SftpHandleGuard guard(session_, interrupted_, openFile(target, flags, mode));
     if (offset > 0) libssh2_sftp_seek64(guard.handle, static_cast<libssh2_uint64_t>(offset));
 
     const double start = monotonicSeconds();
@@ -459,13 +613,14 @@ TransferResult SftpClient::upload(const std::string& localPath,
                     options.onProgress(done, total);
                 }
             }
+            yieldAtBoundary(guard.handle, options.onYield);
         }
 
         if (in.bad()) throw Error("读取本地文件失败：" + localPath);
     }
 
     guard.keep = true;
-    int closeRc = libssh2_sftp_close_handle(guard.handle);
+    int closeRc = closeSftpHandle(session_, interrupted_, guard.handle);
     if (closeRc != 0) fail("关闭远端文件 " + target + " 失败");
     bar.finish(done, true);
 
@@ -487,6 +642,7 @@ TransferResult SftpClient::upload(const std::string& localPath,
 TransferResult SftpClient::download(const std::string& remotePath,
                                     const std::string& localPath,
                                     const TransferOptions& options) {
+    OperationCancelScope cancellation(options.cancelled);
     if (!sftp_) throw Error("SFTP 未打开");
 
     SftpEntry entry;
@@ -515,7 +671,7 @@ TransferResult SftpClient::download(const std::string& remotePath,
     std::ofstream out(local, mode);
     if (!out) throw Error("无法写入本地文件：" + pathToUtf8(local));
 
-    SftpHandleGuard guard(openFile(remotePath, LIBSSH2_FXF_READ, 0));
+    SftpHandleGuard guard(session_, interrupted_, openFile(remotePath, LIBSSH2_FXF_READ, 0));
     if (offset > 0) libssh2_sftp_seek64(guard.handle, static_cast<libssh2_uint64_t>(offset));
 
     const double start = monotonicSeconds();
@@ -547,13 +703,14 @@ TransferResult SftpClient::download(const std::string& remotePath,
                     options.onProgress(done, entry.size);
                 }
             }
+            yieldAtBoundary(guard.handle, options.onYield);
         }
         out.flush();
         if (!out) throw Error("写入本地文件失败：" + pathToUtf8(local));
     }
 
     guard.keep = true;
-    int closeRc = libssh2_sftp_close_handle(guard.handle);
+    int closeRc = closeSftpHandle(session_, interrupted_, guard.handle);
     if (closeRc != 0) fail("关闭远端文件 " + remotePath + " 失败");
     bar.finish(done, true);
 

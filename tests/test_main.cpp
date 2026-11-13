@@ -872,6 +872,67 @@ void testTerminalWideAndScrollback() {
     CHECK_EQ(scroll.scrollOffset(), 0);
 }
 
+void testTerminalFragmentedUtf8() {
+    // 网络分包不能影响文字、宽字符网格、颜色或控制序列的解析结果。
+    const std::string output = "A中文🙂\x1b[31m红\x1b[0m\r\n"
+                               "┌─┐\x1b]0;中文🙂title\x1b\\"
+                               "\x1b]7;file://host/中文\x07\x1b[6n";
+    Terminal whole(32, 3);
+    whole.feed(output);
+    const std::string response = whole.takeResponse();
+    auto checkSame = [&](Terminal& fragmented) {
+        bool cellsEqual = fragmented.lineCount() == whole.lineCount();
+        for (std::size_t row = 0; row < whole.lineCount() && cellsEqual; ++row) {
+            const auto& expected = whole.lineAt(row);
+            const auto& actual = fragmented.lineAt(row);
+            cellsEqual = actual.size() == expected.size();
+            for (std::size_t col = 0; col < expected.size() && cellsEqual; ++col)
+                cellsEqual = actual[col].ch == expected[col].ch &&
+                             actual[col].fg == expected[col].fg &&
+                             actual[col].bg == expected[col].bg &&
+                             actual[col].flags == expected[col].flags;
+        }
+        CHECK(cellsEqual);
+        CHECK_EQ(fragmented.cursorCol(), whole.cursorCol());
+        CHECK_EQ(fragmented.cursorRow(), whole.cursorRow());
+        CHECK_EQ(fragmented.title(), whole.title());
+        CHECK_EQ(fragmented.cwd(), whole.cwd());
+        CHECK_EQ(fragmented.takeResponse(), response);
+    };
+    for (std::size_t split = 0; split <= output.size(); ++split) {
+        Terminal fragmented(32, 3);
+        fragmented.feed(output.substr(0, split));
+        fragmented.feed("");
+        fragmented.feed(output.substr(split));
+        checkSame(fragmented);
+    }
+    Terminal bytes(32, 3);
+    for (char byte : output) bytes.feed(std::string(1, byte));
+    checkSame(bytes);
+    CHECK_EQ(bytes.plainLine(0), std::string("A中文🙂红"));
+    CHECK_EQ(bytes.plainLine(1), std::string("┌─┐"));
+
+    // 不完整字符遇到控制字节或非法续字节后丢弃，不能污染后面的输入。
+    for (const std::string control : {std::string("\r\n"), std::string("\x1b[31m"),
+                                      std::string("\x7f")}) {
+        Terminal interrupted(16, 3);
+        interrupted.feed("\xe4");
+        interrupted.feed(control);
+        interrupted.feed("\xb8\xad");
+        interrupted.feed("中文🙂");
+        const std::size_t row = control == "\r\n" ? 1 : 0;
+        CHECK_EQ(interrupted.plainLine(row), std::string("中文🙂"));
+    }
+    Terminal invalid(16, 3);
+    invalid.feed("\xe4");
+    invalid.feed("X中文");
+    CHECK_EQ(invalid.plainLine(0), std::string("X中文"));
+    invalid.feed("\xf0\x9f");
+    invalid.reset();
+    invalid.feed("\x99\x82" "OK");
+    CHECK_EQ(invalid.plainLine(0), std::string("OK"));
+}
+
 void testTerminalResizeKeepsContent() {
     // 窗口缩小时优先裁掉光标下方的空白行：已有输出不应被整段推进历史
     Terminal term(20, 12);
@@ -926,6 +987,52 @@ void testTerminalResizeKeepsContent() {
     CHECK(all.find("ghijTAIL") != std::string::npos);
     CHECK(all.find("second l") != std::string::npos);
     CHECK(all.find("ine") != std::string::npos);
+}
+
+void testTerminalResizeLongHistory() {
+    Terminal wide(16, 3);
+    wide.feed("AB中文🙂CD");
+    wide.resize(6, 3);
+    CHECK_EQ(wide.plainLine(0), std::string("AB中文"));
+    CHECK_EQ(wide.plainLine(1), std::string("🙂CD"));
+    CHECK((wide.lineAt(1)[0].flags & kFlagWide) != 0);
+    CHECK((wide.lineAt(1)[1].flags & kFlagWideTail) != 0);
+    wide.resize(16, 3);
+    CHECK_EQ(wide.plainLine(0), std::string("AB中文🙂CD"));
+
+    Terminal term(24, 4, 2000);
+    for (int i = 0; i < 1800; ++i)
+        term.feed("row" + std::to_string(i) + "中文🙂\r\n");
+    CHECK(term.scrollbackCount() > 1500);
+    const std::size_t history = term.scrollbackCount();
+    std::vector<std::string> original;
+    for (std::size_t row = 0; row < term.lineCount(); ++row)
+        original.push_back(term.plainLine(row));
+
+    // 未重排的旧前缀和最近的宽字符行都要保留，反复改变列宽不会丢行/并错行。
+    for (int round = 0; round < 3; ++round) {
+        term.resize(18, 4);
+        term.resize(24, 4);
+        CHECK_EQ(term.scrollbackCount(), history);
+        bool sameText = term.lineCount() == original.size();
+        for (std::size_t row = 0; row < original.size() && sameText; ++row)
+            sameText = term.plainLine(row) == original[row];
+        CHECK(sameText);
+        CHECK_EQ(term.lineAt(history - 1)[7].ch, static_cast<char32_t>(U'中'));
+        CHECK((term.lineAt(history - 1)[8].flags & kFlagWideTail) != 0);
+    }
+
+    // 缩放后继续输出，回滚上限、淘汰顺序和文本搜索仍然一致。
+    for (int i = 1800; i < 2200; ++i)
+        term.feed("row" + std::to_string(i) + "中文🙂\r\n");
+    CHECK_EQ(term.scrollbackCount(), static_cast<std::size_t>(2000));
+    CHECK_EQ(term.plainLine(0), std::string("row197中文🙂"));
+    CHECK(term.findAll(U"row0中").empty());
+    CHECK_EQ(term.findAll(U"row2199中文🙂").size(), static_cast<std::size_t>(1));
+    term.scrollView(2000);
+    CHECK_EQ(term.scrollOffset(), 2000);
+    term.scrollToBottom();
+    CHECK_EQ(term.scrollOffset(), 0);
 }
 
 void testTerminalAltScreenAndMisc() {
@@ -2044,25 +2151,39 @@ void testAiSessions() {
     class FakeStore : public ai::ToolBackend {
     public:
         std::map<std::string, std::string> files;
+        int bodyReads = 0;
+        int metadataReads = 0;
+        int bodyWrites = 0;
+        int metadataWrites = 0;
+        std::size_t lastBodyReadLimit = 0;
+        bool failMetadataWrites = false;
 
         std::string homeDir() override { return "/home/probe"; }
         bool makeDir(const std::string&, std::string&) override { return true; }
         CommandResult runCommand(const std::string&, int, const std::string&) override {
             return CommandResult{};
         }
-        bool readFile(const std::string& path, std::size_t, std::string& out, bool& truncated,
+        bool readFile(const std::string& path, std::size_t maxBytes, std::string& out, bool& truncated,
                       std::string& error, const std::string&) override {
+            if (endsWith(path, ".meta.json")) ++metadataReads;
+            else { ++bodyReads; lastBodyReadLimit = maxBytes; }
             const auto it = files.find(path);
             if (it == files.end()) {
                 error = "missing " + path;
                 return false;
             }
-            out = it->second;
-            truncated = false;
+            out = it->second.substr(0, maxBytes);
+            truncated = it->second.size() > maxBytes;
             return true;
         }
-        bool writeFile(const std::string& path, const std::string& content, std::string&,
+        bool writeFile(const std::string& path, const std::string& content, std::string& error,
                        const std::string&) override {
+            if (endsWith(path, ".meta.json")) ++metadataWrites;
+            else ++bodyWrites;
+            if (failMetadataWrites && endsWith(path, ".meta.json")) {
+                error = "metadata unavailable";
+                return false;
+            }
             files[path] = content;
             return true;
         }
@@ -2107,6 +2228,115 @@ void testAiSessions() {
     CHECK_EQ(latest[1].record.title, std::string("旧对话"));
     CHECK_EQ(latest[0].record.messages.size(), static_cast<std::size_t>(2));
     CHECK_EQ(ai::readSessions(store, dir, 1, storeError).size(), static_cast<std::size_t>(1));
+
+    // 历史列表只读取摘要，不把每份正文（上限 512 KiB）都取回来。
+    store.bodyReads = store.metadataReads = 0;
+    const auto summaries = ai::listSessions(store, dir, 20, storeError);
+    CHECK_EQ(summaries.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(store.bodyReads, 0);
+    CHECK_EQ(store.metadataReads, 2);
+    CHECK_EQ(summaries[0].record.title, std::string("新对话"));
+    CHECK(summaries[0].summaryAvailable && summaries[0].record.messages.empty());
+    CHECK_EQ(summaries[0].messageCount, static_cast<std::size_t>(2));
+    CHECK_EQ(summaries[0].record.tags[0], std::string("nginx"));
+    CHECK(!isSessionFileName("20261030-141233-session.meta.json"));
+    StoredSession opened;
+    CHECK(ai::readSessionFile(store, dir, summaries[1].file, opened, storeError));
+    CHECK_EQ(store.bodyReads, 1);
+    CHECK_EQ(opened.record.messages[0].text, older.messages[0].text);
+
+    // 老文件与损坏摘要仍可列出和选择，不为补齐标题预读正文。
+    const std::string legacy = ai::sessionFileName(record, 1700007200);
+    store.files[dir + "/" + legacy] = ai::serializeSession(record);
+    const std::string badMeta = ai::sessionFileName(older, 1700000000);
+    store.files[dir + "/" + badMeta.substr(0, badMeta.size() - 5) + ".meta.json"] = "{bad";
+    store.bodyReads = 0;
+    const auto mixed = ai::listSessions(store, dir, 20, storeError);
+    CHECK_EQ(mixed.size(), static_cast<std::size_t>(3));
+    CHECK_EQ(store.bodyReads, 0);
+    CHECK(!mixed[0].summaryAvailable && !mixed[0].record.title.empty());
+    CHECK(!mixed[2].summaryAvailable);
+    CHECK_EQ(ai::listSessions(store, dir, 1, storeError).size(), static_cast<std::size_t>(1));
+    CHECK(ai::readSessionFile(store, dir, legacy, opened, storeError));
+    CHECK_EQ(opened.record.title, record.title);
+
+    // 读失败/正文超限不能以不完整内容覆盖当前对话。
+    store.files[dir + "/" + legacy] = std::string(600u * 1024u, 'x');
+    CHECK(!ai::readSessionFile(store, dir, legacy, opened, storeError));
+    CHECK(storeError.find("512 KiB") != std::string::npos);
+    CHECK_EQ(opened.record.title, record.title);
+    CHECK(!ai::readSessionFile(store, dir, "../outside.json", opened, storeError));
+    store.bodyReads = 0;
+    CHECK_EQ(ai::listSessions(store, dir, 20, storeError).size(), static_cast<std::size_t>(3));
+    CHECK_EQ(store.bodyReads, 0);
+
+    // 摘要写失败会给出提示，但正文已经成功保存，仍能手动载入。
+    store.failMetadataWrites = true;
+    const std::string saved = ai::sessionFileName(record, 1700010800);
+    CHECK(ai::writeSessionFile(store, dir, saved, record, storeError));
+    CHECK(!storeError.empty());
+    CHECK(ai::readSessionFile(store, dir, saved, opened, storeError));
+    CHECK_EQ(opened.record.messages.size(), record.messages.size());
+
+    // The budget applies to final JSON bytes, including UTF-8, escapes and '\n'.
+    FakeStore boundedStore;
+    SessionRecord bounded = record;
+    bounded.title = "边界\"标题";
+    bounded.messages = {{true, "中文🙂\\\"\n\t"}};
+    bounded.messages[0].text.push_back('\x01');
+    const std::size_t overhead = ai::serializeSession(bounded).size();
+    CHECK(overhead < ai::kMaxSessionFileBytes);
+    bounded.messages[0].text.append(ai::kMaxSessionFileBytes - overhead, 'x');
+    const std::string exactJson = ai::serializeSession(bounded);
+    CHECK_EQ(exactJson.size(), ai::kMaxSessionFileBytes);
+    const std::string boundedFile = ai::sessionFileName(bounded, 1700014400);
+    const std::string bodyPath = dir + "/" + boundedFile;
+    const std::string metadataPath = bodyPath.substr(0, bodyPath.size() - 5) + ".meta.json";
+    CHECK(ai::writeSessionFile(boundedStore, dir, boundedFile, bounded, storeError));
+    CHECK(storeError.empty());
+    CHECK(boundedStore.files[bodyPath] == exactJson);
+    CHECK_EQ(boundedStore.bodyWrites, 1);
+    CHECK_EQ(boundedStore.metadataWrites, 1);
+    StoredSession boundedOpened;
+    CHECK(ai::readSessionFile(boundedStore, dir, boundedFile, boundedOpened, storeError));
+    CHECK_EQ(boundedStore.lastBodyReadLimit, ai::kMaxSessionFileBytes);
+    CHECK(boundedOpened.record.messages[0].text == bounded.messages[0].text);
+    const std::string originalMetadata = boundedStore.files[metadataPath];
+
+    bounded.messages[0].text.push_back('x');
+    CHECK_EQ(ai::serializeSession(bounded).size(), ai::kMaxSessionFileBytes + 1);
+    CHECK(!ai::writeSessionFile(boundedStore, dir, boundedFile, bounded, storeError));
+    CHECK(storeError.find("512 KiB") != std::string::npos);
+    CHECK(storeError.find("原有远端记录保持不变") != std::string::npos);
+    CHECK_EQ(boundedStore.bodyWrites, 1);
+    CHECK_EQ(boundedStore.metadataWrites, 1);
+    CHECK(boundedStore.files[bodyPath] == exactJson);
+    CHECK_EQ(boundedStore.files[metadataPath], originalMetadata);
+
+    // Raw content can fit while JSON escaping alone pushes it over the limit.
+    SessionRecord escaped = record;
+    escaped.messages = {{true, "中文🙂"}};
+    escaped.messages[0].text.append(ai::kMaxSessionFileBytes / 2, '\n');
+    CHECK(escaped.messages[0].text.size() < ai::kMaxSessionFileBytes);
+    CHECK(ai::serializeSession(escaped).size() > ai::kMaxSessionFileBytes);
+    const std::size_t rawSize = escaped.messages[0].text.size();
+    const std::string unsavedFile = ai::sessionFileName(escaped, 1700018000);
+    CHECK(!ai::writeSessionFile(boundedStore, dir, unsavedFile, escaped, storeError));
+    CHECK_EQ(boundedStore.bodyWrites, 1);
+    CHECK_EQ(boundedStore.metadataWrites, 1);
+    CHECK_EQ(boundedStore.files.size(), static_cast<std::size_t>(2));
+    CHECK_EQ(escaped.messages[0].text.size(), rawSize);  // Current chat is not truncated.
+    CHECK(boundedStore.files[bodyPath] == exactJson);
+    CHECK_EQ(boundedStore.files[metadataPath], originalMetadata);
+
+    // Reject truncated input before parsing, preserving the complete prior out.
+    boundedStore.files[bodyPath] = ai::serializeSession(bounded);
+    CHECK(!ai::readSessionFile(boundedStore, dir, boundedFile, boundedOpened, storeError));
+    CHECK(storeError.find("512 KiB") != std::string::npos);
+    CHECK_EQ(boundedOpened.file, boundedFile);
+    CHECK(boundedOpened.summaryAvailable);
+    CHECK_EQ(boundedOpened.messageCount, static_cast<std::size_t>(1));
+    CHECK(ai::serializeSession(boundedOpened.record) == exactJson);
 }
 
 // 联网搜索：编码、两种后端的响应解析、格式化
@@ -2861,7 +3091,9 @@ int main() {
     testTerminalBasics();
     testTerminalColors();
     testTerminalWideAndScrollback();
+    testTerminalFragmentedUtf8();
     testTerminalResizeKeepsContent();
+    testTerminalResizeLongHistory();
     testTerminalAltScreenAndMisc();
     testTerminalTuiCompat();
     testTerminalSearch();

@@ -1599,10 +1599,12 @@ static ssize_t sftp_read(LIBSSH2_SFTP_HANDLE * handle, char *buffer,
                 chunk->sent += rc;
 
                 if(chunk->lefttosend) {
-                    /* We still have data left to send for this chunk.
-                     * If there is at least one completely sent chunk,
-                     * we can get out of this loop and start reading.  */
-                    if(chunk != _libssh2_list_first(&handle->packet_list)) {
+                    /* Never read an earlier EOF while a later READ packet is
+                     * only partly sent: EOF flushes/frees the request list.
+                     * Finish that packet (or return EAGAIN with its original
+                     * buffers intact) before consuming another response. */
+                    if(!chunk->sent &&
+                       chunk != _libssh2_list_first(&handle->packet_list)) {
                         break;
                     }
                     else {
@@ -3971,4 +3973,120 @@ libssh2_sftp_get_channel(LIBSSH2_SFTP *sftp)
         return NULL;
 
     return sftp->channel;
+}
+
+/* rshell extension: a positive sftp_read() result can mask EAGAIN from a
+ * subsequent packet. A completed application buffer is therefore not, by
+ * itself, a safe point to insert a different SFTP request into this stream. */
+LIBSSH2_API int
+libssh2_sftp_quiescent(LIBSSH2_SFTP *sftp)
+{
+    LIBSSH2_CHANNEL *channel;
+    LIBSSH2_SESSION *session;
+    LIBSSH2_SFTP_HANDLE *handle;
+    struct sftp_pipeline_chunk *chunk;
+
+    if(!sftp || !sftp->channel)
+        return 0;
+    channel = sftp->channel;
+    session = channel->session;
+    if(session->packet.olen ||
+       (session->state & LIBSSH2_STATE_EXCHANGING_KEYS) ||
+       channel->write_state != libssh2_NB_state_idle ||
+       channel->read_state != libssh2_NB_state_idle ||
+       channel->adjust_state != libssh2_NB_state_idle ||
+       sftp->packet_state == libssh2_NB_state_sent ||
+       sftp->open_state != libssh2_NB_state_idle ||
+       sftp->read_state != libssh2_NB_state_idle ||
+       sftp->write_state != libssh2_NB_state_idle ||
+       sftp->fsync_state != libssh2_NB_state_idle ||
+       sftp->readdir_state != libssh2_NB_state_idle ||
+       sftp->fstat_state != libssh2_NB_state_idle ||
+       sftp->unlink_state != libssh2_NB_state_idle ||
+       sftp->rename_state != libssh2_NB_state_idle ||
+       sftp->posix_rename_state != libssh2_NB_state_idle ||
+       sftp->fstatvfs_state != libssh2_NB_state_idle ||
+       sftp->statvfs_state != libssh2_NB_state_idle ||
+       sftp->mkdir_state != libssh2_NB_state_idle ||
+       sftp->rmdir_state != libssh2_NB_state_idle ||
+       sftp->stat_state != libssh2_NB_state_idle ||
+       sftp->symlink_state != libssh2_NB_state_idle)
+        return 0;
+
+    handle = _libssh2_list_first(&sftp->sftp_handles);
+    while(handle) {
+        if(handle->close_state != libssh2_NB_state_idle)
+            return 0;
+        chunk = _libssh2_list_first(&handle->packet_list);
+        while(chunk) {
+            if(chunk->lefttosend)
+                return 0;
+            chunk = _libssh2_list_next(&chunk->node);
+        }
+        handle = _libssh2_list_next(&handle->node);
+    }
+    return 1;
+}
+
+LIBSSH2_API int
+libssh2_sftp_flush_pending_requests(LIBSSH2_SFTP_HANDLE *handle)
+{
+    LIBSSH2_SFTP *sftp;
+    LIBSSH2_CHANNEL *channel;
+    LIBSSH2_SESSION *session;
+    struct sftp_pipeline_chunk *chunk;
+    int rc;
+
+    if(!handle)
+        return LIBSSH2_ERROR_BAD_USE;
+    sftp = handle->sftp;
+    channel = sftp->channel;
+    session = channel->session;
+
+    if(sftp->read_state != libssh2_NB_state_idle ||
+       sftp->write_state != libssh2_NB_state_idle)
+        return _libssh2_error(session, LIBSSH2_ERROR_BAD_USE,
+                              "Flush requires a completed SFTP operation");
+
+    /* A read may have returned bytes while transport_read was rekeying. Resume
+     * the same stored exchange, rather than sending an unrelated packet. */
+    if(session->state & LIBSSH2_STATE_EXCHANGING_KEYS) {
+        rc = _libssh2_kex_exchange(session, 1, &session->startup_key_state);
+        if(rc)
+            return rc;
+    }
+
+    /* EAGAIN while receiving a packet can belong to a WINDOW_ADJUST, not to
+     * the next READ request. Finish its original nine-byte packet first. */
+    if(channel->adjust_state != libssh2_NB_state_idle) {
+        uint32_t adjustment = _libssh2_ntohu32(channel->adjust_adjust + 5);
+        rc = _libssh2_channel_receive_window_adjust(channel, adjustment,
+                                                   1, NULL);
+        if(rc)
+            return rc;
+        if(channel->read_state == libssh2_NB_state_jump1)
+            channel->read_state = libssh2_NB_state_idle;
+        if(sftp->packet_state == libssh2_NB_state_sent)
+            sftp->packet_state = libssh2_NB_state_sent1;
+    }
+
+    chunk = _libssh2_list_first(&handle->packet_list);
+    while(chunk) {
+        while(chunk->lefttosend) {
+            ssize_t written = _libssh2_channel_write(channel, 0,
+                &chunk->packet[chunk->sent], chunk->lefttosend);
+            if(written < 0)
+                return (int)written;
+            if(!written)
+                return LIBSSH2_ERROR_EAGAIN;
+            chunk->lefttosend -= written;
+            chunk->sent += written;
+        }
+        chunk = _libssh2_list_next(&chunk->node);
+    }
+
+    if(!libssh2_sftp_quiescent(sftp))
+        return _libssh2_error(session, LIBSSH2_ERROR_BAD_USE,
+                              "Another SFTP operation is not quiescent");
+    return 0;
 }

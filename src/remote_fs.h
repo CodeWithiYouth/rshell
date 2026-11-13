@@ -7,6 +7,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -20,6 +21,7 @@
 #include <libssh2_sftp.h>
 
 #include "protected_secret.h"
+#include "operation_cancel.h"
 #include "ssh_session.h"
 
 namespace rshell {
@@ -87,6 +89,7 @@ struct FsEvent {
     // 取消开关同时标识一次传输，避免同路径任务的事件混淆。
     std::shared_ptr<std::atomic<bool>> cancel;
     std::vector<RemoteEntry> entries;
+    std::uint64_t requestId = 0;
 };
 
 struct RemoteFsCallbacks {
@@ -111,6 +114,8 @@ public:
 
     // 建立独立连接；之前若在运行会先停掉
     void start(const ConnectionOptions& options);
+    // 可从 UI 线程请求停止；libssh2 清理仍由工作线程执行。
+    void requestStop();
     void stop();
 
     bool running() const { return running_.load(); }
@@ -118,7 +123,7 @@ public:
     bool sftpReady() const { return sftpReady_.load(); }
 
     // 以下都是异步入队，结果通过 onEvent 返回
-    void listDir(const std::string& path);
+    void listDir(const std::string& path, std::uint64_t requestId = 0);
     void mkdir(const std::string& path);
     // 新建空文件；同名文件已存在时失败，不覆盖原文件
     void createFile(const std::string& path);
@@ -175,24 +180,32 @@ public:
         bool truncated = false;
         std::string error;
     };
-    ExecOutcome execSync(const std::string& command, int timeoutMs, std::size_t maxOutputBytes);
+    ExecOutcome execSync(const std::string& command, int timeoutMs, std::size_t maxOutputBytes,
+                         const CancelCheck& shouldCancel = {});
     bool readFileSync(const std::string& path, std::size_t maxBytes, std::string& out,
-                      bool& truncated, std::string& error);
-    bool writeFileSync(const std::string& path, const std::string& content, std::string& error);
-    bool listDirSync(const std::string& path, std::vector<RemoteEntry>& out, std::string& error);
+                      bool& truncated, std::string& error, const CancelCheck& shouldCancel = {});
+    bool writeFileSync(const std::string& path, const std::string& content, std::string& error,
+                       const CancelCheck& shouldCancel = {});
+    bool listDirSync(const std::string& path, std::vector<RemoteEntry>& out, std::string& error,
+                     const CancelCheck& shouldCancel = {});
     // 建目录（含上级），目录已存在也算成功。只走 SFTP，不碰 libssh2 会话，
     // 所以可以在后台线程里和界面同时用（会话历史保存要用）。
-    bool mkdirSync(const std::string& path, std::string& error);
+    bool mkdirSync(const std::string& path, std::string& error, const CancelCheck& shouldCancel = {});
     // 连接时解析出的家目录（SFTP realpath），不可用时为空
     const std::string& homePath() const { return homePath_; }
 
 private:
+    friend struct RemoteFsTestAccess;
     using Task = std::function<void()>;
 
-    void post(Task task);
-    // 在文件线程上执行并等待结果（供外部线程同步读取）；超时返回 false
-    bool runSync(Task task, int timeoutMs = 20000);
+    void post(Task task, bool transfer = false);
+    // 超时/取消后尚未开始的任务不会执行；已开始的 IO 通过作用域查询共享取消状态。
+    bool runSync(Task task, int timeoutMs = 20000, const CancelCheck& shouldCancel = {});
     void workerLoop();
+    void executeTask(Task task);
+    // Called only at a quiescent SFTP boundary, on the connection's worker.
+    void serviceInteractions();
+    void sampleIfDue();
     void runSample();
     // 在自有连接上执行命令并抓取 stdout（不碰进程的 stdout）
     bool execCapture(const std::string& command, std::string& out, int timeoutMs, int* latencyMs,
@@ -204,6 +217,9 @@ private:
     std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Task> tasks_;
+    std::deque<Task> transferTasks_;
+    bool servicingInteractions_ = false;
+    std::chrono::steady_clock::time_point nextSample_{};
 
     std::unique_ptr<SshSession> session_;
     std::unique_ptr<SftpClient> sftp_;
@@ -215,7 +231,8 @@ private:
     std::atomic<bool> ready_{false};
     std::atomic<bool> sftpReady_{false};
     std::atomic<bool> statsPending_{false};
-    int sampleInterval_ = 5;
+    std::atomic<std::uint64_t> listingGeneration_{0};
+    std::atomic<int> sampleInterval_{5};
     std::string homePath_;  // 连接时 SFTP 解析出的家目录（会话历史拼路径用）
 };
 

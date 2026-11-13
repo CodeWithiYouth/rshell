@@ -16,6 +16,7 @@
 
 #include "ai_client.h"
 #include "ai_search.h"
+#include "operation_cancel.h"
 
 namespace rshell::ai {
 
@@ -126,7 +127,8 @@ public:
     ToolRequestInfo describe(const std::string& name, const std::string& arguments) const;
 
     // 执行一次工具调用；不抛异常，失败信息写在返回值里
-    ToolResult execute(const std::string& name, const std::string& arguments);
+    ToolResult execute(const std::string& name, const std::string& arguments,
+                       const CancelCheck& shouldCancel = {});
 
     // name_session 的落点：纯本地记账（不碰远端），由 AiTab 写入当前对话的标题/标签
     using SessionNamer = std::function<bool(const std::string& title,

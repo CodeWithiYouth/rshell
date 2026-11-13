@@ -38,9 +38,13 @@ struct TransferOptions {
     // 进度回调：done 是本次已传输的累计字节（续传时含起始偏移），total 是文件总字节。
     // 在传输线程上调用，实现方自行切换到 UI 线程；内部已按 ~100ms 限流。
     std::function<void(std::uint64_t done, std::uint64_t total)> onProgress;
-    // 取消询问：每个数据块前调用一次，返回 true 就抛 Error("传输已取消") 中断传输。
+    // 取消询问：数据块前及等待网络响应时调用，中断后保留半截文件供续传。
     // 在传输线程上调用，实现方只能用原子变量之类的无锁状态。
     std::function<bool()> cancelled;
+    // Optional cooperative scheduling at completed protocol boundaries only.
+    // Runs on this session's owning thread; never run another transfer here.
+    // CLI callers leave it empty. An EAGAIN retry never invokes this callback.
+    std::function<void()> onYield;
 };
 
 struct TransferResult {
@@ -61,11 +65,16 @@ public:
     void open();
     void close();
     bool isOpen() const { return sftp_ != nullptr; }
+    bool interrupted() const { return interrupted_; }
+    // Same-worker scheduling predicate; false with an unmodified system libssh2.
+    // All public reads restore this boundary before returning when supported.
+    bool readyToYield() const;
 
     // 远端 home 目录（realpath(".")）
     std::string homeDir();
     // 列表；path 为空时用 "."
-    std::vector<SftpEntry> listDir(const std::string& path);
+    std::vector<SftpEntry> listDir(const std::string& path,
+                                   const std::function<void()>& onYield = {});
     // 读取单个条目；不存在返回 false
     bool stat(const std::string& path, SftpEntry& out);
     bool exists(const std::string& path);
@@ -106,15 +115,18 @@ public:
     LIBSSH2_SFTP* raw() const { return sftp_; }
 
 private:
-    void waitSocket(int timeoutMs) const;
     [[noreturn]] void fail(const std::string& what) const;
     LIBSSH2_SFTP_HANDLE* openFile(const std::string& path, unsigned long flags, long mode);
     void writeAll(LIBSSH2_SFTP_HANDLE* handle, const char* data, std::size_t len,
                   std::uint64_t& written);
     std::size_t readSome(LIBSSH2_SFTP_HANDLE* handle, char* buf, std::size_t cap);
+    void flushPendingRequests(LIBSSH2_SFTP_HANDLE* handle);
+    void yieldAtBoundary(LIBSSH2_SFTP_HANDLE* handle, const std::function<void()>& callback);
 
     SshSession& session_;
     LIBSSH2_SFTP* sftp_ = nullptr;
+    bool interrupted_ = false;
+    std::vector<LIBSSH2_SFTP_HANDLE*> readers_;
 };
 
 }  // namespace rshell

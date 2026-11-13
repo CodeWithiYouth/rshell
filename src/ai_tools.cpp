@@ -645,7 +645,16 @@ ToolRequestInfo ToolRegistry::describe(const std::string& name, const std::strin
     return info;
 }
 
-ToolResult ToolRegistry::execute(const std::string& name, const std::string& arguments) {
+ToolResult ToolRegistry::execute(const std::string& name, const std::string& arguments,
+                                 const CancelCheck& shouldCancel) {
+    OperationCancelScope cancellation(shouldCancel);
+    if (operationCancelled()) {
+        ToolResult result;
+        result.ok = false;
+        result.json = makeError("任务已停止").dump();
+        result.display = "任务已停止";
+        return result;
+    }
     Json args;
     std::string error;
     if (!Json::parse(arguments, args, &error) || !args.isObject()) {

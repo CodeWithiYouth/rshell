@@ -828,6 +828,7 @@ void ChatPanel::clear() {
     hits_.clear();
     heights_.clear();
     scrollBack_ = 0;
+    stickBottom_ = true;
     reasoningIndex_ = static_cast<std::size_t>(-1);
 }
 
@@ -837,6 +838,9 @@ void ChatPanel::scrollToBottom() {
 }
 
 void ChatPanel::pushHistory(const ChatItem& item) {
+    // Reasoning chunks form one contiguous group. A new message/card ends that
+    // group so later reasoning cannot be appended above newer visible items.
+    reasoningIndex_ = static_cast<std::size_t>(-1);
     items_.push_back(item);
     layoutDirty_ = true;
 }
@@ -847,7 +851,7 @@ void ChatPanel::addUser(const std::wstring& text) {
     item.title = L"你";
     item.body = text;
     pushHistory(item);
-    scrollToBottom();
+    if (stickBottom_) scrollToBottom();
 }
 
 std::size_t ChatPanel::beginAssistant() {
@@ -1057,12 +1061,31 @@ void ChatPanel::paint(HDC dc, const RECT* dirty) {    hits_.clear();
     RECT view{full.left, header.bottom, full.right, composer.top};
 
     const int contentWidth = width - kPad * 2;
+    const bool remeasure = layoutDirty_ || measuredWidth_ != contentWidth || heights_.size() != items_.size();
+    // scrollBack_ is measured from the bottom. Preserve a message and its local
+    // offset before changing heights, otherwise a growing tail moves old text
+    // on the next full repaint even after the user has scrolled away from it.
+    std::size_t anchor = heights_.size();
+    int anchorOffset = 0;
+    if (!stickBottom_ && !heights_.empty() &&
+        (remeasure || lastItemDirty_ || viewportHeight_ != view.bottom - view.top)) {
+        const int contentTop = std::max(0, contentHeight_ - viewportHeight_ - scrollBack_);
+        int above = 0;
+        for (std::size_t i = 0; i < heights_.size(); ++i) {
+            if (above + heights_[i] > contentTop || i + 1 == heights_.size()) {
+                anchor = i;
+                anchorOffset = contentTop - above;
+                break;
+            }
+            above += heights_[i] + kItemGap;
+        }
+    }
     // 消息区用更深的底色，正文和气泡才「浮」得起来（以前整块面板一个颜色，
     // 文字和背景贴在一起看不清层次）
     fillRect(dc, view, bgApp);
     // 只有结构变化或宽度变化才重新测量全部条目；流式追加时只重量最后一条。
     // 否则每个 token 都会对所有历史消息做一遍 DrawText 计算高度。
-    if (layoutDirty_ || measuredWidth_ != contentWidth || heights_.size() != items_.size()) {
+    if (remeasure) {
         measure(dc, contentWidth);
         measuredWidth_ = contentWidth;
         layoutDirty_ = false;
@@ -1076,6 +1099,12 @@ void ChatPanel::paint(HDC dc, const RECT* dirty) {    hits_.clear();
     viewportHeight_ = view.bottom - view.top;
     const int maxScroll = std::max(0, contentHeight_ - viewportHeight_);
     if (stickBottom_) scrollBack_ = 0;
+    else if (anchor < heights_.size()) {
+        int above = 0;
+        for (std::size_t i = 0; i < anchor; ++i) above += heights_[i] + kItemGap;
+        const int offset = std::clamp(anchorOffset, -kItemGap, std::max(0, heights_[anchor] - 1));
+        scrollBack_ = contentHeight_ - viewportHeight_ - above - offset;
+    }
     scrollBack_ = std::clamp(scrollBack_, 0, maxScroll);
 
     // 消息区裁剪，避免滚动时画到标题栏/输入框上（用 Intersect，别把外层的圆角裁掉）
@@ -1777,6 +1806,7 @@ bool ChatPanel::onChar(wchar_t ch) {
 
 // ---------------------------------------------------------------- 离屏预览
 
+#ifdef RSHELL_ENABLE_DIAGNOSTICS
 namespace {
 
 HFONT previewFont(int px, int weight, const wchar_t* face) {
@@ -1948,6 +1978,8 @@ bool renderPreview(const wchar_t* bmpPath, int width, int height, int mode) {
     return ok;
 }
 
+#endif  // RSHELL_ENABLE_DIAGNOSTICS
+
 // ---------------------------------------------------------------- 局部重绘区域
 
 RECT ChatPanel::viewRect() const {
@@ -1971,6 +2003,15 @@ RECT ChatPanel::lastItemRect() const {
                                              : view.bottom + scrollBack_ - contentHeight_;
     const int top = y + above;
     return RECT{view.left, std::max<int>(top, view.top), view.right, view.bottom};
+}
+
+RECT ChatPanel::itemRectForTest(std::size_t index) const {
+    if (index >= heights_.size()) return RECT{};
+    const RECT view = viewRect();
+    int top = contentHeight_ <= viewportHeight_ ? view.top
+                 : view.bottom + scrollBack_ - contentHeight_;
+    for (std::size_t i = 0; i < index; ++i) top += heights_[i] + kItemGap;
+    return RECT{view.left + kPad, top, view.right - kPad, top + heights_[index]};
 }
 
 }  // namespace rshell::ai

@@ -2,10 +2,15 @@
 
 两层测试，互不依赖：
 
+`.\build.ps1` 默认只构建 CLI/GUI；执行 `.\build.ps1 -Test` 才会构建下表的测试与探针并运行 ctest。
+
 | 测试 | 命令 | 依赖 | 覆盖范围 |
 | --- | --- | --- | --- |
 | 单元测试 | `rshell_tests.exe`（或 `.\build.ps1 -Test`） | 无 | 路径/通配符/配置解析/进度与格式化、终端模拟器（VT 解析）等纯逻辑 |
-| GUI 多标签回归 | `rshell_gui_tabs_probe.exe`（包含在 `.\build.ps1 -Test` 中） | Windows，无需 SSH | 隐藏窗口中的标签切换、后台事件分发、SFTP/传输状态隔离、关闭清理、DPI 与溢出布局 |
+| GUI 多标签回归 | `rshell_gui_tabs_probe.exe`（包含在 `.\build.ps1 -Test` 中） | Windows，无需 SSH | 隐藏窗口中的标签切换、后台事件分发、SFTP/传输状态隔离、关闭清理、DPI 与溢出布局；按钮/连接动画结束停计时、局部重绘像素一致、AI 滑入期间终端不重排 |
+| 远端任务取消 | `rshell_remote_cancel_probe.exe`（包含在 `.\build.ps1 -Test` 中） | Windows，无需 SSH | 跨线程取消作用域、排队任务撤销及取消状态隔离 |
+| 传输停滞与 AI 工具停止 | `python tests/remote_cancel_e2e.py --exe build\modern\rshell_remote_cancel_probe.exe` | Python 3.9+、`paramiko` | 暂停 SFTP 读写、空闲超时、块间取消后复用及 AI 命令停止 |
+| 传输期间交互 | `python tests/transfer_interaction_e2e.py --exe build\modern\rshell_transfer_interaction_probe.exe`（另加 `--tight-window` 跑压力模式） | Python 3.9+、`paramiko` | 限速上传/下载时浏览、读文件、执行命令和采样，传输 FIFO、取消隔离、续传、目录树、SHA-256 与单连接验证 |
 | 自更新助手 | `python tests/update_helper_e2e.py --gui build\modern\rshell-gui.exe --fixture build\modern\rshell_update_fixture.exe`（也包含在 `.\build.ps1 -Test` 中） | Windows、Python 3 | 临时副本替换、等待旧进程退出、重新启动和非法参数；不触碰正在使用的程序 |
 | GUI 多连接端到端 | `python tests/gui_tabs_e2e.py --exe build\modern\rshell_gui_tabs_probe.exe` | Python 3.9+、`paramiko` | 真实双 SSH/SFTP、传输、自动重连、文件通道失败后的独立重试及 AI 通道恢复 |
 | AI 任务状态 | `python tests/ai_stream_e2e.py --mode limit --exe build\modern\rshell_gui_tabs_probe.exe`（另可用 `--mode approval`） | Python 3.9+ | 本地假模型验证步数上限、等待审批与停止状态 |
@@ -17,6 +22,10 @@
 
 Bash 历史回归应分别使用 Bash 4.4 与新版 Bash 运行（通过 `--bash` 指定对应程序）；
 Bash 4.4 执行期间的 `HISTCMD` 与 `history` 显示编号可能相差 1，仅在新版通过不能替代旧版验证。
+
+AI 回归还覆盖流式文字与工具/审批卡片的顺序、收起面板后的视觉计时与恢复、迟到历史列表、
+上滚阅读时的定位，以及历史 JSON 的 512 KiB 精确读写边界、转义膨胀和超限零写入。
+`rshell_ai_probe` 另外通过真实 SFTP 验证恰好 512 KiB 与多 1 字节的 EOF/截断区别及历史保存、重开。
 
 ## 端到端测试
 
@@ -104,8 +113,9 @@ $env:RSHELL_TERM_DUMP = "$env:TEMP\rshell-dump.bin"
 需要看真实像素时，用 GUI 自带的离屏渲染（与窗口共用同一份 GDI 绘制代码）：
 
 ```powershell
+.\build.ps1 -Diagnostics -BuildDir build\diagnostics  # 显式启用 GUI 诊断入口
 # 用法：rshell-gui.exe --render <dump> <out.bmp> <cols> <rows>
-.\build\modern\rshell-gui.exe --render "$env:TEMP\rshell-dump.bin" .\dump.bmp 92 34
+.\build\diagnostics\rshell-gui.exe --render "$env:TEMP\rshell-dump.bin" .\dump.bmp 92 34
 ```
 
 例如 `ESC[>4;1m` + 若干行空格出图后，整幅图应与主题背景色完全一致
@@ -117,7 +127,7 @@ $env:RSHELL_TERM_DUMP = "$env:TEMP\rshell-dump.bin"
 
 ```powershell
 $env:RSHELL_FONT_DEBUG = "1"
-.\build\modern\rshell-gui.exe --render "$env:TEMP\rshell-dump.bin" .\dump.bmp 92 34
+.\build\diagnostics\rshell-gui.exe --render "$env:TEMP\rshell-dump.bin" .\dump.bmp 92 34
 Get-Content .\dump.bmp.fonts.txt     # U+276F -> Segoe UI Symbol
 ```
 

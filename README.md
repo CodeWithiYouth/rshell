@@ -8,10 +8,10 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 **Windows 10/11，64 位，按需下载：**
 
-- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.2/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
-- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.2/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.3/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.3/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
 
-两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.3.2 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.3.2)。
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.3.3 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.3.3)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -35,6 +35,7 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 - **文件夹传输：** 在文件面板右键上传文件夹，或选中远端文件夹后选择下载；也可以把本地文件夹拖入面板。遇到同名文件时可选择跳过或取消，不会自动覆盖。
 - **断点续传：** 文件面板右键选择续传上传或续传下载；按已有文件长度继续，长度相同则跳过。请确认源文件与原来一致，续传不会校验已有内容。
 - **传输任务：** 点底部传输入口查看任务，滚轮可浏览更多任务；失败或取消的任务可点「详情」查看原因，选择重新传输或续传。
+- **传输期间操作：** 上传或下载大文件、文件夹时，仍可浏览目录和使用 AI 远端工具，主机状态也会继续更新。交互操作执行期间传输会短暂停顿；后续传输仍按顺序执行。
 - **编辑远端文件：** 右键文件 →「编辑」；保存后自动上传。可在右键菜单底部或「工具」菜单选择文本编辑器。
 - **搜索终端输出：** Ctrl+Shift+F，然后按 Enter / Shift+Enter 浏览匹配项。
 - **断线重连：** Ctrl+Shift+R。
@@ -42,6 +43,7 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 - **更新程序：** 点击标题栏的新版本提示，选择「是」下载校验后替换并重启，或选「GitHub」前往发布页。更新会关闭当前连接和正在进行的传输；程序目录需要写入权限。
 - **保持活动状态：** 会话管理里勾选「保活」并填间隔（默认 30 秒），空闲时定时发送 SSH 保活消息，避免 NAT/防火墙把连接断开。
 - **AI 助手：** 标题栏右上角的星芒按钮、Ctrl+J，或菜单 →「AI 助手」，在当前会话右侧展开（面板打开时按钮高亮）；面板内可切换到全屏。
+- **轻量动效：** 主窗口按钮颜色平滑过渡，连接状态变化短暂提示，AI 面板滑入；关闭 Windows 的界面动画后会立即显示最终状态。
 - **终端字号：** Ctrl++ 放大、Ctrl+- 缩小、Ctrl+0 重置。
 - **复制与粘贴：** 选中终端文本自动复制；Ctrl+V 粘贴。没有选中文本时，Ctrl+C 会向远端发送中断信号。
 
@@ -62,6 +64,8 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 AI 设置中可调整单次任务的最大执行步数（默认 16），也可取消勾选限制；取消限制后仍可手动停止，审批规则保持生效。
 设置页在较小窗口中支持滚轮滚动；达到步数上限时，面板会提示调整设置或发送消息继续。
 面板里的文字可以用鼠标拖选，按 **Ctrl+C** 复制；代码块右上角有「复制」按钮，点一下复制整段代码。
+生成过程中向上滚动查看旧消息会保持阅读位置。收起面板后任务继续执行，重新打开即可查看结果。
+单份历史记录上限为 512 KiB（按保存后的 JSON 大小计算）；超限会提示，保留已有远端记录，当前聊天仍可继续。
 
 **权限模型：**
 

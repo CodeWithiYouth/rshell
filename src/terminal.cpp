@@ -409,12 +409,10 @@ void Terminal::reflowResize(int cols, int rows) {
 
     // 顶部多出来的行回到历史里；纯空白行照旧不进历史（否则滚动条完全失真），
     // 丢掉空白行时顺带清掉下一行的续行标记，避免下次重排误并。
-    std::deque<std::vector<Cell>> keptHistory(history_.begin(),
-                                              history_.begin() + static_cast<std::ptrdiff_t>(keepHistory));
-    std::deque<char> keptHistoryCont(histCont_.begin(),
-                                     histCont_.begin() + static_cast<std::ptrdiff_t>(keepHistory));
-    history_ = std::move(keptHistory);
-    histCont_ = std::move(keptHistoryCont);
+    // 后缀已解析到 merged，直接裁去它；保留旧历史的行缓冲，避免每次拖动
+    // 窗口都深拷贝未参与重排的几千行 Cell。
+    history_.resize(keepHistory);
+    histCont_.resize(keepHistory);
     bool droppedPrevious = keepHistory > 0;  // 分段处当作硬换行
     for (int i = 0; i < screenStart; ++i) {
         const bool blank = isBlankLine(merged[static_cast<std::size_t>(i)], theme_);
@@ -422,7 +420,7 @@ void Terminal::reflowResize(int cols, int rows) {
             droppedPrevious = true;
             continue;
         }
-        history_.push_back(merged[static_cast<std::size_t>(i)]);
+        history_.push_back(std::move(merged[static_cast<std::size_t>(i)]));
         histCont_.push_back(droppedPrevious ? 0 : mergedCont[static_cast<std::size_t>(i)]);
         droppedPrevious = false;
     }
@@ -430,7 +428,7 @@ void Terminal::reflowResize(int cols, int rows) {
     std::vector<std::vector<Cell>> out;
     std::vector<char> outCont;
     for (int i = screenStart; i < static_cast<int>(merged.size()); ++i) {
-        out.push_back(merged[static_cast<std::size_t>(i)]);
+        out.push_back(std::move(merged[static_cast<std::size_t>(i)]));
         outCont.push_back(mergedCont[static_cast<std::size_t>(i)]);
     }
     while (static_cast<int>(out.size()) < rows) {
@@ -610,6 +608,11 @@ void Terminal::feed(const std::string& data) {
     for (unsigned char b : data) {
         switch (state_) {
             case State::Ground:
+                // UTF-8 字符可以跨多次网络读取，但不能跨控制字节拼接。
+                if (b < 0x20 || b == 0x7F) {
+                    utf8Remain_ = 0;
+                    utf8Pending_ = 0;
+                }
                 if (b == 0x1B) {
                     state_ = State::Escape;
                 } else if (b < 0x20) {
@@ -619,7 +622,6 @@ void Terminal::feed(const std::string& data) {
                 }
                 break;
             case State::Escape:
-                utf8Remain_ = 0;
                 if (b == '[') {
                     state_ = State::Csi;
                     csi_.clear();
@@ -721,7 +723,6 @@ void Terminal::feed(const std::string& data) {
                 break;
         }
     }
-    if (state_ == State::Ground) utf8Remain_ = 0;
 }
 
 // OSC 7 的路径按 URL 规则编码（空格、中文等会写成 %XX），这里只解 %XX，

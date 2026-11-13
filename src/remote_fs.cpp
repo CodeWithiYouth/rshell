@@ -10,6 +10,12 @@
 
 #include <libssh2_sftp.h>
 
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
+
 #include "credential_store.h"
 #include "sftp_client.h"
 #include "util.h"
@@ -78,10 +84,10 @@ RemoteFs::~RemoteFs() { stop(); }
 
 void RemoteFs::setCallbacks(RemoteFsCallbacks callbacks) { callbacks_ = std::move(callbacks); }
 
-void RemoteFs::post(Task task) {
+void RemoteFs::post(Task task, bool transfer) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        tasks_.push_back(std::move(task));
+        (transfer ? transferTasks_ : tasks_).push_back(std::move(task));
     }
     cv_.notify_one();
 }
@@ -89,17 +95,42 @@ void RemoteFs::post(Task task) {
 // 外部线程（OLE 复制线程）要读远端数据，但 libssh2 会话只能由文件线程碰。
 // 这里把活儿排进同一个队列，然后等它做完。断开连接时 worker 已经退出，
 // 队列里的任务不会有人跑，靠超时脱身，避免把资源管理器卡死。
-bool RemoteFs::runSync(Task task, int timeoutMs) {
-    if (!running_.load()) return false;
+bool RemoteFs::runSync(Task task, int timeoutMs, const CancelCheck& shouldCancel) {
+    if (!running_.load() || (shouldCancel && shouldCancel())) return false;
+    using Clock = std::chrono::steady_clock;
     struct Job {
         std::mutex mutex;
         std::condition_variable cv;
         bool done = false;
+        std::atomic<bool> abandoned{false};
+        Clock::time_point deadline;
+        CancelCheck shouldCancel;
     };
     auto job = std::make_shared<Job>();
+    job->deadline = Clock::now() + std::chrono::milliseconds(std::max(timeoutMs, 1));
+    job->shouldCancel = shouldCancel;
     Task payload = std::move(task);
     post([job, payload]() {
-        if (payload) payload();
+        {
+            std::lock_guard<std::mutex> lock(job->mutex);
+            if (job->abandoned || Clock::now() >= job->deadline ||
+                (job->shouldCancel && job->shouldCancel())) {
+                job->abandoned = true;
+                job->done = true;
+                job->cv.notify_all();
+                return;
+            }
+        }
+        // Only shared state crosses threads. The caller's callback may reference
+        // its stack or an AI panel which can disappear after runSync returns.
+        OperationCancelScope cancellation([job]() {
+            return job->abandoned.load() || Clock::now() >= job->deadline;
+        });
+        try {
+            if (payload) payload();
+        } catch (...) {
+            // Always wake the waiter, including when a task's cleanup throws.
+        }
         {
             std::lock_guard<std::mutex> lock(job->mutex);
             job->done = true;
@@ -107,8 +138,14 @@ bool RemoteFs::runSync(Task task, int timeoutMs) {
         job->cv.notify_all();
     });
     std::unique_lock<std::mutex> lock(job->mutex);
-    return job->cv.wait_for(lock, std::chrono::milliseconds(timeoutMs),
-                            [&job]() { return job->done; });
+    while (!job->done && running_.load() && Clock::now() < job->deadline &&
+           !(shouldCancel && shouldCancel())) {
+        job->cv.wait_until(lock, std::min(job->deadline, Clock::now() + std::chrono::milliseconds(50)));
+    }
+    const bool finished = job->done && !job->abandoned;
+    if (!finished) job->abandoned = true;
+    job->shouldCancel = {};
+    return finished;
 }
 
 void RemoteFs::start(const ConnectionOptions& options) {
@@ -128,20 +165,28 @@ void RemoteFs::start(const ConnectionOptions& options) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         tasks_.clear();
+        transferTasks_.clear();
     }
     worker_ = std::thread([this]() { workerLoop(); });
 }
 
-void RemoteFs::stop() {
+void RemoteFs::requestStop() {
     running_ = false;
+    ++listingGeneration_;
     cv_.notify_all();
+}
+
+void RemoteFs::stop() {
+    requestStop();
     if (worker_.joinable()) worker_.join();
     {
         std::lock_guard<std::mutex> lock(mutex_);
         tasks_.clear();
+        transferTasks_.clear();
     }
     sftp_.reset();
     if (session_) {
+        if (session_->raw()) libssh2_session_set_timeout(session_->raw(), 500);
         session_->disconnect();
         session_.reset();
     }
@@ -152,15 +197,18 @@ void RemoteFs::stop() {
     keyPassphrase_.clear();
 }
 
-void RemoteFs::listDir(const std::string& path) {
-    post([this, path]() {
+void RemoteFs::listDir(const std::string& path, std::uint64_t requestId) {
+    const auto generation = ++listingGeneration_;
+    post([this, path, requestId, generation]() {
+        if (generation != listingGeneration_.load()) return;
         FsEvent event;
         event.kind = FsEventKind::Listing;
         event.path = path;
+        event.requestId = requestId;
         if (!sftp_) {
             event.kind = FsEventKind::Error;
             event.message = "SFTP 尚未就绪";
-            if (callbacks_.onEvent) callbacks_.onEvent(event);
+            if (generation == listingGeneration_.load() && callbacks_.onEvent) callbacks_.onEvent(event);
             return;
         }
         try {
@@ -185,7 +233,7 @@ void RemoteFs::listDir(const std::string& path) {
             event.kind = FsEventKind::Error;
             event.message = ex.what();
         }
-        if (callbacks_.onEvent) callbacks_.onEvent(event);
+        if (generation == listingGeneration_.load() && callbacks_.onEvent) callbacks_.onEvent(event);
     });
 }
 
@@ -279,6 +327,7 @@ void RemoteFs::download(const std::string& remotePath, const std::string& localP
             TransferOptions options;
             options.showProgress = false;
             options.resume = resume;
+            options.onYield = [this]() { serviceInteractions(); };
             // 每 ~100ms 把已传输字节数抛回 UI 线程，供进度条使用
             options.onProgress = [this, remotePath, cancel](std::uint64_t done, std::uint64_t total) {
                 FsEvent progress;
@@ -304,7 +353,7 @@ void RemoteFs::download(const std::string& remotePath, const std::string& localP
         }
         event.cancel = cancel;
         if (callbacks_.onEvent) callbacks_.onEvent(event);
-    });
+    }, true);
 }
 
 // ---------------------------------------------------------------- 拖动下载：按需读
@@ -313,9 +362,9 @@ struct RemoteFs::Reader::State {
     std::string path;
     LIBSSH2_SFTP_HANDLE* handle = nullptr;  // 只在文件线程上访问
     std::uint64_t size = 0;
-    bool opened = false;
-    bool exhausted = false;
-    bool closed = false;
+    std::atomic<bool> opened{false};
+    std::atomic<bool> exhausted{false};
+    std::atomic<bool> closed{false};
 };
 
 RemoteFs::Reader::Reader(RemoteFs& fs, std::string path)
@@ -343,6 +392,14 @@ bool RemoteFs::Reader::open(std::string* error) {
             st.handle = fs->sftp_->openReadHandle(st.path, size);
             st.size = size;
             st.opened = true;
+            // The synchronous caller may already have timed out and destroyed
+            // its Reader while OPEN was finishing on this worker.
+            if (st.closed.load()) {
+                st.opened = false;
+                fs->sftp_->closeReadHandle(st.handle);
+                st.handle = nullptr;
+                job->error = "远端文件已关闭";
+            }
         } catch (const std::exception& ex) {
             job->error = ex.what();
         }
@@ -383,7 +440,7 @@ std::size_t RemoteFs::Reader::read(char* buffer, std::size_t capacity, std::stri
             job->error = ex.what();
             st.exhausted = true;
         }
-    }, 30000);
+    }, 30000, [state = state_]() { return state->closed.load(); });
     if (!done) {
         if (error) *error = "读取超时";
         return 0;
@@ -400,22 +457,23 @@ std::size_t RemoteFs::Reader::read(char* buffer, std::size_t capacity, std::stri
 void RemoteFs::Reader::close() {
     if (!state_) return;
     state_->closed = true;
-    if (!state_->opened) return;
-    state_->opened = false;
-    if (!state_->handle) return;
+    if (!state_->opened.exchange(false)) return;
     struct Job {
         std::shared_ptr<State> state;
     };
     auto job = std::make_shared<Job>();
     job->state = state_;
     RemoteFs* fs = &fs_;
-    fs->runSync([job, fs]() {
+    // Cleanup must not expire behind a long-running transfer/AI command. Unlike
+    // an operation requested by a user, closing a handle is always safe to run
+    // later; shared state keeps it alive without blocking the OLE caller.
+    fs->post([job, fs]() {
         auto& st = *job->state;
         if (st.handle) {
             if (fs->sftp_) fs->sftp_->closeReadHandle(st.handle);
             st.handle = nullptr;
         }
-    }, 5000);
+    });
 }
 
 std::shared_ptr<RemoteFs::Reader> RemoteFs::openReader(const std::string& remotePath,
@@ -460,6 +518,7 @@ void RemoteFs::upload(const std::string& localPath, const std::string& remotePat
             TransferOptions options;
             options.showProgress = false;
             options.resume = resume;
+            options.onYield = [this]() { serviceInteractions(); };
             // 和下载一样按 ~100ms 把已传字节抛回 UI 线程
             options.onProgress = [this, remotePath, cancel](std::uint64_t done, std::uint64_t total) {
                 FsEvent progress;
@@ -484,7 +543,7 @@ void RemoteFs::upload(const std::string& localPath, const std::string& remotePat
         }
         event.cancel = cancel;
         if (callbacks_.onEvent) callbacks_.onEvent(event);
-    });
+    }, true);
 }
 
 namespace {
@@ -503,6 +562,7 @@ void uploadDirectoryTree(SftpClient& sftp, const fs::path& local, const std::str
                          const TransferOptions& options,
                          const std::shared_ptr<std::atomic<bool>>& cancel, TreeProgress& progress) {
     checkTreeCancelled(cancel);
+    if (options.onYield) options.onYield();
     SftpEntry existing;
     if (sftp.stat(remote, existing)) {
         if (!existing.isDir() || existing.isSymlink()) throw Error("远端目标不是普通目录：" + remote);
@@ -515,6 +575,7 @@ void uploadDirectoryTree(SftpClient& sftp, const fs::path& local, const std::str
     for (; it != end; it.increment(ec)) {
         if (ec) throw Error("读取本地目录失败：" + ec.message());
         checkTreeCancelled(cancel);
+        if (options.onYield) options.onYield();
         const auto status = it->symlink_status(ec);
         if (ec) throw Error("读取本地文件属性失败：" + ec.message());
         if (fs::is_symlink(status)) continue;
@@ -547,13 +608,15 @@ void downloadDirectoryTree(SftpClient& sftp, const std::string& remote, const fs
                            const TransferOptions& options,
                            const std::shared_ptr<std::atomic<bool>>& cancel, TreeProgress& progress) {
     checkTreeCancelled(cancel);
+    if (options.onYield) options.onYield();
     std::error_code ec;
     if (fs::is_symlink(fs::symlink_status(local, ec))) throw Error("本地目录不能是符号链接");
     ec.clear();
     fs::create_directories(local, ec);
     if (ec) throw Error("无法创建本地目录：" + ec.message());
-    for (const SftpEntry& entry : sftp.listDir(remote)) {
+    for (const SftpEntry& entry : sftp.listDir(remote, options.onYield)) {
         checkTreeCancelled(cancel);
+        if (options.onYield) options.onYield();
         if (entry.name.empty() || entry.name == "." || entry.name == ".." ||
             entry.name.find_first_of("/\\:") != std::string::npos)
             throw Error("远端目录包含无效文件名");
@@ -590,6 +653,7 @@ void RemoteFs::uploadDirectory(const std::string& localPath, const std::string& 
     queued.message = localBaseName(localPath); queued.localPath = localPath; queued.cancel = cancel;
     if (callbacks_.onEvent) callbacks_.onEvent(queued);
     post([this, localPath, remotePath, cancel, resume]() {
+        OperationCancelScope cancellation([cancel]() { return cancel && cancel->load(); });
         FsEvent event; event.kind = FsEventKind::Started; event.path = remotePath;
         event.upload = true; event.message = localBaseName(localPath); event.cancel = cancel;
         event.localPath = localPath; event.directory = true;
@@ -598,6 +662,7 @@ void RemoteFs::uploadDirectory(const std::string& localPath, const std::string& 
             if (!sftp_) throw Error("SFTP 尚未就绪");
             TransferOptions options; options.showProgress = false; options.overwrite = false;
             options.resume = resume;
+            options.onYield = [this]() { serviceInteractions(); };
             options.cancelled = [cancel]() { return cancel && cancel->load(); };
             TreeProgress progress;
             progress.conflict = callbacks_.onConflict;
@@ -614,13 +679,14 @@ void RemoteFs::uploadDirectory(const std::string& localPath, const std::string& 
             event.message = std::string("文件夹上传未完成：") + ex.what();
         }
         if (callbacks_.onEvent) callbacks_.onEvent(event);
-    });
+    }, true);
 }
 
 void RemoteFs::downloadDirectory(const std::string& remotePath, const std::string& localPath,
                                  std::shared_ptr<std::atomic<bool>> cancel, bool resume) {
     if (!cancel) cancel = std::make_shared<std::atomic<bool>>(false);
     post([this, remotePath, localPath, cancel, resume]() {
+        OperationCancelScope cancellation([cancel]() { return cancel && cancel->load(); });
         FsEvent started; started.kind = FsEventKind::Started; started.path = remotePath;
         started.localPath = localPath; started.directory = true; started.cancel = cancel;
         started.message = remoteBaseName(remotePath);
@@ -631,6 +697,7 @@ void RemoteFs::downloadDirectory(const std::string& remotePath, const std::strin
             if (!sftp_) throw Error("SFTP 尚未就绪");
             TransferOptions options; options.showProgress = false; options.overwrite = false;
             options.resume = resume;
+            options.onYield = [this]() { serviceInteractions(); };
             options.cancelled = [cancel]() { return cancel && cancel->load(); };
             TreeProgress progress;
             progress.conflict = callbacks_.onConflict;
@@ -647,10 +714,88 @@ void RemoteFs::downloadDirectory(const std::string& remotePath, const std::strin
             event.message = std::string("文件夹下载未完成：") + ex.what();
         }
         if (callbacks_.onEvent) callbacks_.onEvent(event);
-    });
+    }, true);
 }
 
 void RemoteFs::sampleNow() { statsPending_ = true; }
+
+void RemoteFs::executeTask(Task task) {
+    try {
+        if (task) task();
+    } catch (...) {
+        // Operations report their own result; keep the connection worker alive.
+    }
+    if (sftp_ && sftp_->interrupted() && running_.exchange(false)) {
+        ready_ = false;
+        sftpReady_ = false;
+        FsEvent event;
+        event.kind = FsEventKind::Failed;
+        event.message = "文件通道已中断，请重试连接";
+        if (callbacks_.onEvent) callbacks_.onEvent(event);
+    }
+}
+
+void RemoteFs::sampleIfDue() {
+    const int interval = sampleInterval_.load();
+    if (!running_.load() || interval <= 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (!statsPending_.load() && now < nextSample_) return;
+    statsPending_ = false;
+    runSample();
+    nextSample_ = std::chrono::steady_clock::now() + std::chrono::seconds(interval);
+}
+
+void RemoteFs::serviceInteractions() {
+    if (servicingInteractions_ || !running_.load() || operationCancelled() ||
+        !sftp_ || !sftp_->readyToYield()) return;
+
+    servicingInteractions_ = true;
+    struct RestoreFlag {
+        bool& flag;
+        ~RestoreFlag() { flag = false; }
+    } restoreFlag{servicingInteractions_};
+    // A transfer's cancellation belongs only to that transfer. Interactive jobs
+    // retain their own cancellation/deadline and the connection's stop signal.
+    OperationCancelOverride cancellation([this]() { return !running_.load(); });
+    struct RestoreMode {
+        LIBSSH2_SESSION* session;
+        int previous;
+        ~RestoreMode() { libssh2_session_set_blocking(session, previous); }
+    } mode{session_->raw(), libssh2_session_get_blocking(session_->raw())};
+    libssh2_session_set_blocking(mode.session, 1);
+
+    const auto budget = std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
+    for (int count = 0; count < 4 && running_.load(); ++count) {
+        Task task;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (tasks_.empty()) break;
+            task = std::move(tasks_.front());
+            tasks_.pop_front();
+        }
+        executeTask(std::move(task));
+        if (!running_.load() || !sftp_->readyToYield()) break;
+        if (std::chrono::steady_clock::now() >= budget) break;
+    }
+    if (running_.load() && sftp_->readyToYield()) sampleIfDue();
+    // Never resume the paused file's request over an unrelated partial packet.
+    // Normal SFTP exits flush these packets; fail closed if that invariant fails.
+    if (!sftp_->readyToYield() && running_.exchange(false)) {
+#ifdef _WIN32
+        shutdown(session_->socketFd(), SD_BOTH);
+#else
+        shutdown(session_->socketFd(), SHUT_RDWR);
+#endif
+        ready_ = false;
+        sftpReady_ = false;
+        FsEvent event;
+        event.kind = FsEventKind::Failed;
+        event.message = "文件通道无法安全切换操作，请重试连接";
+        if (callbacks_.onEvent) callbacks_.onEvent(event);
+    }
+    if (!running_.load() || sftp_->interrupted())
+        throw Error("文件通道已中断，传输未完成");
+}
 
 void RemoteFs::workerLoop() {
     // ---- 建立独立连接 ----
@@ -677,6 +822,8 @@ void RemoteFs::workerLoop() {
     }
 
     if (!running_.load()) return;
+
+    OperationCancelScope lifetime([this]() { return !running_.load(); });
 
     // SFTP 打不开不算致命：终端还能用，只是左侧文件面板不可用
     std::string sftpError;
@@ -705,42 +852,33 @@ void RemoteFs::workerLoop() {
         if (callbacks_.onEvent) callbacks_.onEvent(event);
     }
 
-    auto nextSample = std::chrono::steady_clock::now();
-    bool firstSample = true;
+    nextSample_ = std::chrono::steady_clock::now();
+    servicingInteractions_ = false;
 
     while (running_.load()) {
         Task task;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             cv_.wait_for(lock, std::chrono::milliseconds(120),
-                         [this]() { return !running_.load() || !tasks_.empty(); });
+                         [this]() { return !running_.load() || !tasks_.empty() || !transferTasks_.empty(); });
             if (!running_.load()) break;
             if (!tasks_.empty()) {
                 task = std::move(tasks_.front());
                 tasks_.pop_front();
+            } else if (!transferTasks_.empty()) {
+                task = std::move(transferTasks_.front());
+                transferTasks_.pop_front();
             }
         }
         if (task) {
-            try {
-                task();
-            } catch (...) {
-                // 任务内部已经吞掉异常，这里兜底避免线程退出
-            }
-            continue;
+            executeTask(std::move(task));
         }
-
-        // 空闲时做一次采样
-        const auto now = std::chrono::steady_clock::now();
-        if (sampleInterval_ > 0 && (firstSample || statsPending_ || now >= nextSample)) {
-            firstSample = false;
-            statsPending_ = false;
-            nextSample = now + std::chrono::seconds(sampleInterval_);
-            runSample();
-        }
+        sampleIfDue();
     }
 
     sftp_.reset();
     if (session_) {
+        libssh2_session_set_timeout(session_->raw(), 500);
         session_->disconnect();
         session_.reset();
     }
@@ -858,10 +996,18 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
     if (maxOutputBytes == 0) maxOutputBytes = static_cast<std::size_t>(-1);
 
     const auto started = std::chrono::steady_clock::now();
+    if (operationCancelled()) return fail("任务已停止");
 
     LIBSSH2_CHANNEL* channel = libssh2_channel_open_session(raw);
     if (!channel) {
         return fail("打开 exec 通道失败（" + std::to_string(libssh2_session_last_errno(raw)) + "）");
+    }
+    if (operationCancelled()) {
+        const long previous = libssh2_session_get_timeout(raw);
+        libssh2_session_set_timeout(raw, 500);
+        libssh2_channel_free(channel);
+        libssh2_session_set_timeout(raw, previous);
+        return fail("任务已停止");
     }
     if (libssh2_channel_exec(channel, command.c_str()) != 0) {
         const int code = libssh2_session_last_errno(raw);
@@ -880,7 +1026,11 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
     // 表现出来就是“第一条命令成功、第二条一直超时”）。
     auto drain = [&](int stream) {
         ssize_t n = libssh2_channel_read_ex(channel, stream, buf.data(), buf.size());
-        while (n > 0) {
+        bool active = false;
+        // Bound each drain so continuous stdout cannot starve cancellation,
+        // stderr or the command deadline.
+        for (int chunks = 0; n > 0 && chunks < 16; ++chunks) {
+            active = true;
             const std::size_t chunk = static_cast<std::size_t>(n);
             const std::size_t room =
                 out.size() < maxOutputBytes ? maxOutputBytes - out.size() : 0;
@@ -892,20 +1042,21 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
             } else {
                 out.append(buf.data(), chunk);
             }
-            n = libssh2_channel_read_ex(channel, stream, buf.data(), buf.size());
+            n = chunks < 15 ? libssh2_channel_read_ex(channel, stream, buf.data(), buf.size())
+                            : LIBSSH2_ERROR_EAGAIN;
         }
         if (n < 0 && n != LIBSSH2_ERROR_EAGAIN) {
             ok = false;
             why = "读取输出失败（" + std::to_string(n) + "）";
             return false;
         }
-        return n > 0;
+        return active;
     };
 
     for (;;) {
-        if (!running_.load()) {  // 断开时尽快退出，别把 UI 线程卡在 join 上
+        if (!running_.load() || operationCancelled()) {
             ok = false;
-            why = "连接已断开";
+            why = running_.load() ? "任务已停止" : "连接已断开";
             break;
         }
         bool active = drain(0);
@@ -929,25 +1080,56 @@ bool RemoteFs::execCapture(const std::string& command, std::string& out, int tim
                 .count());
     }
 
-    // 先恢复阻塞再收尾：非阻塞下 close/free 只是“发出去就不管了”，
-    // 高延迟链路上通道可能没真正关掉，下一条命令就会卡在打开通道上。
+    // Retry close/free to completion, while still allowing stop to shorten the
+    // cleanup deadline. Abandoning EAGAIN leaves libssh2 channel state alive.
     const bool sawEof = libssh2_channel_eof(channel) == 1;
-    libssh2_session_set_blocking(raw, 1);
-    libssh2_channel_close(channel);
+    const long previousTimeout = libssh2_session_get_timeout(raw);
+    bool transportInterrupted = false;
+    auto finish = [&](auto call) {
+        auto until = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(!ok || operationCancelled() ? 500 : std::max(previousTimeout, 500L));
+        int rc;
+        while ((rc = call()) == LIBSSH2_ERROR_EAGAIN) {
+            if (operationCancelled())
+                until = std::min(until, std::chrono::steady_clock::now() + std::chrono::milliseconds(500));
+            if (std::chrono::steady_clock::now() >= until) {
+                transportInterrupted = true;
+#ifdef _WIN32
+                shutdown(session_->socketFd(), SD_BOTH);
+#else
+                shutdown(session_->socketFd(), SHUT_RDWR);
+#endif
+                return call();
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        return rc;
+    };
+    finish([&]() { return libssh2_channel_close(channel); });
     // 退出码在 close 之后取：exit-status 请求可能比 EOF 晚到，抢在 close 前读会拿到 -1
     if (exitCode && ok && sawEof) *exitCode = libssh2_channel_get_exit_status(channel);
-    libssh2_channel_free(channel);
+    finish([&]() { return libssh2_channel_free(channel); });
+    libssh2_session_set_blocking(raw, 1);
+    if (transportInterrupted && running_.exchange(false)) {
+        ready_ = false;
+        sftpReady_ = false;
+        FsEvent event;
+        event.kind = FsEventKind::Failed;
+        event.message = "文件通道已中断，请重试连接";
+        if (callbacks_.onEvent) callbacks_.onEvent(event);
+    }
     if (!ok && error) *error = why.empty() ? "命令执行失败" : why;
     return ok;
 }
 // ---------------------------------------------------------------- AI 工具的同步接口
 //
 // 这几个方法会从 AI 工作线程调用，而 libssh2 会话只能由文件线程触碰，
-// 所以统一走 runSync。注意：runSync 超时返回后，排队的任务仍可能在文件线程里
-// 继续跑，因此结果缓冲区一律用 shared_ptr 持有，不能捕获栈上变量的引用。
+// 所以统一走 runSync。取消/超时会撤销未开始的任务，已开始的任务可能仍在收尾，
+// 因此结果缓冲区一律用 shared_ptr 持有，不能捕获栈上变量的引用。
 
 RemoteFs::ExecOutcome RemoteFs::execSync(const std::string& command, int timeoutMs,
-                                         std::size_t maxOutputBytes) {
+                                         std::size_t maxOutputBytes,
+                                         const CancelCheck& shouldCancel) {
     ExecOutcome outcome;
     if (!running_.load()) {
         outcome.error = "远端连接尚未建立";
@@ -976,10 +1158,10 @@ RemoteFs::ExecOutcome RemoteFs::execSync(const std::string& command, int timeout
                 state->error = ex.what();
             }
         },
-        waitMs);
+        waitMs, shouldCancel);
 
     if (!finished) {
-        outcome.error = "等待远端响应超时";
+        outcome.error = shouldCancel && shouldCancel() ? "任务已停止" : "等待远端响应超时";
         return outcome;
     }
 
@@ -992,7 +1174,7 @@ RemoteFs::ExecOutcome RemoteFs::execSync(const std::string& command, int timeout
 }
 
 bool RemoteFs::readFileSync(const std::string& path, std::size_t maxBytes, std::string& out,
-                            bool& truncated, std::string& error) {
+                            bool& truncated, std::string& error, const CancelCheck& shouldCancel) {
     truncated = false;
     error.clear();
     if (!running_.load()) {
@@ -1021,13 +1203,12 @@ bool RemoteFs::readFileSync(const std::string& path, std::size_t maxBytes, std::
                 handle = sftp_->openReadHandle(path, size);
                 std::vector<char> buffer(32 * 1024);
                 for (;;) {
-                    if (state->data.size() >= maxBytes) {
-                        state->truncated = true;
-                        break;
-                    }
-                    const std::size_t got = sftp_->readHandle(handle, buffer.data(), buffer.size());
-                    if (got == 0) break;
                     const std::size_t room = maxBytes - state->data.size();
+                    // Reaching the budget alone is not truncation. Probe for
+                    // one extra byte so exact-size files remain readable.
+                    const std::size_t request = room < buffer.size() ? room + 1 : buffer.size();
+                    const std::size_t got = sftp_->readHandle(handle, buffer.data(), request);
+                    if (got == 0) break;
                     if (got > room) {
                         state->data.append(buffer.data(), room);
                         state->truncated = true;
@@ -1043,10 +1224,10 @@ bool RemoteFs::readFileSync(const std::string& path, std::size_t maxBytes, std::
                 state->error = ex.what();
             }
         },
-        60000);
+        60000, shouldCancel);
 
     if (!finished) {
-        error = "等待远端响应超时";
+        error = shouldCancel && shouldCancel() ? "任务已停止" : "等待远端响应超时";
         return false;
     }
     if (!state->ok) {
@@ -1059,7 +1240,7 @@ bool RemoteFs::readFileSync(const std::string& path, std::size_t maxBytes, std::
 }
 
 bool RemoteFs::writeFileSync(const std::string& path, const std::string& content,
-                             std::string& error) {
+                             std::string& error, const CancelCheck& shouldCancel) {
     error.clear();
     if (!running_.load()) {
         error = "远端连接尚未建立";
@@ -1085,10 +1266,10 @@ bool RemoteFs::writeFileSync(const std::string& path, const std::string& content
                 state->error = ex.what();
             }
         },
-        60000);
+        60000, shouldCancel);
 
     if (!finished) {
-        error = "等待远端响应超时";
+        error = shouldCancel && shouldCancel() ? "任务已停止" : "等待远端响应超时";
         return false;
     }
     if (!state->ok) {
@@ -1099,7 +1280,7 @@ bool RemoteFs::writeFileSync(const std::string& path, const std::string& content
 }
 
 bool RemoteFs::listDirSync(const std::string& path, std::vector<RemoteEntry>& out,
-                           std::string& error) {
+                           std::string& error, const CancelCheck& shouldCancel) {
     error.clear();
     out.clear();
     if (!running_.load()) {
@@ -1140,10 +1321,10 @@ bool RemoteFs::listDirSync(const std::string& path, std::vector<RemoteEntry>& ou
                 state->error = ex.what();
             }
         },
-        30000);
+        30000, shouldCancel);
 
     if (!finished) {
-        error = "等待远端响应超时";
+        error = shouldCancel && shouldCancel() ? "任务已停止" : "等待远端响应超时";
         return false;
     }
     if (!state->ok) {
@@ -1154,7 +1335,7 @@ bool RemoteFs::listDirSync(const std::string& path, std::vector<RemoteEntry>& ou
     return true;
 }
 
-bool RemoteFs::mkdirSync(const std::string& path, std::string& error) {
+bool RemoteFs::mkdirSync(const std::string& path, std::string& error, const CancelCheck& shouldCancel) {
     error.clear();
     if (path.empty()) {
         error = "缺少目录路径";
@@ -1192,10 +1373,10 @@ bool RemoteFs::mkdirSync(const std::string& path, std::string& error) {
                 state->error = ex.what();
             }
         },
-        20000);
+        20000, shouldCancel);
 
     if (!finished) {
-        error = "等待远端响应超时";
+        error = shouldCancel && shouldCancel() ? "任务已停止" : "等待远端响应超时";
         return false;
     }
     if (!state->ok) {

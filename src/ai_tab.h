@@ -75,6 +75,27 @@ public:
     HWND window() const { return window_; }
     void setBounds(const RECT& bounds);
     void show(bool visible);
+    // Host visibility is explicit so hidden-window probes can still model a
+    // shown panel. Minimize/hide pauses visual work without cancelling tasks.
+    void setHostVisible(bool visible);
+    // Explicit opt-in after the host has applied the final layout and shown us.
+    void animateOpen(bool enabled = true);
+    void finishOpenAnimation();
+    // Deterministic geometry checks can run without showing the parent window.
+    void animateOpenForTest(std::uint64_t now);
+    void advanceOpenAnimationForTest(std::uint64_t now);
+    bool openAnimationActiveForTest() const;
+    int openAnimationOffsetForTest() const;
+    RECT logicalBoundsForTest() const;
+    void enqueueStreamForTest(const std::wstring& text, bool reasoning = false);
+    void enqueueToolForTest(const std::wstring& title, const std::wstring& detail = {});
+    void enqueueApprovalForTest(const std::wstring& title, const std::wstring& detail = {});
+    void flushStreamForTest(const std::function<void()>& afterDetach = {});
+    void resetStreamForTest();
+    void waitSessionReadForTest();
+    std::size_t pendingStreamForTest() const;
+    bool flushPostedForTest() const;
+    bool visualTimersActiveForTest() const;
     void focus();
     void setFullScreen(bool full);
     // 换标签后刷新标题上的主机名
@@ -118,6 +139,10 @@ private:
     LRESULT handle(UINT message, WPARAM wParam, LPARAM lParam);
 
     void initialize(HWND parent);
+    void beginOpenAnimation(std::uint64_t now, bool allowHidden);
+    void advanceOpenAnimation(std::uint64_t now, bool allowHidden);
+    bool applyOpenAnimationOffset(int offset);
+    void updateVisualActivity();
     void applyTheme();
     void finishSettings(bool save);
     void createSettingsControls();
@@ -138,17 +163,22 @@ private:
         Tool,
         Approval,
         TurnDone,
-        SessionLoaded,  // 自动接上最近一次对话（payload = vector<SessionEntry>）
-        SessionList,    // 历史按钮的列表（payload = vector<SessionEntry>）
+        SessionLoaded,  // 自动接上最近一次对话（payload = SessionReadPayload）
+        SessionList,    // 历史按钮的摘要列表
+        SessionOpened,  // 从列表选中后异步读取的正文
+        SessionNotice,  // 对话保存/摘要更新提示
     };
     struct Event {
         EventKind kind = EventKind::Text;
         std::wstring a, b, c;
         bool ok = true;
         bool flag = false;
+        std::uint64_t epoch = 0;  // 0 for history/save events with their own generation.
         std::shared_ptr<void> payload;  // 审批用的等待槽
     };
-    void drainPendingStream();      // 把工作线程攒的文本并进展示缓冲
+    void drainPendingStream();      // Consume an ordered producer prefix, including barriers.
+    bool takeEventBatch(std::vector<Event>& batch);
+    void applyEventBatch(std::vector<Event>& batch);
     void pumpReveal();              // 每帧吐一小片，做平滑展示
     void revealAll();               // 收尾时把缓冲一次倒完
     void requestRepaint();          // 整块重绘（结构变化）
@@ -157,7 +187,8 @@ private:
     void paint(HDC dc, const RECT* dirty = nullptr);
     void positionIme();
     void postEvent(EventKind kind, std::wstring a, std::wstring b = {}, std::wstring c = {},
-                   bool ok = true, std::shared_ptr<void> payload = nullptr);
+                   bool ok = true, std::shared_ptr<void> payload = nullptr,
+                   std::uint64_t epoch = 0);
     void handleEvent(Event& event);
     void onTurnFinished(const std::wstring& status, bool ok);
 
@@ -184,8 +215,8 @@ private:
     void autoLoadLatestSession();
     // 点「历史」：读列表 → 宿主弹窗 → 载入
     void showSessionHistory();
-    // 读远端列表：limit=1 是自动接上，20 是历史按钮
-    void startSessionRead(std::uintptr_t hostId, int limit);
+    // limit=1 自动接上正文，20 只读历史摘要；file 非空时只读所选正文。
+    void startSessionRead(std::uintptr_t hostId, int limit, const std::string& file = {});
     void applySession(const std::string& file, const SessionRecord& record, bool announce);
     // 把当前搜索后端 + Key 应用到工具层（没配好 = 不提供 web_search）
     void applySearch();

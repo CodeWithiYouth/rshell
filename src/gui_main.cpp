@@ -24,6 +24,7 @@
 #include <libssh2_sftp.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -51,9 +52,11 @@
 #include "session_store.h"
 #include "ssh_session.h"
 #include "ssh_shell.h"
+#include "shell_output_buffer.h"
 #include "terminal.h"
 #include "update_check.h"
 #include "ui_theme.h"
+#include "ui_animation.h"
 #include "util.h"
 #include "vault.h"
 #include "win_compat.h"
@@ -78,6 +81,7 @@ enum : UINT {
     WM_UPDATE_AVAILABLE = WM_APP + 9,  // lParam = ReleaseInfo*（UI 线程释放）
     WM_UPDATE_DOWNLOADED = WM_APP + 10, // lParam = UpdateDownload*
     WM_FS_CONFLICT = WM_APP + 11,
+    WM_SHELL_FLUSH = WM_APP + 12, // One pending notification per connection.
 };
 
 // 目录跟随分三步执行，每步由远端私有 OSC 确认；定时器只负责静默等待和超时。
@@ -90,6 +94,7 @@ constexpr UINT_PTR kCwdHookTimer4 = 5;
 // 定时器 id 与 tabId 一起编码成 tabId*8+id（见 mainProc 的 WM_TIMER 分发）
 constexpr UINT_PTR kReconnectTimer = 6;
 constexpr UINT_PTR kUpdateCheckTimer = 7;
+constexpr UINT_PTR kShellFlushTimer = 0;
 
 enum : int {
     ID_LIST = 1001,
@@ -168,6 +173,8 @@ struct SessionState {
     };
     Terminal termData;
     std::shared_ptr<SshShell> shell = std::make_shared<SshShell>();
+    std::shared_ptr<ShellOutputBuffer> shellOutput = std::make_shared<ShellOutputBuffer>();
+    std::unique_ptr<std::string> pendingShellClose;
     std::string currentSession;
     std::wstring statusText = L"就绪";
     bool statusError = false;
@@ -208,6 +215,7 @@ struct SessionState {
     std::string fsHome;          // 登录后的 home
     std::string fsError;         // 列目录失败原因
     bool fsLoading = false;      // 列目录请求还在路上（高延迟时面板要显示「正在加载」）
+    std::uint64_t fsRequestId = 0;
     std::string fsQuietPath;     // 终端跟随触发的导航：列目录失败只在状态栏提示
     std::vector<RemoteEntry> fsEntries;
     int fsSel = -1;
@@ -417,6 +425,51 @@ struct App : SessionState {
 };
 
 App g_app;
+
+// Shared UI transitions stay outside SessionState: background SSH events may
+// temporarily swap that state, but must never retarget foreground animations.
+constexpr UINT_PTR kUiAnimationTimer = 0x7fff0001;
+constexpr int kTitleMotionBase = -100;
+constexpr int kAiMotionId = -110;
+struct ButtonMotion {
+    int id = 0;
+    RECT bounds{};
+    ui::Tween hover{0.0f}, press{0.0f};
+    bool repaint = false;
+};
+struct UiMotion {
+    std::array<ButtonMotion, 16> buttons{};
+    std::size_t count = 0;
+    UINT_PTR tabId = 0;
+    int connectionKey = -1;
+    std::uint32_t connectionFrom = ui::textFaint, connectionTo = ui::textFaint;
+    ui::Tween connectionFade{1.0f}, feedback{1.0f};
+    bool enabled = true, timerArmed = false, connectionRepaint = false;
+} g_uiMotion;
+
+struct MainBackBuffer {
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ original = nullptr;
+    int width = 0, height = 0;
+    void reset() {
+        if (dc && original) SelectObject(dc, original);
+        if (bitmap) DeleteObject(bitmap);
+        if (dc) DeleteDC(dc);
+        dc = nullptr; bitmap = nullptr; original = nullptr;
+        width = height = 0;
+    }
+    bool ensure(HDC reference, int w, int h) {
+        if (dc && width == w && height == h) return true;
+        reset();
+        dc = CreateCompatibleDC(reference);
+        bitmap = CreateCompatibleBitmap(reference, w, h);
+        if (!dc || !bitmap) { reset(); return false; }
+        original = SelectObject(dc, bitmap);
+        width = w; height = h;
+        return true;
+    }
+} g_mainBackBuffer;
 
 // 活动标签的状态放在 App 的基类中，以复用现有终端/SFTP 绘制代码；
 // 其余标签保存在各自的堆对象中。后端本体不随状态移动，工作线程始终持有原连接。
@@ -1198,7 +1251,8 @@ void drawImeComposition(HDC mem, int padX, int padY, int cw, int ch) {
 }
 
 // 把终端网格绘制到指定 DC（WM_PAINT 与离屏渲染工具 --render 共用同一份逻辑）
-void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome = false) {
+void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome = false,
+                      const RECT* dirty = nullptr) {
     Terminal& term = g_app.termData;
     const int cols = term.cols();
     const int cw = g_app.cellW;
@@ -1238,7 +1292,9 @@ void drawTerminalGrid(HDC mem, int width, int height, bool focused, bool chrome 
     // 基线对齐：不同回退字体的 ascent 不同，按基线绘制才能保证同一行文字上下对齐
     SetTextAlign(mem, TA_LEFT | TA_BASELINE);
 
-    for (int row = 0; row < rows; ++row) {
+    const int firstRow = dirty ? std::clamp(static_cast<int>(dirty->top - padY) / ch, 0, rows) : 0;
+    const int lastRow = dirty ? std::clamp(static_cast<int>(dirty->bottom - padY + ch - 1) / ch, 0, rows) : rows;
+    for (int row = firstRow; row < lastRow; ++row) {
         const std::size_t lineIndex = firstLine + static_cast<std::size_t>(row);
         const std::vector<Cell>& cells = term.lineAt(lineIndex);
         if (cells.empty()) continue;
@@ -1406,7 +1462,10 @@ void paintTerminal(HWND hwnd) {
         return;
     }
 
-    drawTerminalGrid(g_app.memDC, width, height, GetFocus() == hwnd, true);
+    const int paintState = SaveDC(g_app.memDC);
+    IntersectClipRect(g_app.memDC, ps.rcPaint.left, ps.rcPaint.top,
+                      ps.rcPaint.right, ps.rcPaint.bottom);
+    drawTerminalGrid(g_app.memDC, width, height, GetFocus() == hwnd, true, &ps.rcPaint);
     // 仅在首次打开的空终端显示引导，保留断开后的全部输出。
     if (g_app.currentSession.empty() && !g_app.connecting && !g_app.shell->running() &&
         g_app.termData.scrollbackCount() == 0 && width >= dp(320) && height >= dp(220)) {
@@ -1437,10 +1496,13 @@ void paintTerminal(HWND hwnd) {
             RestoreDC(mem, saved);
         }
     }
-    BitBlt(dc, 0, 0, width, height, g_app.memDC, 0, 0, SRCCOPY);
+    RestoreDC(g_app.memDC, paintState);
+    BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right - ps.rcPaint.left,
+           ps.rcPaint.bottom - ps.rcPaint.top, g_app.memDC, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
     EndPaint(hwnd, &ps);
 }
 
+#ifdef RSHELL_ENABLE_DIAGNOSTICS
 // 取某个字体实际生效的字面名（用于诊断）
 std::wstring faceOfFont(HDC dc, HFONT font) {
     if (!font) return L"<null>";
@@ -1546,6 +1608,8 @@ bool renderDumpToBmp(const std::wstring& dumpPath, const std::wstring& outPath, 
     ReleaseDC(nullptr, screen);
     return ok;
 }
+
+#endif  // RSHELL_ENABLE_DIAGNOSTICS
 
 // ---------------------------------------------------------------- 终端交互
 
@@ -2500,6 +2564,8 @@ void disconnectSession() {
     cancelAutoReconnect(true);
     // 连接没了，本地编辑副本无法回传；停止跟踪（文件仍留在 ~/.rshell/edit）
     dropEditedFiles(g_app.connectionId);
+    g_app.shellOutput->close();
+    g_app.pendingShellClose.reset();
     g_app.connectionId = g_nextConnectionId++;
     if (g_app.shell->running() || g_app.connecting) {
         if (g_app.connecting) g_app.shell = std::make_shared<SshShell>();
@@ -2552,7 +2618,10 @@ void connectToSession(const Session& session, const std::wstring& password,
     dropEditedFiles(g_app.connectionId);
     g_app.connectionId = g_nextConnectionId++;
     const UINT_PTR connectionId = g_app.connectionId;
+    g_app.shellOutput->close();
     g_app.shell->close();  // 等旧工作线程结束后才能替换回调。
+    g_app.shellOutput = std::make_shared<ShellOutputBuffer>();
+    g_app.pendingShellClose.reset();
 
     ConnectionOptions options;
     options.host = session.host;
@@ -2596,13 +2665,13 @@ void connectToSession(const Session& session, const std::wstring& password,
     };
 
     auto shell = g_app.shell;
+    const auto output = g_app.shellOutput;
     const auto runtime = g_app.runtime;
     shell->setCallbacks(ShellCallbacks{
-        [mainWindow, connectionId](std::string data) {
-            auto* payload = new std::string(std::move(data));
-            if (!PostMessageW(mainWindow, WM_SHELL_DATA, connectionId, reinterpret_cast<LPARAM>(payload))) {
-                delete payload;
-            }
+        [mainWindow, connectionId, output](std::string data) {
+            output->push(std::move(data), [mainWindow, connectionId]() {
+                return PostMessageW(mainWindow, WM_SHELL_FLUSH, connectionId, 0) != FALSE;
+            });
         },
         [mainWindow, connectionId, source = shell.get()]() {
             auto* reason = new std::string(source->closedReason());
@@ -6019,7 +6088,7 @@ const RemoteEntry* selectedFileEntry() {
 void fsRefresh() {
     if (g_app.fsPath.empty()) return;
     g_app.fsLoading = true;
-    g_app.fs->listDir(g_app.fsPath);
+    g_app.fs->listDir(g_app.fsPath, ++g_app.fsRequestId);
     if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
 }
 
@@ -6033,7 +6102,7 @@ void fsNavigate(const std::string& path, bool quiet = false) {
     g_app.fsError.clear();
     g_app.fsEntries.clear();
     g_app.fsLoading = true;  // 高延迟时先给个「正在加载」，别让人以为目录是空的
-    g_app.fs->listDir(g_app.fsPath);
+    g_app.fs->listDir(g_app.fsPath, ++g_app.fsRequestId);
     if (g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
     if (g_app.main) InvalidateRect(g_app.main, nullptr, FALSE);
 }
@@ -7024,6 +7093,7 @@ void paintFileIcon(HDC dc, const RECT& box, FileKind kind) {
 
 // 图标总览（开发用）：rshell-gui.exe --icons <out.bmp>
 // 把所有类型按 16/24/32/48 各画一遍，一眼就能看出哪一档比例/线条不对。
+#ifdef RSHELL_ENABLE_DIAGNOSTICS
 bool renderIconSheet(const std::wstring& outPath) {
     if (g_app.dpi <= 0) g_app.dpi = wincompat::systemDpi();
     createFonts();
@@ -7115,6 +7185,8 @@ bool renderIconSheet(const std::wstring& outPath) {
     DeleteDC(mem);
     return ok;
 }
+
+#endif  // RSHELL_ENABLE_DIAGNOSTICS
 
 // ---------------------------------------------------------------- 拖入 / 拖出
 //
@@ -7759,6 +7831,8 @@ void stopRemoteFs() {
 
 // UI 线程处理来自文件工作线程的事件
 void handleFsEvent(const FsEvent& event) {
+    // A slow earlier navigation must not replace the directory now requested.
+    if (event.requestId && event.requestId != g_app.fsRequestId) return;
     // ---- 传输任务（上传 + 下载）----
     if (event.kind == FsEventKind::Started) {
         if (!g_app.fsReady && !event.localPath.empty()) return;
@@ -8705,6 +8779,133 @@ void drawSparkle(HDC dc, int cx, int cy, int radius, std::uint32_t color) {
     fillPoints(dc, pts, color);
 }
 
+bool uiMotionAllowed() {
+    return g_uiMotion.enabled && IsWindowVisible(g_app.main) && !IsIconic(g_app.main);
+}
+
+void readUiAnimationPreference() {
+    BOOL enabled = TRUE;
+    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, &enabled, 0);
+    wchar_t disabled[2]{};
+    g_uiMotion.enabled = enabled && !GetEnvironmentVariableW(
+        L"RSHELL_DISABLE_ANIMATIONS", disabled, 2);
+}
+
+ButtonMotion* buttonMotion(int id) {
+    for (std::size_t i = 0; i < g_uiMotion.count; ++i)
+        if (g_uiMotion.buttons[i].id == id) return &g_uiMotion.buttons[i];
+    return nullptr;
+}
+
+bool uiAnimationsActive(ULONGLONG now) {
+    if (g_uiMotion.connectionFade.active(now) || g_uiMotion.feedback.active(now)) return true;
+    for (std::size_t i = 0; i < g_uiMotion.count; ++i) {
+        const auto& b = g_uiMotion.buttons[i];
+        if (b.hover.active(now) || b.press.active(now)) return true;
+    }
+    return false;
+}
+
+void finishUiAnimations() {
+    for (auto& b : g_uiMotion.buttons) { b.hover.finish(); b.press.finish(); }
+    g_uiMotion.connectionFade.finish();
+    g_uiMotion.feedback.finish();
+    if (g_uiMotion.timerArmed) KillTimer(g_app.main, kUiAnimationTimer);
+    g_uiMotion.timerArmed = false;
+}
+
+std::uint32_t animatedConnectionColor(ULONGLONG now) {
+    return ui::mix(g_uiMotion.connectionFrom, g_uiMotion.connectionTo,
+                   g_uiMotion.connectionFade.value(now));
+}
+
+RECT buttonPaintBounds(RECT bounds) {
+    // GDI+ centers the outline on the path; its antialiasing reaches beyond
+    // the hit rectangle. Repaint those edge pixels on every color transition.
+    InflateRect(&bounds, dp(2), dp(2));
+    return bounds;
+}
+
+void syncUiAnimationTargets(ULONGLONG now, bool animate) {
+    auto target = [&](int id, const RECT& bounds, bool hover, bool press) {
+        auto* b = buttonMotion(id);
+        if (!b) {
+            if (g_uiMotion.count == g_uiMotion.buttons.size()) return;
+            b = &g_uiMotion.buttons[g_uiMotion.count++];
+            b->id = id;
+        }
+        b->bounds = buttonPaintBounds(bounds);
+        b->hover.to(hover ? 1.0f : 0.0f, now, animate ? 120 : 0);
+        b->press.to(press ? 1.0f : 0.0f, now, animate ? 70 : 0);
+        b->repaint = b->repaint || b->hover.active(now) || b->press.active(now);
+    };
+    for (const auto& b : g_app.buttons) {
+        const bool hovered = buttonEnabled(b.id) && g_app.hoverButton == b.id;
+        target(b.id, b.rc, hovered, hovered && g_app.pressButton == b.id);
+    }
+    RECT rc{};
+    GetClientRect(g_app.main, &rc);
+    for (int i = 0; i < 4; ++i) {
+        const RECT bounds{rc.right - dp(46) * (4 - i), 0,
+                          rc.right - dp(46) * (3 - i), g_app.titleH};
+        target(kTitleMotionBase - i, bounds, g_app.hoverTitleBtn == i,
+               g_app.hoverTitleBtn == i && g_app.pressTitleBtn == i);
+    }
+    const RECT ai{rc.right - dp(46) * 5 - dp(4), 0,
+                  rc.right - dp(46) * 4 - dp(4), g_app.titleH};
+    target(kAiMotionId, ai, g_app.hoverTitleAi, g_app.hoverTitleAi && g_app.pressTitleAi);
+
+    const bool connected = g_app.shell->running();
+    const int key = g_app.connecting ? 1 : connected ?
+        (g_app.fsFailed ? 3 : g_app.fsRecoveryPending ? 4 : g_app.fsReady ? 2 : 5) :
+        (g_app.statusError ? 6 : 0);
+    const std::uint32_t color = g_app.connecting || key == 3 || key == 4 ? ui::warn :
+        connected ? ui::success : g_app.statusError ? ui::danger : ui::textFaint;
+    const bool changedTab = g_uiMotion.tabId != g_selectedTabId;
+    if (changedTab || g_uiMotion.connectionKey != key) {
+        const bool transition = animate && !changedTab && g_uiMotion.connectionKey >= 0;
+        g_uiMotion.connectionFrom = animatedConnectionColor(now);
+        g_uiMotion.connectionTo = color;
+        g_uiMotion.connectionFade.snap(transition ? 0.0f : 1.0f);
+        g_uiMotion.connectionFade.to(1.0f, now, transition ? 220 : 0);
+        g_uiMotion.feedback.snap(transition ? 0.0f : 1.0f);
+        g_uiMotion.feedback.to(1.0f, now, transition ? 600 : 0);
+        g_uiMotion.connectionKey = key;
+        g_uiMotion.tabId = g_selectedTabId;
+        g_uiMotion.connectionRepaint = transition;
+    }
+    if (!animate) finishUiAnimations();
+    else if (!g_uiMotion.timerArmed && uiAnimationsActive(now)) {
+        g_uiMotion.timerArmed = SetTimer(g_app.main, kUiAnimationTimer, 16, nullptr) != 0;
+        if (!g_uiMotion.timerArmed) finishUiAnimations();
+    }
+}
+
+void updateUiAnimations(ULONGLONG now) {
+    syncUiAnimationTargets(now, true);
+    for (std::size_t i = 0; i < g_uiMotion.count; ++i) {
+        auto& b = g_uiMotion.buttons[i];
+        if (b.repaint) InvalidateRect(g_app.main, &b.bounds, FALSE);
+        b.repaint = b.hover.active(now) || b.press.active(now);
+    }
+    if (g_uiMotion.connectionRepaint) {
+        RECT rc{};
+        GetClientRect(g_app.main, &rc);
+        const RECT title{0, 0, rc.right, g_app.titleH};
+        const RECT status{0, rc.bottom - g_app.statusH, rc.right, rc.bottom};
+        InvalidateRect(g_app.main, &title, FALSE);
+        InvalidateRect(g_app.main, &status, FALSE);
+        g_uiMotion.connectionRepaint = g_uiMotion.connectionFade.active(now) ||
+                                      g_uiMotion.feedback.active(now);
+    }
+    if (!uiAnimationsActive(now)) finishUiAnimations();
+}
+
+float buttonMotionAmount(int id, bool press, ULONGLONG now) {
+    const auto* b = buttonMotion(id);
+    return b ? (press ? b->press.value(now) : b->hover.value(now)) : 0.0f;
+}
+
 // 标题栏：logo + 应用名 + 当前会话 + 连接状态药丸 + 菜单/最小化/最大化/关闭
 void paintTitleBar(HDC dc, const RECT& rc) {
     const int h = g_app.titleH;
@@ -8720,14 +8921,14 @@ void paintTitleBar(HDC dc, const RECT& rc) {
 
     // 右侧窗口按钮（关闭 hover 变红，是 Windows 用户的肌肉记忆）
     const bool maximized = IsZoomed(g_app.main) != FALSE;
+    const ULONGLONG now = GetTickCount64();
     for (int i = 0; i < 4; ++i) {
-        const bool hovered = (g_app.hoverTitleBtn == i);
-        const bool pressed = hovered && g_app.pressTitleBtn == i;
-        if (hovered) {
-            const std::uint32_t hoverBg = (i == 3) ? ui::danger : ui::bgHover;
-            fillRect(dc, g_app.titleButtons[i], pressed ? ui::mix(hoverBg, 0x000000, 0.18) : hoverBg);
-        }
-        std::uint32_t glyph = (i == 3 && hovered) ? 0xFFFFFF : (hovered ? ui::text : ui::textDim);
+        const float hover = buttonMotionAmount(kTitleMotionBase - i, false, now);
+        const float press = buttonMotionAmount(kTitleMotionBase - i, true, now);
+        const std::uint32_t hoverBg = (i == 3) ? ui::danger : ui::bgHover;
+        const auto bg = ui::mix(ui::bgPanel, hoverBg, hover);
+        fillRect(dc, g_app.titleButtons[i], ui::mix(bg, 0x000000, press * 0.18));
+        std::uint32_t glyph = ui::mix(ui::textDim, i == 3 ? 0xFFFFFF : ui::text, hover);
         drawTitleGlyph(dc, i, g_app.titleButtons[i], glyph, maximized);
     }
 
@@ -8740,8 +8941,8 @@ void paintTitleBar(HDC dc, const RECT& rc) {
     {
         const RECT chip{g_app.titleAi.left + dp(7), dp(9), g_app.titleAi.right - dp(7),
                         h - dp(9)};
-        const bool hovered = g_app.hoverTitleAi;
-        const bool pressed = hovered && g_app.pressTitleAi;
+        const float hover = buttonMotionAmount(kAiMotionId, false, now);
+        const float press = buttonMotionAmount(kAiMotionId, true, now);
         std::uint32_t chipBg = ui::bgCard;
         std::uint32_t chipBorder = ui::borderSoft;
         std::uint32_t glyph = ui::accent;
@@ -8750,12 +8951,10 @@ void paintTitleBar(HDC dc, const RECT& rc) {
             chipBorder = ui::mix(ui::accent, ui::bgPanel, 0.4);
             glyph = 0xFFFFFF;
         }
-        if (hovered) {
-            chipBg = g_app.aiOpen ? ui::mix(ui::action, ui::bgPanel, 0.22) : ui::bgHover;
-            chipBorder = ui::mix(ui::accent, ui::bgPanel, 0.45);
-            if (!g_app.aiOpen) glyph = ui::mix(ui::accent, 0xFFFFFF, 0.3);
-        }
-        if (pressed) chipBg = ui::mix(chipBg, 0x000000, 0.18);
+        chipBg = ui::mix(chipBg, g_app.aiOpen ? ui::mix(ui::action, ui::bgPanel, 0.22) : ui::bgHover, hover);
+        chipBorder = ui::mix(chipBorder, ui::mix(ui::accent, ui::bgPanel, 0.45), hover);
+        if (!g_app.aiOpen) glyph = ui::mix(glyph, 0xFFFFFF, hover * 0.3);
+        chipBg = ui::mix(chipBg, 0x000000, press * 0.18);
         fillRoundRect(dc, chip, dp(8), chipBg, chipBorder);
         const int cx = (chip.left + chip.right) / 2;
         const int cy = (chip.top + chip.bottom) / 2;
@@ -8787,6 +8986,7 @@ void paintTitleBar(HDC dc, const RECT& rc) {
         pillLabel = L"已连接";
         pillColor = ui::success;
     }
+    pillColor = animatedConnectionColor(now);
     const int pillW = textWidth(dc, pillLabel, g_app.tinyFont) + dp(28);
     const int pillRight = g_app.titleAi.left - dp(8);
     const int pillLeft = pillRight - pillW;
@@ -8830,6 +9030,10 @@ void paintTitleBar(HDC dc, const RECT& rc) {
     RECT pill{pillLeft, (h - pillH) / 2, pillRight, (h - pillH) / 2 + pillH};
     fillRoundRect(dc, pill, pillH / 2, ui::mix(pillColor, ui::bgPanel, 0.86),
                   ui::mix(pillColor, ui::bgPanel, 0.6));
+    const float feedback = 1.0f - g_uiMotion.feedback.value(now);
+    if (feedback > 0.0f)
+        fillCircle(dc, pill.left + dp(9), (pill.top + pill.bottom) / 2,
+                   dp(7), ui::mix(ui::mix(pillColor, ui::bgPanel, 0.86), pillColor, feedback * 0.35));
     fillCircle(dc, pill.left + dp(9), (pill.top + pill.bottom) / 2, dp(3), pillColor);
     RECT pillText{pill.left + dp(16), pill.top, pill.right - dp(4), pill.bottom};
     drawText(dc, pillLabel, pillText, pillColor, g_app.tinyFont,
@@ -8914,10 +9118,13 @@ void drawListGlyph(HDC dc, const RECT& rc, std::uint32_t color) {
 
 void paintButtons(HDC dc) {
     const bool connected = g_app.shell->running();
+    const ULONGLONG now = GetTickCount64();
     for (const auto& b : g_app.buttons) {
+        const RECT painted = buttonPaintBounds(b.rc);
+        if (!RectVisible(dc, &painted)) continue;
         const bool enabled = buttonEnabled(b.id);
-        const bool hovered = enabled && g_app.hoverButton == b.id;
-        const bool pressed = hovered && g_app.pressButton == b.id;
+        const float hover = enabled ? buttonMotionAmount(b.id, false, now) : 0.0f;
+        const float press = enabled ? buttonMotionAmount(b.id, true, now) : 0.0f;
         std::uint32_t bg = ui::bgCard;
         std::uint32_t fg = ui::textDim;
         std::uint32_t border = ui::borderSoft;
@@ -8927,15 +9134,13 @@ void paintButtons(HDC dc) {
             if (!enabled) {
                 bg = ui::mix(ui::action, ui::bgApp, 0.62);
                 fg = ui::mix(0xFFFFFF, ui::bgApp, 0.35);
-            } else if (pressed) {
-                bg = ui::actionPressed;
-                fg = 0xFFFFFF;
             } else {
-                bg = hovered ? ui::actionHover : ui::action;
+                bg = ui::mix(ui::mix(ui::action, ui::actionHover, hover), ui::actionPressed, press);
                 fg = 0xFFFFFF;
             }
         } else if (b.primary) {
-            bg = pressed ? ui::mix(ui::bgCard, 0x000000, 0.15) : (hovered ? ui::bgHover : ui::bgCard);
+            bg = ui::mix(ui::mix(ui::bgCard, ui::bgHover, hover),
+                         ui::mix(ui::bgCard, 0x000000, 0.15), press);
             fg = ui::mix(ui::danger, ui::text, 0.45);
             border = ui::mix(ui::danger, ui::bgApp, 0.45);
         } else {
@@ -8943,9 +9148,9 @@ void paintButtons(HDC dc) {
                 bg = ui::mix(ui::bgCard, ui::bgApp, 0.5);
                 fg = ui::mix(ui::textFaint, ui::bgApp, 0.35);
             } else {
-                bg = pressed ? ui::mix(ui::bgHover, 0x000000, 0.12)
-                             : (hovered ? ui::bgHover : ui::bgCard);
-                fg = hovered ? ui::text : ui::textDim;
+                bg = ui::mix(ui::mix(ui::bgCard, ui::bgHover, hover),
+                             ui::mix(ui::bgHover, 0x000000, 0.12), press);
+                fg = ui::mix(ui::textDim, ui::text, hover);
             }
         }
 
@@ -9426,8 +9631,10 @@ void paintStatusBar(HDC dc, const RECT& rc) {
     const StatusLayout layout = statusGeometry(rc);
     fillRect(dc, RECT{0, y, rc.right, rc.bottom}, ui::bgPanel);
     drawHLine(dc, 0, rc.right, y, ui::border);
-    const std::uint32_t dot = g_app.connecting ? ui::warn :
-        (g_app.shell->running() ? ui::success : (g_app.statusError ? ui::danger : ui::textFaint));
+    const auto dot = animatedConnectionColor(GetTickCount64());
+    const float feedback = 1.0f - g_uiMotion.feedback.value(GetTickCount64());
+    if (feedback > 0.0f)
+        fillCircle(dc, dp(14), y + h / 2, dp(7), ui::mix(ui::bgPanel, dot, feedback * 0.35));
     fillCircle(dc, dp(14), y + h / 2, dp(3), dot);
     drawText(dc, statusConnectionText(), layout.connection, ui::text, g_app.uiFont,
              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -9536,23 +9743,12 @@ void showStatusHint(HWND owner, POINT point) {
     InvalidateRect(g_app.statusHint, nullptr, FALSE);
 }
 
-void paintMain(HWND hwnd) {
-    PAINTSTRUCT ps;
-    HDC dc = BeginPaint(hwnd, &ps);
-    RECT rc;
-    GetClientRect(hwnd, &rc);
-
-    if (rc.right <= 0 || rc.bottom <= 0) {
-        EndPaint(hwnd, &ps);
-        return;
-    }
-    HDC mem = CreateCompatibleDC(dc);
-    HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-    HGDIOBJ oldBmp = SelectObject(mem, bmp);
-
+void drawMain(HDC mem, const RECT& rc) {
     fillRect(mem, rc, ui::bgApp);
-    paintTitleBar(mem, rc);
-    paintSessionTabs(mem);
+    const RECT titleRect{0, 0, rc.right, g_app.titleH};
+    const RECT statusRect{0, rc.bottom - g_app.statusH, rc.right, rc.bottom};
+    if (RectVisible(mem, &titleRect)) paintTitleBar(mem, rc);
+    if (RectVisible(mem, &g_app.tabsRect)) paintSessionTabs(mem);
 
     const int pad = dp(14);
 
@@ -9620,13 +9816,36 @@ void paintMain(HWND hwnd) {
     }
 
     paintButtons(mem);
-    paintStatusBar(mem, rc);
-    paintDownloadsPanel(mem, hwnd);
+    if (RectVisible(mem, &statusRect)) paintStatusBar(mem, rc);
+    if (g_app.downloadsOpen) paintDownloadsPanel(mem, g_app.main);
+}
 
-    BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-    SelectObject(mem, oldBmp);
-    DeleteObject(bmp);
-    DeleteDC(mem);
+void paintMain(HWND hwnd) {
+    HRGN dirty = CreateRectRgn(0, 0, 0, 0);
+    const int dirtyType = dirty ? GetUpdateRgn(hwnd, dirty, FALSE) : ERROR;
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+
+    if (rc.right <= 0 || rc.bottom <= 0) {
+        if (dirty) DeleteObject(dirty);
+        EndPaint(hwnd, &ps);
+        return;
+    }
+    syncUiAnimationTargets(GetTickCount64(), uiMotionAllowed());
+    HDC mem = g_mainBackBuffer.ensure(dc, rc.right, rc.bottom) ? g_mainBackBuffer.dc : dc;
+    const int saved = SaveDC(mem);
+    if (dirtyType != ERROR) SelectClipRgn(mem, dirty);
+    else IntersectClipRect(mem, ps.rcPaint.left, ps.rcPaint.top, ps.rcPaint.right, ps.rcPaint.bottom);
+    if (dirty) DeleteObject(dirty);
+    drawMain(mem, rc);
+
+    RestoreDC(mem, saved);
+    if (mem != dc)
+        BitBlt(dc, ps.rcPaint.left, ps.rcPaint.top,
+               ps.rcPaint.right - ps.rcPaint.left, ps.rcPaint.bottom - ps.rcPaint.top,
+               mem, ps.rcPaint.left, ps.rcPaint.top, SRCCOPY);
     EndPaint(hwnd, &ps);
 }
 
@@ -10109,7 +10328,10 @@ ai::AiTab* ensureAiPanel() {
     };
 
     g_app.aiTab = ai::AiTab::create(g_app.main, std::move(context));
-    if (g_app.aiTab) g_app.aiTab->setFullScreen(g_app.aiFull);
+    if (g_app.aiTab) {
+        g_app.aiTab->setHostVisible(IsWindowVisible(g_app.main) && !IsIconic(g_app.main));
+        g_app.aiTab->setFullScreen(g_app.aiFull);
+    }
     return g_app.aiTab;
 }
 
@@ -10132,6 +10354,7 @@ void toggleAiPanel() {
         g_app.aiTab->focus();
     }
     layoutMain(g_app.main);
+    if (g_app.aiOpen) g_app.aiTab->animateOpen(uiMotionAllowed());
     InvalidateRect(g_app.main, nullptr, TRUE);
 }
 void setAiPanelFull(bool full) {
@@ -10143,13 +10366,18 @@ void setAiPanelFull(bool full) {
 }
 
 void disposeSessionState(SessionState& state) {
+    KillTimer(g_app.main, state.tabId * 8 + kShellFlushTimer);
     for (UINT_PTR timer = kCwdHookTimer1; timer <= kCwdHookTimer4; ++timer)
         KillTimer(g_app.main, state.tabId * 8 + timer);
     KillTimer(g_app.main, reconnectTimerId(state));
     dropEditedFiles(state.connectionId);
     state.connectionId = g_nextConnectionId++;
+    state.shellOutput->close();
     for (auto& task : state.downloads) if (task.cancel) task.cancel->store(true);
-    state.fs->stop();
+    // Handshakes may still be waiting on the network. Retire that backend without
+    // holding the UI; both the backend and libssh2 runtime outlive the cleanup.
+    state.fs->requestStop();
+    std::thread([fs = state.fs, runtime = g_app.runtime]() { fs->stop(); }).detach();
     if (!state.connecting) state.shell->close();
     state.currentPassword.clear(); state.currentKeyPassphrase.clear();
 }
@@ -10215,12 +10443,67 @@ std::wstring aboutText() {
         L"Ctrl++ / Ctrl+- 缩放字体。";
 }
 
+void applyShellOutput(const std::string& data) {
+    if (std::ofstream* dump = terminalDump()) {
+        dump->write(data.data(), static_cast<std::streamsize>(data.size()));
+        dump->flush();
+    }
+    g_app.shellGotOutput = true;
+    g_app.lastShellOutputTick = GetTickCount();
+    g_app.termData.feed(data);
+    for (const auto& ack : g_app.termData.takeShellIntegrationAcks()) handleCwdHookAck(ack);
+    g_app.searchDirty = g_app.searchOpen;
+    flushTerminalResponse();
+    if (g_app.termData.takeCwdChange()) syncTerminalCwd();
+    if (!foregroundSession()) {
+        g_app.unread = true;
+        InvalidateRect(g_app.main, &g_app.tabsRect, FALSE);
+        return;
+    }
+    InvalidateRect(g_app.term, nullptr, FALSE);
+    if (!g_app.termData.title().empty()) {
+        SetWindowTextW(g_app.main, (L"rshell - " + toWide(g_app.currentSession) + L" - " +
+                                   toWide(g_app.termData.title())).c_str());
+    }
+}
+
+void flushShellOutput() {
+    // Bound each message's parsing work; other tabs and input get a turn between batches.
+    KillTimer(g_app.main, g_app.tabId * 8 + kShellFlushTimer);
+    const std::string data = g_app.shellOutput->take(256u * 1024u);
+    if (!data.empty()) applyShellOutput(data);
+    if (g_app.shellOutput->finishBatch()) {
+        // Timer messages yield to input/paint instead of keeping the posted-message
+        // queue permanently nonempty during an unbounded stream of remote output.
+        if (!SetTimer(g_app.main, g_app.tabId * 8 + kShellFlushTimer, 16, nullptr))
+            g_app.shellOutput->notificationFailed();
+    } else if (g_app.pendingShellClose) {
+        if (PostMessageW(g_app.main, WM_SHELL_CLOSED, g_app.connectionId,
+                         reinterpret_cast<LPARAM>(g_app.pendingShellClose.get())))
+            g_app.pendingShellClose.release();
+    }
+}
+
+void blinkTerminalCursor() {
+    if (!g_app.term || GetFocus() != g_app.term || !IsWindowVisible(g_app.term) ||
+        IsIconic(g_app.main) || !g_app.termData.cursorVisible() ||
+        g_app.termData.scrollOffset() != 0 || g_app.holdTermPaint ||
+        !g_app.imeComposition.empty() || g_app.currentSession.empty()) return;
+    g_app.cursorOn = !g_app.cursorOn;
+    // Redraw the cursor's row only. This also restores wide glyphs under the cursor.
+    RECT client{};
+    GetClientRect(g_app.term, &client);
+    const int top = g_app.termPadY + g_app.termData.cursorRow() * g_app.cellH;
+    RECT row{g_app.termPadX, top, client.right - g_app.scrollbarW, top + g_app.cellH};
+    InvalidateRect(g_app.term, &row, FALSE);
+}
+
 LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    const bool sessionMessage = msg == WM_SHELL_DATA || msg == WM_SHELL_CLOSED ||
+    const bool sessionMessage = msg == WM_SHELL_DATA || msg == WM_SHELL_FLUSH || msg == WM_SHELL_CLOSED ||
         msg == WM_CONNECT_OK || msg == WM_CONNECT_FAIL || msg == WM_FS_EVENT || msg == WM_FS_STATS ||
         msg == WM_FS_CONFLICT;
     SessionState* target = sessionMessage ? findSessionState(wp, true) : findSessionState(g_selectedTabId, false);
-    if (msg == WM_TIMER && wp >= 8) {
+    if (msg == WM_TIMER && wp >= 8 && wp != kUiAnimationTimer) {
         target = findSessionState(wp / 8, false);
         if (!target) return 0;
         wp %= 8;
@@ -10241,6 +10524,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_CREATE: {
             g_app.main = hwnd;
+            g_uiMotion = UiMotion{};
+            readUiAnimationPreference();
             g_applicationClosing.store(false);
             initializeSessionTabs();
             g_app.dpi = wincompat::windowDpi(hwnd);
@@ -10586,6 +10871,11 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             break;
         }
         case WM_TIMER:
+            if (wp == kUiAnimationTimer) {
+                if (uiMotionAllowed()) updateUiAnimations(GetTickCount64());
+                else finishUiAnimations();
+                return 0;
+            }
             // 闪烁定时器设在主窗口上（WM_CREATE 里的 SetTimer），之前只在
             // terminalProc 里处理，主窗口把它交给了 DefWindowProc，结果光标
             // 一直亮着不闪。这里统一由主窗口驱动。
@@ -10603,12 +10893,20 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 }
                 expireStatusNotices(GetTickCount64());
                 if (g_app.searchDirty) refreshTerminalSearch(false);
-                g_app.cursorOn = !g_app.cursorOn;
-                if (g_app.term) InvalidateRect(g_app.term, nullptr, FALSE);
+                blinkTerminalCursor();
+                // Recover notifications if PostMessage failed because its queue was full.
+                if (g_app.shellOutput->pendingBytes() || g_app.pendingShellClose) flushShellOutput();
+                if (foregroundSession()) for (auto& state : g_tabs) if (state &&
+                    (state->shellOutput->pendingBytes() || state->pendingShellClose)) {
+                    SessionStateScope background(state.get());
+                    flushShellOutput();
+                }
                 // 列目录还没回来时让「正在加载」的三个点动起来
                 if (g_app.fsLoading && g_app.list) InvalidateRect(g_app.list, nullptr, FALSE);
                 // 编辑器的保存没有通知：靠本地文件大小/时间判断是否该回传
                 pollEditedFiles();
+            } else if (wp == kShellFlushTimer) {
+                flushShellOutput();
             } else if (wp == kUpdateCheckTimer) {
                 KillTimer(hwnd, kUpdateCheckTimer);
                 startUpdateCheck(false);
@@ -10687,9 +10985,38 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         case WM_SIZE:
+            finishUiAnimations();
+            if (g_app.aiTab) {
+                g_app.aiTab->finishOpenAnimation();
+                g_app.aiTab->setHostVisible(wp != SIZE_MINIMIZED && IsWindowVisible(hwnd));
+            }
             layoutMain(hwnd);
             return 0;
+        case WM_SHOWWINDOW:
+            if (g_app.aiTab) g_app.aiTab->setHostVisible(wp && !IsIconic(hwnd));
+            if (!wp) {
+                finishUiAnimations();
+                if (g_app.aiTab) g_app.aiTab->finishOpenAnimation();
+            }
+            break;
+        case WM_SETTINGCHANGE:
+            readUiAnimationPreference();
+            if (!g_uiMotion.enabled) {
+                finishUiAnimations();
+                if (g_app.aiTab) g_app.aiTab->finishOpenAnimation();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            break;
+        case WM_CAPTURECHANGED:
+        case WM_CANCELMODE:
+            g_app.pressButton = -1;
+            g_app.pressTitleBtn = -1;
+            g_app.pressTitleAi = false;
+            InvalidateRect(hwnd, nullptr, FALSE);
+            break;
         case WM_DPICHANGED: {
+            finishUiAnimations();
+            if (g_app.aiTab) g_app.aiTab->finishOpenAnimation();
             g_app.dpi = HIWORD(wp);
             createFonts();
             const RECT* suggested = reinterpret_cast<const RECT*>(lp);
@@ -10888,31 +11215,12 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SHELL_DATA: {
             std::unique_ptr<std::string> payload(reinterpret_cast<std::string*>(lp));
             if (wp != g_app.connectionId) return 0;
-            if (payload) {
-                if (std::ofstream* dump = terminalDump()) {
-                    dump->write(payload->data(), static_cast<std::streamsize>(payload->size()));
-                    dump->flush();
-                }
-                g_app.shellGotOutput = true;
-                g_app.lastShellOutputTick = GetTickCount();
-                g_app.termData.feed(*payload);
-                for (const auto& ack : g_app.termData.takeShellIntegrationAcks()) handleCwdHookAck(ack);
-                if (!foregroundSession()) { g_app.unread = true; InvalidateRect(hwnd, &g_app.tabsRect, FALSE); }
-                g_app.searchDirty = g_app.searchOpen;
-                flushTerminalResponse();
-                // shell 的 OSC 7 钩子会在每次画提示符时把 $PWD 报回来，
-                // 目录变了就带着文件面板一起走（单向：面板不反向影响终端）
-                if (g_app.termData.takeCwdChange()) syncTerminalCwd();
-                InvalidateRect(g_app.term, nullptr, FALSE);
-                if (foregroundSession() && !g_app.termData.title().empty()) {
-                    SetWindowTextW(hwnd,
-                                   (L"rshell - " + toWide(g_app.currentSession) + L" - " +
-                                    toWide(g_app.termData.title()))
-                                       .c_str());
-                }
-            }
+            if (payload) applyShellOutput(*payload);
             return 0;
         }
+        case WM_SHELL_FLUSH:
+            flushShellOutput();
+            return 0;
         case WM_CONNECT_OK: {
             if (wp != g_app.connectionId) return 0;
             g_app.connecting = false;
@@ -11068,6 +11376,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SHELL_CLOSED: {
             std::unique_ptr<std::string> reason(reinterpret_cast<std::string*>(lp));
             if (wp != g_app.connectionId) return 0;
+            if (g_app.shellOutput->pendingBytes()) {
+                g_app.pendingShellClose = std::move(reason);
+                return 0;
+            }
             if (g_app.fsRecoveryPending) {
                 if (g_app.reconnectTimerSet) KillTimer(hwnd, reconnectTimerId(g_app));
                 g_app.reconnectTimerSet = false;
@@ -11199,6 +11511,8 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_DESTROY:
             saveUiLayout();  // 退出前记住窗口位置/尺寸和分栏宽度
             KillTimer(hwnd, 1);
+            finishUiAnimations();
+            g_mainBackBuffer.reset();
             g_applicationClosing.store(true);
             if (g_app.aiTab) {  // 全局 AI 面板：停掉工作线程再退出
                 ai::AiTab::destroy(g_app.aiTab);
@@ -11296,6 +11610,7 @@ int runGui(HINSTANCE inst, int showCommand) {
     // 拖出下载要用 OLE 拖放（DoDragDrop）
     const bool oleReady = SUCCEEDED(OleInitialize(nullptr));
 
+#ifdef RSHELL_ENABLE_DIAGNOSTICS
     // 离屏渲染：rshell-gui.exe --render <dump> <out.bmp> <cols> <rows>
     //           rshell-gui.exe --icons <out.bmp>   （文件类型图标总览，调图标用）
     // 不起窗口、不连 SSH，直接用同一份绘制代码出图，便于核对渲染结果
@@ -11357,6 +11672,7 @@ int runGui(HINSTANCE inst, int showCommand) {
             LocalFree(argv);
         }
     }
+#endif  // RSHELL_ENABLE_DIAGNOSTICS
     // 终端配色与界面的深蓝灰底色保持一致，
     // 默认的 xterm 纯色在深色 UI 里显得刺眼。
     {
@@ -11463,6 +11779,7 @@ int runGui(HINSTANCE inst, int showCommand) {
     // 被顶出的空白行会写进回滚历史，表现为一启动就有“历史”和滚动条。
     g_app.termData.reset();
 
+#ifdef RSHELL_ENABLE_DIAGNOSTICS
     // 调试开关：RSHELL_GUI_DEMO=1 时灌一段样例输出，方便离线检查配色/字体/边框对齐
     if (std::getenv("RSHELL_GUI_DEMO")) {
         std::string demo;
@@ -11548,6 +11865,7 @@ int runGui(HINSTANCE inst, int showCommand) {
         layoutMain(window);
     }
 
+#endif  // RSHELL_ENABLE_DIAGNOSTICS
     updateButtons();
     setStatus(L"就绪：点「打开会话列表…」选择主机");
 

@@ -225,6 +225,17 @@ LIBSSH2_API int libssh2_sftp_shutdown(LIBSSH2_SFTP *sftp);
 LIBSSH2_API unsigned long libssh2_sftp_last_error(LIBSSH2_SFTP *sftp);
 LIBSSH2_API LIBSSH2_CHANNEL *libssh2_sftp_get_channel(LIBSSH2_SFTP *sftp);
 
+/* rshell cooperative-IO extensions. Call only from the session's owning thread
+ * between completed public operations, never concurrently with another call.
+ * Quiescent means no unfinished outbound request across any SFTP handle. Fully
+ * sent read-ahead requests and partial incoming responses may remain queued. */
+LIBSSH2_API int libssh2_sftp_quiescent(LIBSSH2_SFTP *sftp);
+/* Finish only existing request bytes/window adjustments after a successful
+ * read. Does not issue another READ or consume file data. Returns 0, EAGAIN
+ * (retry this same function/handle), or another negative error. */
+LIBSSH2_API int
+libssh2_sftp_flush_pending_requests(LIBSSH2_SFTP_HANDLE *handle);
+
 /* File / Directory Ops */
 LIBSSH2_API LIBSSH2_SFTP_HANDLE *
 libssh2_sftp_open_ex(LIBSSH2_SFTP *sftp,

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(rshell VERSION 1.3.2 LANGUAGES CXX)
+project(rshell VERSION 1.3.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -7,6 +7,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(RSHELL_BUILD_TESTS "Build rshell unit tests" ON)
+option(RSHELL_ENABLE_DIAGNOSTICS "Include GUI rendering previews and diagnostic commands" OFF)
 option(RSHELL_WINDOWS7_COMPAT "Target Windows 7 SP1 / Server 2008 R2 SP1 (requires MSVC v143 or older)" ON)
 
 # WinCNG 的 ECDH/ECDSA 依赖 BCryptDeriveKey 的 RAW_SECRET（Windows 10+）。
@@ -121,6 +122,7 @@ if(NOT RSHELL_HAVE_SYSTEM_LIBSSH2)
     if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/third_party/libssh2/CMakeLists.txt)
         message(STATUS "Using vendored libssh2: third_party/libssh2")
         add_subdirectory(third_party/libssh2 EXCLUDE_FROM_ALL)
+        set(RSHELL_LIBSSH2_QUIESCENT TRUE)
     else()
         FetchContent_Declare(libssh2
             GIT_REPOSITORY https://github.com/libssh2/libssh2.git
@@ -192,6 +194,10 @@ endif()
 
 target_include_directories(rshell_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(rshell_core PUBLIC ${RSHELL_LIBSSH2_TARGET})
+if(RSHELL_LIBSSH2_QUIESCENT)
+    # The bundled SFTP backend can flush pending read packets before yielding.
+    target_compile_definitions(rshell_core PUBLIC RSHELL_LIBSSH2_QUIESCENT=1)
+endif()
 
 
 if(WIN32)
@@ -248,6 +254,9 @@ if(WIN32)
         src/rshell.rc
     )
     target_compile_definitions(rshell_gui PRIVATE RSHELL_VERSION="${PROJECT_VERSION}")
+    if(RSHELL_ENABLE_DIAGNOSTICS)
+        target_compile_definitions(rshell_gui PRIVATE RSHELL_ENABLE_DIAGNOSTICS=1)
+    endif()
     target_compile_definitions(rshell PRIVATE RSHELL_VERSION="${PROJECT_VERSION}")
     target_link_libraries(rshell_gui PRIVATE rshell_core comdlg32 comctl32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp shell32)
     set_target_properties(rshell_gui PROPERTIES OUTPUT_NAME "rshell-gui")
@@ -276,9 +285,9 @@ find_package(Python3 COMPONENTS Interpreter QUIET)
 if(RSHELL_BUILD_TESTS AND Python3_Interpreter_FOUND)
     # 代理连通性：本地 SSH + SOCKS5 / HTTP CONNECT（都要求认证）
     add_custom_target(rshell_proxy_e2e
-        COMMAND  /tests/proxy_test.py
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/proxy_test.py
                 --exe $<TARGET_FILE:rshell>
-        WORKING_DIRECTORY 
+        WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
         DEPENDS rshell
         COMMENT "运行 SOCKS5 / HTTP CONNECT 代理连通性测试"
         USES_TERMINAL)
@@ -312,7 +321,8 @@ if(RSHELL_BUILD_TESTS)
             src/terminal.cpp src/ssh_shell.cpp src/session_store.cpp src/remote_fs.cpp
             src/ai_panel.cpp src/ai_tab.cpp src/ai_ssh_backend.cpp src/md_render.cpp
             src/update_check.cpp ${RSHELL_AI_SOURCES})
-        target_compile_definitions(rshell_gui_tabs_probe PRIVATE RSHELL_VERSION="${PROJECT_VERSION}")
+        target_compile_definitions(rshell_gui_tabs_probe PRIVATE
+            RSHELL_VERSION="${PROJECT_VERSION}" RSHELL_ENABLE_DIAGNOSTICS=1)
         target_link_libraries(rshell_gui_tabs_probe PRIVATE rshell_core
             comdlg32 comctl32 user32 gdi32 gdiplus dwmapi ole32 uuid imm32 winhttp shell32)
         add_test(NAME rshell_gui_tabs COMMAND rshell_gui_tabs_probe)
@@ -329,6 +339,18 @@ if(RSHELL_BUILD_TESTS)
         add_executable(rshell_ai_probe tests/ai_tools_probe.cpp
             src/remote_fs.cpp src/ai_ssh_backend.cpp ${RSHELL_AI_SOURCES})
         target_link_libraries(rshell_ai_probe PRIVATE rshell_core winhttp)
+
+        # 不联网检查跨线程取消作用域与排队任务撤销；可另外连接测试服务器做回归。
+        add_executable(rshell_remote_cancel_probe tests/remote_cancel_probe.cpp
+            src/remote_fs.cpp src/ai_ssh_backend.cpp ${RSHELL_AI_SOURCES})
+        target_link_libraries(rshell_remote_cancel_probe PRIVATE rshell_core winhttp)
+        add_test(NAME rshell_remote_cancel COMMAND rshell_remote_cancel_probe)
+
+        # 限速本地 fixture 验证传输期间同一连接上的交互/FIFO/取消隔离。
+        # python tests/transfer_interaction_e2e.py --exe <此目标路径>
+        add_executable(rshell_transfer_interaction_probe tests/transfer_interaction_probe.cpp
+            src/remote_fs.cpp)
+        target_link_libraries(rshell_transfer_interaction_probe PRIVATE rshell_core)
     endif()
 
     # 无 GUI 的交互式 shell 冒烟测试（配合 tests/sftp_test_server.py 使用）

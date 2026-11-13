@@ -21,6 +21,7 @@
 #include "ai_ssh_backend.h"
 #include "ai_tools.h"
 #include "remote_fs.h"
+#include "ui_animation.h"
 #include "ui_theme.h"
 #include "util.h"
 #include "vault.h"
@@ -47,12 +48,13 @@ HFONT createScaledFont(HFONT base, double scale, int weight) {
     return CreateFontIndirectW(&lf);
 }
 
-constexpr UINT kAiEventMessage = WM_APP + 61;
 constexpr UINT kAiFlushMessage = WM_APP + 62;
 constexpr UINT kAiModelsMessage = WM_APP + 63;
 constexpr UINT_PTR kCaretTimer = 11;
 constexpr UINT_PTR kRepaintTimer = 12;
 constexpr UINT_PTR kCopyFlashTimer = 13;  // 复制代码块后把按钮从“已复制”恢复成“复制”
+constexpr UINT_PTR kOpenAnimationTimer = 14;
+constexpr unsigned kOpenAnimationMs = 170;
 constexpr int kRepaintIntervalMs = 16;  // 流式刷新上限约 60fps（实际按上帧耗时自适应放慢）
 
 // 设置视图的固定排版（绘制与建控件共用）
@@ -145,6 +147,13 @@ struct ModelFetchPayload {
     std::string error;
 };
 
+struct SessionReadPayload {
+    std::uintptr_t hostId = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t presentationGeneration = 0;
+    std::vector<StoredSession> entries;
+};
+
 // 每个对话一个稳定的会话 ID（OpenCode Go 用来做路由与提示缓存）
 std::string makeSessionId() {
     std::random_device device;
@@ -209,7 +218,8 @@ std::string firstLineOf(const std::string& text) {
 // 历史列表里的一行：标题 · 6 条 · 10-30 14:12 · #标签
 std::wstring sessionEntryLabel(const StoredSession& entry) {
     std::wstring label = toWideText(entry.record.title.empty() ? "未命名对话" : entry.record.title);
-    label += L"  ·  " + std::to_wstring(entry.record.messages.size()) + L" 条";
+    if (entry.summaryAvailable)
+        label += L"  ·  " + std::to_wstring(entry.messageCount) + L" 条";
     const std::int64_t stamp =
         entry.record.updated > 0 ? entry.record.updated : sessionStampFromName(entry.file);
     const std::string when = sessionStampText(stamp);
@@ -364,8 +374,21 @@ struct AiTab::Impl {
     std::thread worker;
     std::atomic<bool> cancel{false};
     bool shown = false;   // 面板是否处于打开状态（决定要不要自动读历史）
+    bool hostVisible = true;
+    bool visualActive = false;
+    bool caretTimerActive = false;
+    bool copyTimerActive = false;
+    ULONGLONG copyFlashUntil = 0;
+    std::uint64_t presentationGeneration = 1;
+    RECT logicalBounds{};
+    bool hasLogicalBounds = false;
+    ui::Tween openOffset;
+    int openPixelOffset = 0;
+    bool openAnimationRunning = false;
+    bool openAnimationClipped = false;
+    bool applyingOpenAnimation = false;
     std::atomic<bool> busy{false};
-    bool closing = false;
+    std::atomic<bool> closing{false};
 
     std::mutex mutex;
     std::shared_ptr<ApprovalSlot> pending;
@@ -377,9 +400,12 @@ struct AiTab::Impl {
 
     // 流式文本按帧合并：token 先攒在缓冲里，避免每个 token 一次重绘
     std::mutex textMutex;
-    std::wstring pendingText;
-    std::wstring pendingReasoning;
-    std::atomic<bool> flushPosted{false};
+    std::vector<Event> pendingEvents;
+    bool flushPosted = false;  // Protected by textMutex together with pendingEvents.
+    bool drainingEvents = false;
+    bool deferredFlush = false;
+    std::atomic<std::uint64_t> streamEpoch{1};
+    std::uint64_t turnStreamEpoch = 1;  // Written before launching the producer thread.
     bool repaintPending = false;
     bool imeComposing = false;
 
@@ -387,7 +413,6 @@ struct AiTab::Impl {
     RECT dirty{};              // 待重绘区域（客户区坐标）
     bool dirtyFull = true;     // 整块都要重画（结构变化/尺寸变化/首次）
     int lastPaintMs = 0;       // 上一帧耗时，用来决定下一帧间隔
-    ULONGLONG lastFlushTick = 0;  // 上一次把文本交给面板的时刻（perf 日志用）
     // 平滑展示：收到的字先进这里，每帧吐一小片，避免一秒一次的整段蹦出
     std::wstring revealBuffer;
 
@@ -408,6 +433,7 @@ struct AiTab::Impl {
     std::mutex metaMutex;            // 标题/标签/文件名
     std::thread loader;              // 读历史（自动接上 / 历史按钮）
     std::atomic<bool> loading{false};
+    std::uint64_t sessionReadGeneration = 0;  // UI 线程：新建/发问后丢弃迟到的历史
     // 「把对话存到远端」开关：工作线程每轮结束要读，用原子量避免和设置页抢
     std::string sessionDirPath;      // 缓存的 <home>/.rshell/sessions
     std::uintptr_t sessionDirHost = 0;
@@ -483,6 +509,7 @@ AiTab* AiTab::create(HWND parent, AiTabContext context) {
 
 void AiTab::destroy(AiTab* tab) {
     if (!tab) return;
+    tab->finishOpenAnimation();
     if (tab->impl_) {
         tab->impl_->closing = true;
         tab->impl_->cancel = true;
@@ -523,6 +550,8 @@ void AiTab::initialize(HWND) {
     };
     actions.onClear = [this]() {
         if (impl_->busy) return;
+        ++impl_->sessionReadGeneration;
+        ++impl_->streamEpoch;
         impl_->agent.reset();
         panel_.clear();
         impl_->assistantIndex = static_cast<std::size_t>(-1);
@@ -551,7 +580,9 @@ void AiTab::initialize(HWND) {
     };
     // 复制代码块后让按钮显示一会儿“已复制”，再重绘恢复
     actions.onCopied = [this]() {
-        if (window_) SetTimer(window_, kCopyFlashTimer, 1500, nullptr);
+        impl_->copyFlashUntil = GetTickCount64() + 1500;
+        if (window_ && impl_->visualActive)
+            impl_->copyTimerActive = SetTimer(window_, kCopyFlashTimer, 1500, nullptr) != 0;
     };
     panel_.setCallbacks(std::move(actions));
 
@@ -604,7 +635,6 @@ void AiTab::initialize(HWND) {
     updateHostLabel();
     updateWelcome();  // 空状态里已经带「打开设置」，不再重复加一条提示
 
-    SetTimer(window_, kCaretTimer, 500, nullptr);
 }
 
 void AiTab::setFullScreen(bool full) {
@@ -636,6 +666,10 @@ double AiTab::paintForTest(HDC dc, const RECT* dirty) {
 
 void AiTab::setBounds(const RECT& bounds) {
     if (!window_) return;
+    if (impl_->hasLogicalBounds && EqualRect(&impl_->logicalBounds, &bounds)) return;
+    finishOpenAnimation();
+    impl_->logicalBounds = bounds;
+    impl_->hasLogicalBounds = true;
     MoveWindow(window_, bounds.left, bounds.top, bounds.right - bounds.left,
                bounds.bottom - bounds.top, TRUE);
     RECT client{};
@@ -647,11 +681,185 @@ void AiTab::setBounds(const RECT& bounds) {
 
 void AiTab::show(bool visible) {
     if (!window_) return;
+    const HWND owner = window_;
+    if (!visible) finishOpenAnimation();
     impl_->shown = visible;
     if (visible) updateHostLabel();  // 会话可能刚连上
-    ShowWindow(window_, visible ? SW_SHOWNA : SW_HIDE);
+    const bool childVisible = (GetWindowLongPtrW(window_, GWL_STYLE) & WS_VISIBLE) != 0;
+    if (childVisible != visible) ShowWindow(window_, visible ? SW_SHOWNA : SW_HIDE);
+    updateVisualActivity();
+    if (!IsWindow(owner) || GetWindowLongPtrW(owner, GWLP_USERDATA) != reinterpret_cast<LONG_PTR>(this)) return;
     // 打开面板后再自动接历史：收起来时不碰远端连接
     if (visible) autoLoadLatestSession();
+}
+
+void AiTab::setHostVisible(bool visible) {
+    if (impl_->hostVisible == visible) return;
+    impl_->hostVisible = visible;
+    updateVisualActivity();
+}
+
+void AiTab::updateVisualActivity() {
+    const bool active = impl_->shown && impl_->hostVisible;
+    if (active == impl_->visualActive) return;
+    impl_->visualActive = active;
+    KillTimer(window_, kRepaintTimer);
+    KillTimer(window_, kCaretTimer);
+    KillTimer(window_, kCopyFlashTimer);
+    impl_->repaintPending = false;
+    impl_->caretTimerActive = false;
+    impl_->copyTimerActive = false;
+    if (!active) {
+        ++impl_->presentationGeneration;
+        finishOpenAnimation();
+    }
+    // Consume semantic events in order. Hiding changes presentation only; the
+    // model, approvals and save/load results continue to update their state.
+    const HWND owner = window_;
+    drainPendingStream();
+    if (!IsWindow(owner) || GetWindowLongPtrW(owner, GWLP_USERDATA) != reinterpret_cast<LONG_PTR>(this)) return;
+    revealAll();
+    impl_->dirtyFull = true;
+    if (impl_->visualActive) {
+        // A resumed panel catches up once instead of replaying invisible frames.
+        KillTimer(window_, kRepaintTimer);
+        impl_->repaintPending = false;
+        impl_->caretTimerActive = SetTimer(window_, kCaretTimer, 500, nullptr) != 0;
+        const ULONGLONG now = GetTickCount64();
+        if (impl_->copyFlashUntil > now)
+            impl_->copyTimerActive = SetTimer(window_, kCopyFlashTimer,
+                static_cast<UINT>(impl_->copyFlashUntil - now), nullptr) != 0;
+        InvalidateRect(window_, nullptr, FALSE);
+    }
+}
+
+void AiTab::animateOpen(bool enabled) {
+    if (!enabled) { finishOpenAnimation(); return; }
+    beginOpenAnimation(GetTickCount64(), false);
+}
+
+void AiTab::animateOpenForTest(std::uint64_t now) { beginOpenAnimation(now, true); }
+void AiTab::advanceOpenAnimationForTest(std::uint64_t now) { advanceOpenAnimation(now, true); }
+bool AiTab::openAnimationActiveForTest() const { return impl_->openAnimationRunning; }
+int AiTab::openAnimationOffsetForTest() const { return impl_->openPixelOffset; }
+RECT AiTab::logicalBoundsForTest() const { return impl_->logicalBounds; }
+
+void AiTab::enqueueStreamForTest(const std::wstring& text, bool reasoning) {
+    postEvent(reasoning ? EventKind::Reasoning : EventKind::Text, text, {}, {}, true, {},
+              impl_->streamEpoch.load());
+}
+void AiTab::enqueueToolForTest(const std::wstring& title, const std::wstring& detail) {
+    postEvent(EventKind::Tool, title, detail, {}, true, {}, impl_->streamEpoch.load());
+}
+void AiTab::enqueueApprovalForTest(const std::wstring& title, const std::wstring& detail) {
+    postEvent(EventKind::Approval, title, detail, {}, true, {}, impl_->streamEpoch.load());
+}
+void AiTab::flushStreamForTest(const std::function<void()>& afterDetach) {
+    std::vector<Event> batch;
+    if (!takeEventBatch(batch)) return;
+    const HWND owner = window_;
+    if (afterDetach) afterDetach();
+    if (!IsWindow(owner) || GetWindowLongPtrW(owner, GWLP_USERDATA) != reinterpret_cast<LONG_PTR>(this)) return;
+    applyEventBatch(batch);
+}
+void AiTab::resetStreamForTest() {
+    ++impl_->streamEpoch;
+    panel_.clear();
+    impl_->assistantIndex = static_cast<std::size_t>(-1);
+    impl_->revealBuffer.clear();
+}
+void AiTab::waitSessionReadForTest() {
+    if (impl_->loader.joinable()) impl_->loader.join();
+}
+std::size_t AiTab::pendingStreamForTest() const {
+    std::lock_guard<std::mutex> lock(impl_->textMutex);
+    std::size_t count = 0;
+    for (const Event& event : impl_->pendingEvents)
+        if (event.kind == EventKind::Text || event.kind == EventKind::Reasoning) count += event.a.size();
+    return count;
+}
+bool AiTab::flushPostedForTest() const {
+    std::lock_guard<std::mutex> lock(impl_->textMutex);
+    return impl_->flushPosted;
+}
+bool AiTab::visualTimersActiveForTest() const {
+    return impl_->caretTimerActive || impl_->copyTimerActive || impl_->repaintPending ||
+           impl_->openAnimationRunning;
+}
+
+void AiTab::beginOpenAnimation(std::uint64_t now, bool allowHidden) {
+    if (!window_ || !impl_ || !impl_->shown || !impl_->hasLogicalBounds) return;
+    if (!impl_->visualActive) return;
+    if (!allowHidden && (!IsWindowVisible(window_) || IsIconic(GetAncestor(window_, GA_ROOT)))) {
+        finishOpenAnimation();
+        return;
+    }
+    if (impl_->openAnimationRunning) return;
+    const RECT& bounds = impl_->logicalBounds;
+    const int width = bounds.right - bounds.left;
+    if (width <= 0 || bounds.bottom <= bounds.top) return;
+    const int distance = std::min(width, std::max(1, MulDiv(40, wincompat::windowDpi(window_), 96)));
+    impl_->openOffset.snap(static_cast<float>(distance));
+    impl_->openOffset.to(0.0f, now, kOpenAnimationMs);
+    impl_->openAnimationRunning = true;
+    advanceOpenAnimation(now, allowHidden);
+    if (impl_->openAnimationRunning && !SetTimer(window_, kOpenAnimationTimer, 16, nullptr))
+        finishOpenAnimation();
+}
+
+bool AiTab::applyOpenAnimationOffset(int offset) {
+    const RECT& bounds = impl_->logicalBounds;
+    const int width = bounds.right - bounds.left;
+    const int height = bounds.bottom - bounds.top;
+    if (offset == impl_->openPixelOffset && impl_->openAnimationClipped) return true;
+    impl_->applyingOpenAnimation = true;
+    const auto clip = [&]() {
+        HRGN region = CreateRectRgn(0, 0, std::max(0, width - offset), height);
+        if (!region) return false;
+        if (!SetWindowRgn(window_, region, TRUE)) { DeleteObject(region); return false; }
+        impl_->openAnimationClipped = true;  // Windows owns region after success.
+        return true;
+    };
+    // Keep every intermediate region within the final panel rectangle, even
+    // while moving right initially or revealing more pixels on later frames.
+    bool ok = true;
+    if (offset > impl_->openPixelOffset) ok = clip();
+    if (ok) ok = SetWindowPos(window_, nullptr, bounds.left + offset, bounds.top, 0, 0,
+                              SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER) != FALSE;
+    if (ok && offset <= impl_->openPixelOffset) ok = clip();
+    if (ok) impl_->openPixelOffset = offset;
+    impl_->applyingOpenAnimation = false;
+    return ok;
+}
+
+void AiTab::advanceOpenAnimation(std::uint64_t now, bool allowHidden) {
+    if (!window_ || !impl_ || !impl_->openAnimationRunning) return;
+    if (!impl_->shown || (!allowHidden &&
+        (!IsWindowVisible(window_) || IsIconic(GetAncestor(window_, GA_ROOT)))) ||
+        !impl_->openOffset.active(now)) {
+        finishOpenAnimation();
+        return;
+    }
+    const int offset = std::max(0, static_cast<int>(impl_->openOffset.value(now) + 0.5f));
+    if (!applyOpenAnimationOffset(offset)) finishOpenAnimation();
+}
+
+void AiTab::finishOpenAnimation() {
+    if (!window_ || !impl_) return;
+    KillTimer(window_, kOpenAnimationTimer);
+    const bool restore = impl_->openAnimationRunning || impl_->openPixelOffset != 0;
+    impl_->openAnimationRunning = false;
+    impl_->openOffset.snap(0.0f);
+    impl_->openPixelOffset = 0;
+    impl_->applyingOpenAnimation = true;
+    if (restore && impl_->hasLogicalBounds)
+        SetWindowPos(window_, nullptr, impl_->logicalBounds.left, impl_->logicalBounds.top, 0, 0,
+                     SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+    if (impl_->openAnimationClipped) {
+        SetWindowRgn(window_, nullptr, TRUE);
+        impl_->openAnimationClipped = false;
+    }
+    impl_->applyingOpenAnimation = false;
 }
 
 void AiTab::focus() {
@@ -834,6 +1042,8 @@ void AiTab::sendMessage(const std::wstring& text) {
         return;
     }
 
+    ++impl_->sessionReadGeneration;
+    const std::uint64_t epoch = ++impl_->streamEpoch;
     impl_->revealBuffer.clear();  // 上一轮的字不该漏到这一轮
     // 锁定这一轮的目标标签：中途切标签也不会把命令打到别的机器上
     turnHostId = activeHostId();
@@ -845,6 +1055,7 @@ void AiTab::sendMessage(const std::wstring& text) {
         auto slot = std::make_shared<ApprovalSlot>();
         {
             std::lock_guard<std::mutex> lock(impl_->mutex);
+            if (impl_->closing.load() || impl_->cancel.load()) return ApprovalDecision::Abort;
             impl_->pending = slot;
         }
         postEvent(EventKind::Approval, toWideText(request.summary),
@@ -868,6 +1079,7 @@ void AiTab::sendMessage(const std::wstring& text) {
     panel_.setStatus(L"生成中…");
 
     if (impl_->worker.joinable()) impl_->worker.join();
+    impl_->turnStreamEpoch = epoch;
     const std::uintptr_t turnHost = turnHostId;
     const std::wstring turnLabel = currentHostLabel();
     impl_->worker = std::thread([this, turnHost, turnLabel]() {
@@ -977,6 +1189,7 @@ void AiTab::requestRepaint() {
 // 积压很少时直接吐完，避免小批也要等好几帧。
 void AiTab::pumpReveal() {
     if (impl_->revealBuffer.empty()) return;
+    if (!impl_->visualActive) { revealAll(); return; }
     const std::size_t backlog = impl_->revealBuffer.size();
     std::size_t take = backlog <= 6 ? backlog : std::max<std::size_t>(2, backlog / 12);
     take = std::min(take, backlog);
@@ -997,44 +1210,57 @@ void AiTab::revealAll() {
     impl_->revealBuffer.clear();
 }
 
-// 把工作线程攒下的文本并进面板。flush 消息和「一轮结束」都会调用：
-// 结束时若最后一小段还卡在 pendingText 里（消息被合并了），这里补上，别丢字。
-void AiTab::drainPendingStream() {
-    std::wstring text;
-    std::wstring reasoning;
-    {
-        std::lock_guard<std::mutex> lock(impl_->textMutex);
-        text.swap(impl_->pendingText);
-        reasoning.swap(impl_->pendingReasoning);
+bool AiTab::takeEventBatch(std::vector<Event>& batch) {
+    if (impl_->drainingEvents) {
+        impl_->deferredFlush = true;
+        return false;
     }
+    impl_->drainingEvents = true;
+    std::lock_guard<std::mutex> lock(impl_->textMutex);
+    batch.swap(impl_->pendingEvents);
+    // Detaching the batch and reopening producer notification are atomic with
+    // respect to enqueue. A producer cannot append into a lost-wakeup gap.
     impl_->flushPosted = false;
+    return true;
+}
 
-    const std::size_t none = static_cast<std::size_t>(-1);
-    if (!reasoning.empty()) {
-        if (impl_->assistantIndex != none) {
-            panel_.finishAssistant(impl_->assistantIndex, true);
-            impl_->assistantIndex = none;
+void AiTab::applyEventBatch(std::vector<Event>& batch) {
+    const HWND owner = window_;
+    for (Event& event : batch) {
+        if (!event.epoch || event.epoch == impl_->streamEpoch.load()) handleEvent(event);
+        // A history picker runs a nested message loop in which the host can be
+        // closed. Never resume the detached batch on a destroyed panel.
+        if (!IsWindow(owner) || GetWindowLongPtrW(owner, GWLP_USERDATA) != reinterpret_cast<LONG_PTR>(this)) return;
+    }
+    impl_->drainingEvents = false;
+    if (impl_->deferredFlush) {
+        impl_->deferredFlush = false;
+        bool notify = false;
+        {
+            std::lock_guard<std::mutex> lock(impl_->textMutex);
+            if (!impl_->pendingEvents.empty()) {
+                impl_->flushPosted = true;
+                notify = true;
+            }
         }
-        panel_.appendReasoning(reasoning);
+        // A popup's nested message loop may have consumed the notification
+        // while its predecessor batch was still being processed.
+        if (notify && !PostMessageW(window_, kAiFlushMessage, 0, 0)) {
+            std::lock_guard<std::mutex> lock(impl_->textMutex);
+            impl_->flushPosted = false;
+        }
     }
-    if (!text.empty()) {
-        // 上游常常一秒才推一批（150+ 字）：先进缓冲，由 pumpReveal 每帧吐一点，
-        // 观感才是逐行往下推，而不是整段蹦出来。
-        impl_->revealBuffer += text;
-        pumpReveal();
-    }
-    const ULONGLONG now = GetTickCount64();
-    const ULONGLONG gap = impl_->lastFlushTick ? (now - impl_->lastFlushTick) : 0;
-    impl_->lastFlushTick = now;
-    if (!text.empty() || !reasoning.empty()) {
-        perfLog(nowStamp() + " flush chars=" + std::to_string(text.size()) + " gap=" +
-                std::to_string(gap) + "ms");
-    }
+}
+
+void AiTab::drainPendingStream() {
+    std::vector<Event> batch;
+    if (takeEventBatch(batch)) applyEventBatch(batch);
 }
 
 // 追加流式文本：只有最后一个气泡会变，脏区从它顶部算到底部。
 // 但内容超过一屏且贴着底部时，整段列表会随新行一起上移，这时必须重画整个消息区。
 void AiTab::requestChatRepaint() {
+    if (!impl_->visualActive) { impl_->dirtyFull = true; return; }
     if (!impl_->dirtyFull) {
         const bool scrolls = panel_.stickToBottom() && panel_.contentOverflows();
         const RECT area = scrolls ? panel_.viewRect() : panel_.lastItemRect();
@@ -1054,34 +1280,43 @@ void AiTab::requestChatRepaint() {
 // 一帧在途时不重复起定时器；间隔按上一帧耗时自适应：
 // 画面便宜时跑满 60fps，单帧变贵时就让间隔跟着耗时走，避免刷新消息越积越多。
 void AiTab::scheduleRepaint() {
+    if (!impl_->visualActive) { impl_->dirtyFull = true; return; }
     if (impl_->repaintPending) return;
-    impl_->repaintPending = true;
     int interval = kRepaintIntervalMs;
     if (impl_->lastPaintMs > interval) interval = std::min(impl_->lastPaintMs, 200);
-    SetTimer(window_, kRepaintTimer, interval, nullptr);
+    impl_->repaintPending = SetTimer(window_, kRepaintTimer, interval, nullptr) != 0;
 }
 
 void AiTab::postEvent(EventKind kind, std::wstring a, std::wstring b, std::wstring c, bool ok,
-                      std::shared_ptr<void> payload) {
-    // 文本/思考增量先入缓冲，攒够一帧再交给界面，避免每个 token 一次 PostMessage + 重绘
-    if (kind == EventKind::Text || kind == EventKind::Reasoning) {
-        {
-            std::lock_guard<std::mutex> lock(impl_->textMutex);
-            (kind == EventKind::Text ? impl_->pendingText : impl_->pendingReasoning) += a;
+                      std::shared_ptr<void> payload, std::uint64_t epoch) {
+    if (impl_->closing.load()) return;
+    Event event;
+    event.kind = kind;
+    event.a = std::move(a);
+    event.b = std::move(b);
+    event.c = std::move(c);
+    event.ok = ok;
+    event.payload = std::move(payload);
+    const bool stream = kind == EventKind::Text || kind == EventKind::Reasoning;
+    const bool turnEvent = stream || kind == EventKind::Tool || kind == EventKind::Approval ||
+                           kind == EventKind::TurnDone || kind == EventKind::AssistantBegin;
+    if (turnEvent) event.epoch = epoch ? epoch : impl_->turnStreamEpoch;
+    bool notify = false;
+    {
+        std::lock_guard<std::mutex> lock(impl_->textMutex);
+        auto& pending = impl_->pendingEvents;
+        if (stream && !pending.empty() && pending.back().kind == kind &&
+            pending.back().epoch == event.epoch) {
+            pending.back().a += event.a;
+        } else {
+            pending.push_back(std::move(event));
         }
-        if (!impl_->flushPosted.exchange(true))
-            PostMessageW(window_, kAiFlushMessage, 0, 0);
-        return;
+        if (!impl_->flushPosted) { impl_->flushPosted = true; notify = true; }
     }
-
-    auto* event = new Event();
-    event->kind = kind;
-    event->a = std::move(a);
-    event->b = std::move(b);
-    event->c = std::move(c);
-    event->ok = ok;
-    event->payload = std::move(payload);
-    PostMessageW(window_, kAiEventMessage, 0, reinterpret_cast<LPARAM>(event));
+    if (notify && !PostMessageW(window_, kAiFlushMessage, 0, 0)) {
+        std::lock_guard<std::mutex> lock(impl_->textMutex);
+        impl_->flushPosted = false;  // A later enqueue/show can retry retained data.
+    }
 }
 
 void AiTab::handleEvent(Event& event) {
@@ -1089,18 +1324,19 @@ void AiTab::handleEvent(Event& event) {
 
     switch (event.kind) {
         case EventKind::Text: {
-            if (impl_->assistantIndex == none) impl_->assistantIndex = panel_.beginAssistant();
-            panel_.appendAssistant(impl_->assistantIndex, event.a);
-            requestRepaint();
+            impl_->revealBuffer += event.a;
+            pumpReveal();
+            requestChatRepaint();
             return;
         }
         case EventKind::Reasoning: {
+            revealAll();
             if (impl_->assistantIndex != none) {
                 panel_.finishAssistant(impl_->assistantIndex, true);
                 impl_->assistantIndex = none;
             }
             panel_.appendReasoning(event.a);
-            requestRepaint();
+            requestChatRepaint();
             return;
         }
         case EventKind::Tool: {
@@ -1129,7 +1365,6 @@ void AiTab::handleEvent(Event& event) {
             return;
         }
         case EventKind::TurnDone: {
-            drainPendingStream();  // 收尾：别把最后一小段落在缓冲里
             revealAll();
             if (impl_->assistantIndex != none) {
                 panel_.finishAssistant(impl_->assistantIndex, event.ok);
@@ -1144,26 +1379,60 @@ void AiTab::handleEvent(Event& event) {
             requestRepaint();
             return;
         }
-        case EventKind::SessionLoaded: {
-            if (impl_->busy || !panel_.items().empty()) return;  // 期间用户已经开始聊了
-            auto entries = std::static_pointer_cast<std::vector<StoredSession>>(event.payload);
-            if (!entries || entries->empty()) return;
-            applySession(entries->front().file, entries->front().record, true);
+        case EventKind::SessionLoaded:
+        case EventKind::SessionOpened: {
+            const auto result = std::static_pointer_cast<SessionReadPayload>(event.payload);
+            if (!result || impl_->busy || result->generation != impl_->sessionReadGeneration) return;
+            if (result->hostId != activeHostId()) {
+                panel_.setStatus(L"");
+                requestRepaint();
+                autoLoadLatestSession();
+                return;
+            }
+            if (event.kind == EventKind::SessionLoaded && !panel_.items().empty()) return;
+            panel_.setStatus(L"");
+            if (!event.ok) {
+                panel_.addNotice(L"读取历史会话失败：" + event.a, true);
+                requestRepaint();
+                return;
+            }
+            if (!result->entries.empty()) {
+                const auto& entry = result->entries.front();
+                applySession(entry.file, entry.record, event.kind == EventKind::SessionLoaded);
+            }
             return;
         }
         case EventKind::SessionList: {
-            auto entries = std::static_pointer_cast<std::vector<StoredSession>>(event.payload);
+            const auto result = std::static_pointer_cast<SessionReadPayload>(event.payload);
+            if (!result || impl_->busy || result->generation != impl_->sessionReadGeneration) return;
+            if (!impl_->visualActive ||
+                result->presentationGeneration != impl_->presentationGeneration) {
+                panel_.setStatus(L"");
+                requestRepaint();
+                return;
+            }
+            if (result->hostId != activeHostId()) {
+                panel_.setStatus(L"");
+                requestRepaint();
+                autoLoadLatestSession();
+                return;
+            }
+            const auto& entries = result->entries;
             panel_.setStatus(L"");
             requestRepaint();
-            if (!entries || entries->empty()) {
+            if (!event.ok) {
+                panel_.addNotice(L"读取历史会话失败：" + event.a, true);
+                return;
+            }
+            if (entries.empty()) {
                 panel_.addNotice(L"这台主机上还没有历史对话。每到一轮结束会自动存到 "
                                  L"~/.rshell/sessions/。",
                                  false);
                 return;
             }
             std::vector<std::wstring> labels;
-            labels.reserve(entries->size());
-            for (const StoredSession& entry : *entries) labels.push_back(sessionEntryLabel(entry));
+            labels.reserve(entries.size());
+            for (const StoredSession& entry : entries) labels.push_back(sessionEntryLabel(entry));
 
             // 锚点：面板头部「历史」按钮的下沿
             POINT anchor{0, 0};
@@ -1174,13 +1443,23 @@ void AiTab::handleEvent(Event& event) {
                 ClientToScreen(window_, &anchor);
             }
             int choice = -1;
+            const HWND owner = window_;
             if (context_.pickFromList) choice = context_.pickFromList(anchor, labels);
-            if (choice >= 0 && choice < static_cast<int>(entries->size())) {
-                const StoredSession& picked = (*entries)[static_cast<std::size_t>(choice)];
-                applySession(picked.file, picked.record, false);
+            if (!IsWindow(owner) || GetWindowLongPtrW(owner, GWLP_USERDATA) != reinterpret_cast<LONG_PTR>(this)) return;
+            if (choice >= 0 && choice < static_cast<int>(entries.size()) &&
+                result->hostId == activeHostId() && !impl_->busy &&
+                result->generation == impl_->sessionReadGeneration && impl_->visualActive &&
+                result->presentationGeneration == impl_->presentationGeneration) {
+                panel_.setStatus(L"载入历史对话…");
+                requestRepaint();
+                startSessionRead(result->hostId, 1, entries[static_cast<std::size_t>(choice)].file);
             }
             return;
         }
+        case EventKind::SessionNotice:
+            panel_.addNotice(event.a, !event.ok);
+            requestRepaint();
+            return;
         case EventKind::AssistantBegin: return;
     }
 }
@@ -1263,9 +1542,16 @@ void AiTab::saveSessionSnapshot(std::uintptr_t hostId, const std::wstring& hostL
     }
     dir = impl_->sessionDirPath;
     std::string error;
-    if (!ensureSessionDir(backend, dir, error)) return;
+    if (!ensureSessionDir(backend, dir, error)) {
+        postEvent(EventKind::SessionNotice, L"保存对话失败：" + toWideText(error), {}, {}, false);
+        return;
+    }
     impl_->sessionDirPath = dir;
-    if (!writeSessionFile(backend, dir, file, record, error)) return;
+    if (!writeSessionFile(backend, dir, file, record, error)) {
+        postEvent(EventKind::SessionNotice, L"保存对话失败：" + toWideText(error), {}, {}, false);
+        return;
+    }
+    if (!error.empty()) postEvent(EventKind::SessionNotice, toWideText(error));
 
     std::lock_guard<std::mutex> meta(impl_->metaMutex);
     impl_->sessionFile = file;
@@ -1275,7 +1561,7 @@ void AiTab::saveSessionSnapshot(std::uintptr_t hostId, const std::wstring& hostL
 // 打开面板 / 换主机：面板还空着就接上这台主机最近一次对话
 void AiTab::autoLoadLatestSession() {
     // 面板收起来时不读：没必要为了看不见的对话去动远端连接（也就不会和断线抢连接）
-    if (!window_ || !impl_->shown) return;
+    if (!window_ || !impl_->visualActive) return;
     if (impl_->busy || impl_->loading) return;
     const std::uintptr_t hostId = activeHostId();
     // 会话存在远端，只有连上（SFTP 就绪）的主机才有得读
@@ -1303,7 +1589,7 @@ void AiTab::showSessionHistory() {
     startSessionRead(hostId, 20);
 }
 
-void AiTab::startSessionRead(std::uintptr_t hostId, int limit) {
+void AiTab::startSessionRead(std::uintptr_t hostId, int limit, const std::string& file) {
     const std::shared_ptr<ToolBackend> backend = hostStore(hostId);
     if (!backend) return;
     if (impl_->loader.joinable()) {
@@ -1311,10 +1597,16 @@ void AiTab::startSessionRead(std::uintptr_t hostId, int limit) {
         impl_->loader.join();
     }
     impl_->loading = true;
+    const std::uint64_t generation = ++impl_->sessionReadGeneration;
+    const std::uint64_t presentation = impl_->presentationGeneration;
     // 读的过程中标签可能被关掉：拿着一份后端与保活句柄
     std::shared_ptr<void> alive = hostKeepAlive(hostId);
-    impl_->loader = std::thread([this, backend, hostId, limit, alive]() {
-        auto entries = std::make_shared<std::vector<StoredSession>>();
+    impl_->loader = std::thread([this, backend, hostId, limit, file, generation, presentation, alive]() {
+        auto result = std::make_shared<SessionReadPayload>();
+        result->hostId = hostId;
+        result->generation = generation;
+        result->presentationGeneration = presentation;
+        std::string error;
         try {
             std::lock_guard<std::mutex> remote(impl_->remoteMutex);
             if (impl_->sessionDirHost != hostId) {
@@ -1322,25 +1614,38 @@ void AiTab::startSessionRead(std::uintptr_t hostId, int limit) {
                 impl_->sessionDirHost = hostId;
             }
             std::string dir = impl_->sessionDirPath;
-            std::string error;
-            *entries = readSessions(*backend, dir, limit, error);
+            if (!file.empty()) {
+                StoredSession entry;
+                if (ensureSessionDir(*backend, dir, error) &&
+                    readSessionFile(*backend, dir, file, entry, error))
+                    result->entries.push_back(std::move(entry));
+            } else if (limit == 1) {
+                result->entries = readSessions(*backend, dir, limit, error);
+            } else {
+                result->entries = listSessions(*backend, dir, limit, error);
+            }
             impl_->sessionDirPath = dir;
+        } catch (const std::exception& e) {
+            error = e.what();
         } catch (...) {
-            // 远端连接在读取途中断掉：当作没有历史，不能把异常抛到线程外
+            error = "远端连接在读取途中中断";
         }
         impl_->loading = false;
         if (impl_->closing) return;
-        postEvent(limit == 1 ? EventKind::SessionLoaded : EventKind::SessionList, L"", L"", L"",
-                  true, entries);
+        const EventKind kind = !file.empty() ? EventKind::SessionOpened :
+                               limit == 1 ? EventKind::SessionLoaded : EventKind::SessionList;
+        postEvent(kind, toWideText(error), L"", L"", error.empty(), result);
     });
 }
 
 // 把一段历史铺回面板与上下文
 void AiTab::applySession(const std::string& file, const SessionRecord& record, bool announce) {
     if (impl_->busy) return;
+    ++impl_->streamEpoch;
     impl_->agent.reset();
     panel_.clear();
     impl_->assistantIndex = static_cast<std::size_t>(-1);
+    impl_->revealBuffer.clear();
 
     std::vector<Message> history;
     for (const SessionMessage& message : record.messages) {
@@ -1742,6 +2047,14 @@ LRESULT CALLBACK AiTab::wndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
 LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_SIZE: {
+            if (impl_ && impl_->applyingOpenAnimation) return 0;
+            if (impl_) {
+                finishOpenAnimation();
+                if (impl_->hasLogicalBounds && wParam != SIZE_MINIMIZED) {
+                    impl_->logicalBounds.right = impl_->logicalBounds.left + LOWORD(lParam);
+                    impl_->logicalBounds.bottom = impl_->logicalBounds.top + HIWORD(lParam);
+                }
+            }
             RECT client{};
             GetClientRect(window_, &client);
             panel_.setBounds(client);
@@ -1749,6 +2062,10 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             InvalidateRect(window_, nullptr, FALSE);
             return 0;
         }
+
+        case WM_SHOWWINDOW:
+            if (!wParam) finishOpenAnimation();
+            return DefWindowProcW(window_, message, wParam, lParam);
 
         case WM_COMMAND: {
             if (settingsOpen_ && HIWORD(wParam) == CBN_SELCHANGE) {
@@ -1794,15 +2111,8 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return DefWindowProcW(window_, message, wParam, lParam);
         }
 
-        case kAiEventMessage: {
-            std::unique_ptr<Event> event(reinterpret_cast<Event*>(lParam));
-            if (event) handleEvent(*event);
-            return 0;
-        }
-
         case kAiFlushMessage: {
             drainPendingStream();
-            requestChatRepaint();
             return 0;
         }
 
@@ -1964,7 +2274,17 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
             return 0;
 
         case WM_TIMER:
-            if (wParam == kRepaintTimer) {
+            if (!impl_->visualActive &&
+                (wParam == kRepaintTimer || wParam == kCaretTimer || wParam == kCopyFlashTimer)) {
+                KillTimer(window_, static_cast<UINT_PTR>(wParam));
+                impl_->repaintPending = false;
+                impl_->caretTimerActive = false;
+                impl_->copyTimerActive = false;
+                return 0;
+            }
+            if (wParam == kOpenAnimationTimer) {
+                advanceOpenAnimation(GetTickCount64(), false);
+            } else if (wParam == kRepaintTimer) {
                 KillTimer(window_, kRepaintTimer);
                 impl_->repaintPending = false;
                 pumpReveal();  // 缓冲里还有字就继续吐，并自动排下一帧
@@ -1978,6 +2298,8 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
                 InvalidateRect(window_, &caretArea, FALSE);
             } else if (wParam == kCopyFlashTimer) {
                 KillTimer(window_, kCopyFlashTimer);
+                impl_->copyTimerActive = false;
+                impl_->copyFlashUntil = 0;
                 InvalidateRect(window_, nullptr, FALSE);
             }
             return 0;
@@ -2074,6 +2396,7 @@ LRESULT AiTab::handle(UINT message, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_NCDESTROY: {
+            finishOpenAnimation();
             KillTimer(window_, kCaretTimer);
             KillTimer(window_, kRepaintTimer);
             // 宿主直接把窗口销毁（没走 AiTab::destroy）时，也要先把线程收干净：

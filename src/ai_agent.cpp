@@ -177,6 +177,12 @@ AgentTurn Agent::run(const std::function<bool()>& shouldCancel) {
         history_.push_back(makeAssistant(result.content, result.toolCalls));
 
         for (const ToolCall& call : result.toolCalls) {
+            if (shouldCancel && shouldCancel()) {
+                // Keep every tool_call paired with a result so this history can
+                // be resumed after cancellation without a protocol error.
+                history_.push_back(makeTool(call.id, errorPayload("任务已停止").dump()));
+                continue;
+            }
             const ToolRequestInfo info = tools_.describe(call.name, call.arguments);
 
             ToolRecord record;
@@ -240,7 +246,7 @@ AgentTurn Agent::run(const std::function<bool()>& shouldCancel) {
                 outcome.json = errorPayload(info.problem).dump();
                 outcome.display = info.problem;
             } else {
-                outcome = tools_.execute(call.name, call.arguments);
+                outcome = tools_.execute(call.name, call.arguments, shouldCancel);
             }
 
             record.executed = true;
@@ -253,6 +259,10 @@ AgentTurn Agent::run(const std::function<bool()>& shouldCancel) {
             if (callbacks_.onToolFinish) callbacks_.onToolFinish(record);
 
             history_.push_back(makeTool(call.id, outcome.json));
+        }
+        if (shouldCancel && shouldCancel()) {
+            turn.cancelled = true;
+            return turn;
         }
     }
 

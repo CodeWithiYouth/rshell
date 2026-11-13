@@ -27,6 +27,10 @@
     构建后运行 ctest 单元测试。
 
 .EXAMPLE
+    .\build.ps1 -Diagnostics -BuildDir build\diagnostics
+    构建包含离屏渲染和演示入口的诊断版，产物在独立目录。
+
+.EXAMPLE
     .\build.ps1 -Clean -Test
     删除构建目录后干净重建并测试。
 #>
@@ -50,6 +54,9 @@ param(
 
     # 构建后运行 ctest。
     [switch]$Test,
+
+    # 启用 GUI 离屏渲染、图标预览和演示入口（发布构建默认关闭）。
+    [switch]$Diagnostics,
 
     # 兼容模式下强制使用 Visual Studio 安装的 v143 工具集，忽略 build_tmp\msvc143。
     [switch]$PreferInstalledToolset
@@ -266,7 +273,9 @@ $commonArgs = @(
     "-DRSHELL_WINDOWS7_COMPAT=$compatValue"
     "-DRSHELL_WINCNG_ECDSA=$ecdhValue"
     "-DRSHELL_CRYPTO_BACKEND=WinCNG"
+    "-DRSHELL_ENABLE_DIAGNOSTICS=$($Diagnostics.IsPresent.ToString().ToUpperInvariant())"
 )
+if ($Test) { $commonArgs += '-DRSHELL_BUILD_TESTS=ON' }
 
 $cmake = Find-CMake
 Write-Step "构建 $target（$Configuration，MSVC $($toolset.Name)，$($toolset.Source)）"
@@ -277,7 +286,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Step '编译'
-& $cmake --build $buildPath
+if ($Test) {
+    & $cmake --build $buildPath
+} else {
+    & $cmake --build $buildPath --target rshell rshell_gui
+}
 if ($LASTEXITCODE -ne 0) { throw "编译失败（退出码 $LASTEXITCODE）。" }
 
 if ($Test) {
@@ -290,7 +303,9 @@ if ($Test) {
 
 Write-Host ''
 Write-Host "构建完成，产物目录：$buildPath" -ForegroundColor Green
-foreach ($name in @('rshell.exe', 'rshell-gui.exe', 'rshell_tests.exe')) {
+$outputNames = @('rshell.exe', 'rshell-gui.exe')
+if ($Test) { $outputNames += 'rshell_tests.exe' }
+foreach ($name in $outputNames) {
     $path = Join-Path $buildPath $name
     if (Test-Path $path) {
         $size = [math]::Round((Get-Item $path).Length / 1KB)

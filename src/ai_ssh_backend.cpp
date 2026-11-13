@@ -17,7 +17,8 @@ ToolBackend::CommandResult SshToolBackend::runCommand(const std::string& command
                                                           const std::string& host) {
     (void)host;  // 绑定在单条连接上
     const int timeoutMs = std::clamp(timeoutSec, 1, 300) * 1000;
-    const RemoteFs::ExecOutcome outcome = fs_.execSync(command, timeoutMs, kMaxCommandOutput);
+    const RemoteFs::ExecOutcome outcome =
+        fs_.execSync(command, timeoutMs, kMaxCommandOutput, currentOperationCancellation());
 
     CommandResult result;
     result.truncated = outcome.truncated;
@@ -34,20 +35,20 @@ ToolBackend::CommandResult SshToolBackend::runCommand(const std::string& command
 bool SshToolBackend::readFile(const std::string& path, std::size_t maxBytes, std::string& out,
                               bool& truncated, std::string& error, const std::string& host) {
     (void)host;
-    return fs_.readFileSync(path, maxBytes, out, truncated, error);
+    return fs_.readFileSync(path, maxBytes, out, truncated, error, currentOperationCancellation());
 }
 
 bool SshToolBackend::writeFile(const std::string& path, const std::string& content,
                                std::string& error, const std::string& host) {
     (void)host;
-    return fs_.writeFileSync(path, content, error);
+    return fs_.writeFileSync(path, content, error, currentOperationCancellation());
 }
 
 bool SshToolBackend::listDir(const std::string& path, std::vector<DirEntryView>& out,
                              std::string& error, const std::string& host) {
     (void)host;
     std::vector<RemoteEntry> entries;
-    if (!fs_.listDirSync(path, entries, error)) return false;
+    if (!fs_.listDirSync(path, entries, error, currentOperationCancellation())) return false;
 
     out.clear();
     out.reserve(entries.size());
@@ -64,7 +65,7 @@ bool SshToolBackend::listDir(const std::string& path, std::vector<DirEntryView>&
 std::string SshToolBackend::homeDir() { return fs_.homePath(); }
 
 bool SshToolBackend::makeDir(const std::string& path, std::string& error) {
-    return fs_.mkdirSync(path, error);
+    return fs_.mkdirSync(path, error, currentOperationCancellation());
 }
 
 }  // namespace rshell::ai

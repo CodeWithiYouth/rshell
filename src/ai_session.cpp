@@ -77,7 +77,9 @@ std::string sessionFileName(const SessionRecord& record, std::int64_t stamp) {
 bool isSessionFileName(const std::string& name) {
     // 20261030-141233-foo.json 至少这么长；前缀必须是时间戳，否则不算我们的文件
     if (name.size() < 20) return false;
+    if (name.find_first_of("/\\") != std::string::npos) return false;
     if (name.compare(name.size() - 5, 5, ".json") != 0) return false;
+    if (name.size() >= 10 && name.compare(name.size() - 10, 10, ".meta.json") == 0) return false;
     for (int i = 0; i < 8; ++i)
         if (!std::isdigit(static_cast<unsigned char>(name[static_cast<std::size_t>(i)]))) return false;
     if (name[8] != '-') return false;
@@ -195,10 +197,14 @@ bool ensureSessionDir(ToolBackend& backend, std::string& dir, std::string& error
 
 std::vector<StoredSession> readSessions(ToolBackend& backend, std::string& dir, int limit,
                                         std::string& error) {
+    error.clear();
     std::vector<StoredSession> entries;
     if (!ensureSessionDir(backend, dir, error)) return entries;
     std::vector<DirEntryView> files;
-    if (!backend.listDir(dir, files, error, "")) return entries;
+    if (!backend.listDir(dir, files, error, "")) {
+        if (error.empty()) error = "无法列出历史会话目录";
+        return entries;
+    }
 
     std::vector<std::string> names;
     for (const DirEntryView& file : files)
@@ -207,13 +213,90 @@ std::vector<StoredSession> readSessions(ToolBackend& backend, std::string& dir, 
 
     for (auto it = names.rbegin();
          it != names.rend() && static_cast<int>(entries.size()) < limit; ++it) {
-        std::string text;
         std::string readError;
-        bool truncated = false;
-        if (!backend.readFile(dir + "/" + *it, 512u * 1024u, text, truncated, readError, "")) continue;
         StoredSession entry;
-        if (!parseSession(text, entry.record, nullptr)) continue;
+        if (!readSessionFile(backend, dir, *it, entry, readError)) {
+            error = readError;
+            continue;
+        }
+        entries.push_back(std::move(entry));
+    }
+    if (!entries.empty()) error.clear();
+    return entries;
+}
+
+bool readSessionFile(ToolBackend& backend, const std::string& dir, const std::string& file,
+                     StoredSession& out, std::string& error) {
+    error.clear();
+    if (dir.empty() || !isSessionFileName(file) || file.find_first_of("/\\") != std::string::npos) {
+        error = "无效的对话文件名";
+        return false;
+    }
+    std::string text;
+    bool truncated = false;
+    if (!backend.readFile(dir + "/" + file, kMaxSessionFileBytes, text, truncated, error, "")) {
+        if (error.empty()) error = "无法读取对话文件 " + file;
+        return false;
+    }
+    if (truncated) {
+        error = "对话记录超过 512 KiB，未载入不完整内容";
+        return false;
+    }
+    StoredSession entry;
+    if (!parseSession(text, entry.record, &error)) return false;
+    if (entry.record.messages.empty()) {
+        error = "对话记录中没有可载入的消息";
+        return false;
+    }
+    entry.file = file;
+    entry.messageCount = entry.record.messages.size();
+    entry.summaryAvailable = true;
+    out = std::move(entry);
+    return true;
+}
+
+std::vector<StoredSession> listSessions(ToolBackend& backend, std::string& dir, int limit,
+                                       std::string& error) {
+    error.clear();
+    std::vector<StoredSession> entries;
+    if (!ensureSessionDir(backend, dir, error)) return entries;
+    std::vector<DirEntryView> files;
+    if (!backend.listDir(dir, files, error, "")) {
+        if (error.empty()) error = "无法列出历史会话目录";
+        return entries;
+    }
+    std::vector<std::string> names;
+    for (const auto& file : files) if (!file.isDir) names.push_back(file.name);
+    std::sort(names.begin(), names.end());
+    for (auto it = names.rbegin();
+         it != names.rend() && static_cast<int>(entries.size()) < limit; ++it) {
+        if (!isSessionFileName(*it)) continue;
+        StoredSession entry;
         entry.file = *it;
+        entry.record.title = it->substr(16, it->size() - 21);
+        if (entry.record.title == "session" || entry.record.title.empty())
+            entry.record.title = "未命名对话";
+        entry.record.created = entry.record.updated = sessionStampFromName(*it);
+        const std::string metadata = it->substr(0, it->size() - 5) + ".meta.json";
+        if (std::binary_search(names.begin(), names.end(), metadata)) {
+            std::string text, readError;
+            bool truncated = false;
+            Json root;
+            if (backend.readFile(dir + "/" + metadata, 16u * 1024u, text, truncated, readError, "") &&
+                !truncated && Json::parse(text, root, nullptr) && root.isObject()) {
+                const Json* count = root.find("message_count");
+                const Json* title = root.find("title");
+                SessionRecord summary;
+                if (title && title->isString() && !title->asString().empty() &&
+                    count && count->isNumber() && count->asNumber() >= 0 &&
+                    count->asNumber() <= 1000000 && parseSession(text, summary, nullptr)) {
+                    entry.record = std::move(summary);
+                    entry.record.messages.clear();
+                    entry.messageCount = static_cast<std::size_t>(count->asNumber());
+                    entry.summaryAvailable = true;
+                }
+            }
+        }
         entries.push_back(std::move(entry));
     }
     return entries;
@@ -221,11 +304,43 @@ std::vector<StoredSession> readSessions(ToolBackend& backend, std::string& dir, 
 
 bool writeSessionFile(ToolBackend& backend, const std::string& dir, const std::string& file,
                       const SessionRecord& record, std::string& error) {
-    if (dir.empty() || file.empty()) {
+    error.clear();
+    if (dir.empty() || !isSessionFileName(file)) {
         error = "缺少目录或文件名";
         return false;
     }
-    return backend.writeFile(dir + "/" + file, serializeSession(record), error, "");
+    const std::string serialized = serializeSession(record);
+    if (serialized.size() > kMaxSessionFileBytes) {
+        error = "对话记录超过 512 KiB，未保存；原有远端记录保持不变，当前聊天可继续";
+        return false;
+    }
+    if (!backend.writeFile(dir + "/" + file, serialized, error, "")) return false;
+    // 每份对话一个小摘要，互不竞争共享索引；摘要失败也不能使正文保存失效。
+    Json metadata = Json::object();
+    metadata["version"] = Json::number(1);
+    metadata["title"] = Json::string(cutUtf8(record.title, 240));
+    metadata["host"] = Json::string(cutUtf8(record.host, 96));
+    metadata["created"] = Json::number(static_cast<double>(record.created));
+    metadata["updated"] = Json::number(static_cast<double>(record.updated));
+    Json tags = Json::array();
+    for (const auto& tag : record.tags) {
+        if (tags.size() == 8) break;
+        tags.push(Json::string(cutUtf8(tag, 64)));
+    }
+    metadata["tags"] = std::move(tags);
+    metadata["message_count"] = Json::number(static_cast<double>(record.messages.size()));
+    const std::string name = file.substr(0, file.size() - 5) + ".meta.json";
+    std::string metadataError;
+    try {
+        if (backend.writeFile(dir + "/" + name, metadata.dump() + "\n", metadataError, "")) return true;
+    } catch (const std::exception& e) {
+        metadataError = e.what();
+    } catch (...) {
+        metadataError = "摘要写入中断";
+    }
+    error = "对话已保存，历史列表摘要暂未更新" +
+            (metadataError.empty() ? std::string() : "：" + metadataError);
+    return true;
 }
 
 }  // namespace rshell::ai

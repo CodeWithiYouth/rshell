@@ -3227,6 +3227,69 @@ void windowPlacementRegression() {
     std::error_code error;
     std::filesystem::remove(path, error);
 }
+// 后台触发的模态框：owner 是隐藏/最小化窗口时，对话框也必须落在可见工作区，
+// 关闭后 owner 必须恢复可用。dialog 在测试线程上跑（和真实调用一致），
+// 由旁路线程观察并关掉它。
+void dialogPlacementRegression() {
+    struct Result {
+        bool found = false;
+        bool inside = false;
+        bool workAreaKnown = false;
+        bool ownerDisabled = false;
+    } result;
+
+    std::thread inspector([&result] {
+        HWND dialog = nullptr;
+        for (int attempt = 0; attempt < 250; ++attempt) {
+            dialog = nullptr;
+            EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+                DWORD pid = 0;
+                GetWindowThreadProcessId(hwnd, &pid);
+                if (pid != GetCurrentProcessId()) return TRUE;
+                wchar_t name[64]{};
+                if (GetClassNameW(hwnd, name, 64) == 0) return TRUE;
+                if (wcscmp(name, L"RshellMessageDialog") != 0) return TRUE;
+                *reinterpret_cast<HWND*>(lp) = hwnd;
+                return FALSE;
+            }, reinterpret_cast<LPARAM>(&dialog));
+            if (dialog && IsWindowVisible(dialog)) break;
+            Sleep(20);
+        }
+        if (!dialog) return;
+
+        result.found = true;
+        RECT rect{};
+        GetWindowRect(dialog, &rect);
+        MONITORINFO info{};
+        info.cbSize = sizeof(info);
+        const HMONITOR monitor = MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST);
+        if (monitor && GetMonitorInfoW(monitor, &info)) {
+            const RECT& work = info.rcWork;
+            result.workAreaKnown = true;
+            result.inside = rect.left >= work.left && rect.top >= work.top &&
+                            rect.right <= work.right && rect.bottom <= work.bottom;
+        }
+        // ShowWindow 到 EnableWindow(owner) 之间有一小段同线程代码，
+        // 旁路线程可能正好卡在这个窗口期，稍等它稳定下来再记录。
+        for (int i = 0; i < 50 && IsWindowEnabled(g_app.main); ++i) Sleep(10);
+        result.ownerDisabled = !IsWindowEnabled(g_app.main);
+        PostMessageW(dialog, WM_CLOSE, 0, 0);
+    });
+
+    MessageSpec spec;
+    spec.kind = 0;
+    spec.title = L"dialog probe";
+    spec.text = L"probe";
+    showMessage(spec);
+    if (inspector.joinable()) inspector.join();
+
+    check(result.found, "message dialog is created for placement test");
+    check(result.workAreaKnown, "dialog has a monitor");
+    check(result.inside, "dialog stays inside the monitor work area");
+    check(result.ownerDisabled, "owner is disabled while the dialog is open");
+    check(IsWindowEnabled(g_app.main), "owner is re-enabled after the dialog closes");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -3301,6 +3364,7 @@ int main(int argc, char** argv) {
         titleAiButtonRegression();
         terminalDockReflowRegression();
         windowPlacementRegression();
+        dialogPlacementRegression();
         buttonAndConnectionAnimationRegression();
         aiOpenAnimationRegression();
         mainPartialPaintRegression();

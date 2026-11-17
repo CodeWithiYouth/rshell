@@ -3065,7 +3065,7 @@ void paintDialog(HWND hwnd, const std::wstring& title, const std::wstring& subti
     EndPaint(hwnd, &ps);
 }
 
-// 对话框窗口：无边框 + 阴影 + 暗色 DWM 边 + 圆角，居中于主窗口
+// 对话框窗口：无边框 + 阴影 + 暗色 DWM 边 + 圆角，居中于 owner / 当前显示器
 HWND createDialogWindow(const wchar_t* className, const std::wstring& title, int width,
                         int height) {
     // owner 取当前活动窗口（同一线程内）：在会话管理窗口里再弹提示时，
@@ -3075,6 +3075,40 @@ HWND createDialogWindow(const wchar_t* className, const std::wstring& title, int
         ownerWindow == g_app.main) {
         ownerWindow = g_app.main;
     }
+
+    // 对话框可能从后台弹出（MCP 审批、自动重连、定时器）：主窗口最小化或
+    // 已经不在任何屏幕上时，不能拿它的矩形做定位，否则框会落到屏幕外。
+    RECT anchorRect{};
+    const bool hasAnchor =
+        ownerWindow && IsWindow(ownerWindow) && IsWindowVisible(ownerWindow) &&
+        !IsIconic(ownerWindow) && GetWindowRect(ownerWindow, &anchorRect) &&
+        anchorRect.right > anchorRect.left && anchorRect.bottom > anchorRect.top;
+
+    POINT anchor{};
+    if (hasAnchor) {
+        anchor.x = (anchorRect.left + anchorRect.right) / 2;
+        anchor.y = (anchorRect.top + anchorRect.bottom) / 2;
+    } else if (!GetCursorPos(&anchor)) {
+        anchor.x = GetSystemMetrics(SM_CXSCREEN) / 2;
+        anchor.y = GetSystemMetrics(SM_CYSCREEN) / 2;
+    }
+
+    MONITORINFO monitorInfo{};
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    if (GetMonitorInfoW(MonitorFromPoint(anchor, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
+        work = monitorInfo.rcWork;
+    }
+
+    // 尺寸也收进工作区：过高的详情/审批内容会把按钮顶到屏幕外。
+    width = std::max(dp(240), std::min(width, static_cast<int>(work.right - work.left) - dp(24)));
+    height = std::max(dp(120), std::min(height, static_cast<int>(work.bottom - work.top) - dp(24)));
+
+    const int x = hasAnchor ? anchorRect.left + ((anchorRect.right - anchorRect.left) - width) / 2
+                            : work.left + ((work.right - work.left) - width) / 2;
+    const int y = hasAnchor ? anchorRect.top + ((anchorRect.bottom - anchorRect.top) - height) / 2
+                            : work.top + ((work.bottom - work.top) - height) / 2;
+
     HWND dlg = CreateWindowExW(0, className, title.c_str(),
                                WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, CW_USEDEFAULT,
                                CW_USEDEFAULT, width, height, ownerWindow, nullptr, g_app.inst,
@@ -3089,14 +3123,12 @@ HWND createDialogWindow(const wchar_t* className, const std::wstring& title, int
     DwmSetWindowAttribute(dlg, 33, &corner, sizeof(corner));
     applyRoundRegion(dlg, width, height);
 
-    RECT owner{};
-    RECT self{0, 0, width, height};
-    if (g_app.main && GetWindowRect(g_app.main, &owner)) {
-        const int x = owner.left + ((owner.right - owner.left) - width) / 2;
-        const int y = owner.top + ((owner.bottom - owner.top) - height) / 2;
-        SetWindowPos(dlg, HWND_TOP, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-    }
-    (void)self;
+    // 夹到工作区内，保证整个框（包括底部按钮）都能看到。
+    const int clampedX =
+        std::clamp(x, static_cast<int>(work.left), static_cast<int>(work.right) - width);
+    const int clampedY =
+        std::clamp(y, static_cast<int>(work.top), static_cast<int>(work.bottom) - height);
+    SetWindowPos(dlg, HWND_TOP, clampedX, clampedY, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
     return dlg;
 }
 
@@ -4173,15 +4205,36 @@ void runModalLoop(HWND dlg) {
     // owner 可能本来就是禁用的（外层模态），关闭时必须恢复原状而不是一律启用。
     HWND owner = GetWindow(dlg, GW_OWNER);
     if (!owner || !IsWindow(owner)) owner = g_app.main;
+
+    // 先显示并抢前台，再禁用 owner：反过来做的话，owner 被禁用时系统可能把
+    // 前台交给别的程序，SetForegroundWindow 更容易失败。
+    ShowWindow(dlg, SW_SHOWNORMAL);
+    // 后台触发的对话框（MCP 审批、掉线重连）经常抢不到前台：先临时置顶，
+    // 保证它不会被主窗口或别的程序盖住；用户真正激活它以后马上恢复普通 z 序，
+    // 避免切到别的程序时它一直压在最上面。
+    SetWindowPos(dlg, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    SetForegroundWindow(dlg);
+    SetActiveWindow(dlg);
+    SetFocus(dlg);
+    bool keepTopmost = GetForegroundWindow() != dlg;
+    if (!keepTopmost) {
+        SetWindowPos(dlg, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
     const BOOL ownerWasEnabled = owner ? IsWindowEnabled(owner) : FALSE;
     if (owner) EnableWindow(owner, FALSE);
-    ShowWindow(dlg, SW_SHOW);
-    SetForegroundWindow(dlg);
+
     MSG msg;
     while (IsWindow(dlg) && GetMessageW(&msg, nullptr, 0, 0)) {
-        if (IsDialogMessageW(dlg, &msg)) continue;
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
+        if (!IsDialogMessageW(dlg, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+        if (keepTopmost && GetForegroundWindow() == dlg) {
+            keepTopmost = false;
+            SetWindowPos(dlg, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
     }
     if (owner && IsWindow(owner)) {
         EnableWindow(owner, ownerWasEnabled);

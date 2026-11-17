@@ -8,10 +8,10 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 **Windows 10/11，64 位，按需下载：**
 
-- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.3/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
-- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.3/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.4/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.4/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
 
-两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.3.3 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.3.3)。
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.3.4 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.3.4)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -74,6 +74,50 @@ AI 设置中可调整单次任务的最大执行步数（默认 16），也可�
 - 一次只会有一个待确认操作；生成过程中点「停止」会终止整轮任务。
 
 API Key 保存在本机主密码保险库，不会写进配置文件；每次启动需要解锁保险库后才能使用。
+
+## MCP（给其它 AI 客户端用）
+
+rshell-gui 运行期间可以把**已经连上的会话**暴露成一个 MCP 服务，让 Claude Code、Cursor、VS Code 等支持 MCP 的客户端直接列目录、读文件、传文件或执行命令，不用再单独配 SSH。
+
+1. 先在 rshell 里连上目标主机。
+2. 菜单 →「工具」→「MCP 服务」打开。状态栏会显示监听地址，完整的连接信息（地址 + Bearer token）会复制到剪贴板；之后可用「复制 MCP 连接信息」再次获取。
+3. 默认只开放只读工具：
+
+   | 工具 | 作用 | 默认 |
+   | --- | --- | --- |
+   | `list_dir` | 列远端目录 | 开启 |
+   | `read_file` | 读远端文本文件（敏感路径拒绝、结果脱敏） | 开启 |
+   | `write_file` | 写远端文件 | 需在菜单里打开「MCP 允许写文件」 |
+   | `run_command` | 在远端执行命令（必须同时发送 `intent` 说明目的） | 需打开「MCP 允许执行命令」（高危） |
+
+   `host` 参数留空使用当前激活标签；填会话名可操作其它已打开的标签。
+
+   **审批规则和 AI 面板共用一份**：普通命令、普通路径写入直接执行；`rm`、`systemctl restart`、`mkfs`、写 `/etc` 或 `~/.ssh` 等命中高风险规则的请求，会在 rshell 里弹出「允许执行 / 拒绝」确认框（默认停在「拒绝」）。确认框会写明**目标主机、操作意图**和完整命令；没有人点确认就不会执行，点允许后也会锁定当时的会话，中途切换标签不会把命令发到别的机器。
+
+4. 客户端配置示例（把地址和 token 换成 rshell 显示的）：
+
+   ```powershell
+   # Claude Code
+   claude mcp add --transport http rshell http://127.0.0.1:8765/mcp `
+     --header "Authorization: Bearer <token>"
+   ```
+
+   ```jsonc
+   // Cursor / VS Code 的 mcp.json（字段名随客户端版本略有差异）
+   {
+     "mcpServers": {
+       "rshell": {
+         "type": "http",
+         "url": "http://127.0.0.1:8765/mcp",
+         "headers": { "Authorization": "Bearer <token>" }
+       }
+     }
+   }
+   ```
+
+   Claude Desktop 不直接支持远程 HTTP 时，可用 `npx -y mcp-remote <url> --header "Authorization: Bearer <token>"` 转接。
+
+服务只监听 `127.0.0.1`。token 等价于这台机器的 SSH 权限，不要写进截图、日志或共享配置；配置保存在 `~/.rshell/ui.ini`（`mcp=` / `mcpport=` / `mcpwrite=` / `mcpcommand=` / `mcptoken=`），启动前也可以用 `RSHELL_MCP`、`RSHELL_MCP_PORT`、`RSHELL_MCP_TOKEN` 等环境变量覆盖。关掉菜单里的开关会立即停止监听。
 
 ## 密码与隐私
 

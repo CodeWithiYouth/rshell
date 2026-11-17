@@ -1987,7 +1987,7 @@ void mainMenuRegression() {
     check(!items[7].separator && items[7].id == IDM_EXIT && items[7].children.empty(),
           "exit stays a plain top-level item");
 
-    // 叶子项总数与原来的一字排开菜单一致，而且没有重复 id
+    // 叶子项总数 = 原来的 24 个命令 + 新增的 4 个 MCP 开关，而且没有重复 id
     int leaves = 0;
     std::vector<int> ids;
     for (const auto& item : items) {
@@ -2002,7 +2002,7 @@ void mainMenuRegression() {
             ids.push_back(child.id);
         }
     }
-    check(leaves == 24, "every command of the old flat menu is still reachable");
+    check(leaves == 28, "every command of the old flat menu is still reachable");
     check(std::find(ids.begin(), ids.end(), 0) == ids.end(), "no reachable row is a placeholder id");
     std::sort(ids.begin(), ids.end());
     check(std::adjacent_find(ids.begin(), ids.end()) == ids.end(), "no command appears twice");
@@ -2024,7 +2024,7 @@ void mainMenuRegression() {
     check(session[2].id == IDM_CONNECT && session[2].text == L"连接…",
           "connect/disconnect label follows the connection state");
     const auto& tools = items[4].children;
-    check(tools.size() == 3 && tools[0].id == IDM_CHECK_UPDATE, "tools keeps the update commands");
+    check(tools.size() == 8 && tools[0].id == IDM_CHECK_UPDATE, "tools keeps the update commands");
     check(tools[0].text == L"立即检查更新…", "the manual check is labelled as immediate");
     check(tools[1].text == (g_app.updateCheckOnStart ? L"启动时检查更新 · 已开启"
                                                      : L"启动时检查更新 · 已关闭"),
@@ -2033,6 +2033,12 @@ void mainMenuRegression() {
               tools[2].text == (g_app.editorPath.empty() ? L"选择文本编辑器…"
                                                          : L"更换文本编辑器…"),
           "the editor setting follows whether an editor was chosen");
+    check(tools[3].separator, "MCP commands are separated from the update commands");
+    check(tools[4].id == IDM_MCP && tools[5].id == IDM_MCP_COPY &&
+              tools[6].id == IDM_MCP_WRITE && tools[7].id == IDM_MCP_COMMAND,
+          "MCP controls live at the end of the tools submenu");
+    check(tools[4].text == (g_app.mcpEnabled ? L"MCP 服务 · 已开启" : L"MCP 服务 · 已关闭"),
+          "the MCP toggle shows its state");
 }
 
 // 二级菜单的悬停修正：父项左右内边距仍然算“还在这一项上”，

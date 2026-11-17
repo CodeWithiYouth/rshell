@@ -2,7 +2,11 @@
 
 本文件记录 rshell 每个版本的变化。发布流程会自动把对应版本的段落写进 GitHub Release 说明。
 
-## 未发布
+## v1.3.4 — 2026-11-17
+
+### 新增
+
+- **内置 MCP 服务**：rshell-gui 运行时可把已连接的会话暴露为 MCP 工具（`list_dir`、`read_file`、`write_file`、`run_command`），支持 Claude Code、Cursor、VS Code 等客户端；只监听 `127.0.0.1`，Bearer token 认证，写文件和执行命令需要单独在「工具」菜单里授权。审批规则与 AI 面板一致：低风险操作直接执行，删除、重启服务、写系统目录等高风险操作会在 rshell 里弹确认；`run_command` 必须附带说明目的的 `intent`，确认框会显示目标主机、意图和完整命令。
 
 ## v1.3.3 — 2026-11-13
 

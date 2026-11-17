@@ -45,6 +45,7 @@
 #include "ai_ssh_backend.h"
 #include "ai_tab.h"
 #include "dnd_virtual_file.h"
+#include "mcp_server.h"
 #include "protected_secret.h"
 #include "remote_fs.h"
 #include "reconnect.h"
@@ -82,6 +83,8 @@ enum : UINT {
     WM_UPDATE_DOWNLOADED = WM_APP + 10, // lParam = UpdateDownload*
     WM_FS_CONFLICT = WM_APP + 11,
     WM_SHELL_FLUSH = WM_APP + 12, // One pending notification per connection.
+    WM_MCP_RESOLVE_HOST = WM_APP + 13,  // lParam = McpResolveRequest*（HTTP 线程同步等待）
+    WM_MCP_APPROVE = WM_APP + 14,       // lParam = McpApprovalRequest*（HTTP 线程同步等待）
 };
 
 // 目录跟随分三步执行，每步由远端私有 OSC 确认；定时器只负责静默等待和超时。
@@ -128,6 +131,10 @@ ID_BTN_FS_TOGGLE,   // 文件面板：折叠 / 展开
     IDM_NEXT_TAB,
     IDM_PREV_TAB,
     IDM_AI_PANEL,
+    IDM_MCP,         // 开关内置 MCP 服务
+    IDM_MCP_COPY,    // 复制 MCP 连接信息
+    IDM_MCP_WRITE,   // 允许 MCP 写文件
+    IDM_MCP_COMMAND, // 允许 MCP 执行命令（高危）
     // 文件面板右键菜单（都在 popup::Item 里，走同一个 WM_COMMAND 分发）
     IDM_FS_UPLOAD = 2101,
     IDM_FS_MKDIR,
@@ -255,6 +262,14 @@ struct App : SessionState {
     ai::AiTab* aiTab = nullptr;
     bool aiOpen = false;   // 右侧 AI 面板是否展开
     bool aiFull = false;   // 展开时是否全屏
+    // 内置 MCP 服务：把已连接的会话暴露给 Claude Desktop / Cursor 等客户端。
+    // 只监听 127.0.0.1，配置（端口、令牌、权限）存在 ui.ini。
+    std::unique_ptr<McpServer> mcpServer;
+    bool mcpEnabled = false;
+    int mcpPort = 8765;
+    std::string mcpToken;
+    bool mcpAllowWrite = false;
+    bool mcpAllowCommand = false;
     // 分栏宽度（0 = 按窗口自动算）；拖过分隔条后记住，存在 ~/.rshell/ui.ini
     int sidebarWanted = 0;  // 拖拽后的期望宽度（0 = 自动）
     int aiDockWanted = 0;
@@ -8150,28 +8165,64 @@ void rememberWindowPlacement() {
 // 宽度按 96dpi 的逻辑像素存，换显示器/缩放比例后不会一下子撑爆
 void loadUiLayout() {
     // 回归测试里也不读用户真实布局，避免测试结果依赖本机状态
-    if (std::getenv("RSHELL_NO_UI_SAVE")) return;
+    const bool ignoreFile = std::getenv("RSHELL_NO_UI_SAVE") != nullptr;
     std::ifstream in(utf8ToPath(uiIniPath()));
-    if (!in) return;
-    const double scale = g_app.dpi > 0 ? g_app.dpi / 96.0 : 1.0;
-    std::string line;
-    while (std::getline(in, line)) {
-        const auto eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string key = trim(line.substr(0, eq));
-        const std::string raw = line.substr(eq + 1);
-        // 编辑器是字符串路径（可能带中文），不能走下面的 atoi
-        if (key == "editor") {
-            const std::string path = trim(raw);
-            if (!path.empty()) g_app.editorPath = toWide(path);
-            continue;
+    if (in && !ignoreFile) {
+        const double scale = g_app.dpi > 0 ? g_app.dpi / 96.0 : 1.0;
+        std::string line;
+        while (std::getline(in, line)) {
+            const auto eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string key = trim(line.substr(0, eq));
+            const std::string raw = line.substr(eq + 1);
+            // 编辑器/令牌是字符串（可能带中文或十六进制），不能走下面的 atoi
+            if (key == "editor") {
+                const std::string path = trim(raw);
+                if (!path.empty()) g_app.editorPath = toWide(path);
+                continue;
+            }
+            if (key == "mcptoken") {
+                g_app.mcpToken = trim(raw);
+                continue;
+            }
+            const int value = std::atoi(raw.c_str());
+            if (key == "mcp") {
+                g_app.mcpEnabled = value != 0;
+                continue;
+            }
+            if (key == "mcpwrite") {
+                g_app.mcpAllowWrite = value != 0;
+                continue;
+            }
+            if (key == "mcpcommand") {
+                g_app.mcpAllowCommand = value != 0;
+                continue;
+            }
+            if (key == "mcpport") {
+                if (value > 0 && value < 65536) g_app.mcpPort = value;
+                continue;
+            }
+            if (value <= 0) continue;
+            if (key == "sidebar") g_app.sidebarWanted = static_cast<int>(value * scale);
+            else if (key == "aidock") g_app.aiDockWanted = static_cast<int>(value * scale);
+            else if (key == "fscollapsed") g_app.fsCollapsed = value != 0;
+            else if (key == "updatecheck") g_app.updateCheckOnStart = value != 0;
         }
-        const int value = std::atoi(raw.c_str());
-        if (value <= 0) continue;
-        if (key == "sidebar") g_app.sidebarWanted = static_cast<int>(value * scale);
-        else if (key == "aidock") g_app.aiDockWanted = static_cast<int>(value * scale);
-        else if (key == "fscollapsed") g_app.fsCollapsed = value != 0;
-        else if (key == "updatecheck") g_app.updateCheckOnStart = value != 0;
+    }
+
+    // 自动化 / 便携场景可以用环境变量覆盖，不写入文件。
+    auto envFlag = [](const char* name, bool& target) {
+        if (const char* raw = std::getenv(name)) target = std::atoi(raw) != 0;
+    };
+    envFlag("RSHELL_MCP", g_app.mcpEnabled);
+    envFlag("RSHELL_MCP_WRITE", g_app.mcpAllowWrite);
+    envFlag("RSHELL_MCP_COMMAND", g_app.mcpAllowCommand);
+    if (const char* raw = std::getenv("RSHELL_MCP_PORT")) {
+        const int port = std::atoi(raw);
+        if (port > 0 && port < 65536) g_app.mcpPort = port;
+    }
+    if (const char* raw = std::getenv("RSHELL_MCP_TOKEN")) {
+        if (*raw) g_app.mcpToken = raw;
     }
 }
 
@@ -8195,6 +8246,11 @@ void saveUiLayout() {
     out << "aidock=" << aiLogical << "\n";
     out << "fscollapsed=" << (g_app.fsCollapsed ? 1 : 0) << "\n";
     out << "updatecheck=" << (g_app.updateCheckOnStart ? 1 : 0) << "\n";
+    out << "mcp=" << (g_app.mcpEnabled ? 1 : 0) << "\n";
+    out << "mcpport=" << g_app.mcpPort << "\n";
+    out << "mcpwrite=" << (g_app.mcpAllowWrite ? 1 : 0) << "\n";
+    out << "mcpcommand=" << (g_app.mcpAllowCommand ? 1 : 0) << "\n";
+    if (!g_app.mcpToken.empty()) out << "mcptoken=" << g_app.mcpToken << "\n";
     if (!g_app.editorPath.empty()) out << "editor=" << toUtf8(g_app.editorPath) << "\n";
     // 位置为物理像素，尺寸为 96dpi 逻辑像素；读取时按目标显示器 DPI 折算
     if (g_app.windowPlacement.valid) {
@@ -10036,6 +10092,16 @@ std::vector<popup::Item> buildMainMenu() {
     tools.push_back(leaf(IDM_FS_EDITOR,
                          g_app.editorPath.empty() ? L"选择文本编辑器…"
                                                   : L"更换文本编辑器…"));
+    tools.push_back(sep());
+    tools.push_back(leaf(IDM_MCP, g_app.mcpEnabled ? L"MCP 服务 · 已开启" : L"MCP 服务 · 已关闭"));
+    tools.push_back(leaf(IDM_MCP_COPY, L"复制 MCP 连接信息", L"", g_app.mcpEnabled));
+    tools.push_back(leaf(IDM_MCP_WRITE,
+                         g_app.mcpAllowWrite ? L"MCP 允许写文件 · 已开启"
+                                             : L"MCP 允许写文件 · 已关闭"));
+    tools.push_back(leaf(IDM_MCP_COMMAND,
+                         g_app.mcpAllowCommand ? L"MCP 允许执行命令 · 已开启"
+                                               : L"MCP 允许执行命令 · 已关闭",
+                         L"", true, true));
 
     // ---- 帮助
     std::vector<popup::Item> help;
@@ -10292,6 +10358,149 @@ std::vector<ai::AiHostInfo> aiHostList() {
         if (state) add(*state);
     add(static_cast<SessionState&>(g_app));
     return hosts;
+}
+
+// ---------------------------------------------------------------- 内置 MCP 服务
+
+// HTTP 线程 → 界面线程：按会话名取工具后端。SendMessage 让解析发生在
+// g_tabs 的唯一所有者（界面线程）上，避免跨线程读标签数组。
+struct McpResolveRequest {
+    std::string host;
+    McpHostBinding binding;
+    std::string error;
+};
+
+bool resolveMcpHost(const std::string& host, McpHostBinding& binding, std::string& error) {
+    if (!g_app.main) {
+        error = "rshell 窗口已关闭";
+        return false;
+    }
+    McpResolveRequest request;
+    request.host = host;
+    const LRESULT ok = SendMessageW(g_app.main, WM_MCP_RESOLVE_HOST, 0,
+                                    reinterpret_cast<LPARAM>(&request));
+    if (ok) {
+        binding = std::move(request.binding);
+        return true;
+    }
+    error = request.error.empty() ? "找不到可用的主机会话" : request.error;
+    return false;
+}
+
+// 高风险操作（删除、重启服务、写系统目录等）走和 AI 面板同一套规则，
+// 这里用宿主已有的自绘确认框，由用户点「允许执行 / 拒绝」。
+struct McpApprovalRequest {
+    std::wstring summary;
+    std::wstring detail;
+    std::wstring host;
+    std::wstring intent;
+    bool dangerous = false;
+    bool approved = false;
+};
+
+bool approveMcpOperation(const ai::ToolRequestInfo& info, const std::string& hostLabel,
+                         const std::string& intent) {
+    if (!g_app.main) return false;
+    McpApprovalRequest request;
+    request.summary = toWide(info.summary);
+    // 命令/文件预览可能很长：对话框只展示前 1500 字节，避免撑出屏幕。
+    bool truncated = false;
+    const std::string detail = ai::truncateUtf8(info.detail, 1500, truncated);
+    request.detail = toWide(detail + (truncated ? "\n……（内容已截断）" : ""));
+    request.dangerous = info.dangerous;
+    request.host = hostLabel.empty() ? L"当前会话" : toWide(hostLabel);
+    if (!intent.empty()) {
+        bool intentTruncated = false;
+        request.intent = toWide(ai::truncateUtf8(intent, 240, intentTruncated) +
+                                (intentTruncated ? "…" : ""));
+    }
+    const LRESULT handled =
+        SendMessageW(g_app.main, WM_MCP_APPROVE, 0, reinterpret_cast<LPARAM>(&request));
+    return handled != 0 && request.approved;
+}
+
+std::wstring mcpClientInfo() {
+    std::wstring text = L"MCP 服务地址：http://127.0.0.1:" +
+                        std::to_wstring(g_app.mcpServer ? g_app.mcpServer->port() : g_app.mcpPort) +
+                        L"/mcp\nAuthorization: Bearer " + toWide(g_app.mcpToken) + L"\n\n";
+    text += L"已开启工具：list_dir、read_file";
+    if (g_app.mcpAllowWrite) text += L"、write_file";
+    if (g_app.mcpAllowCommand) text += L"、run_command";
+    text += L"\n\nhost 参数留空表示当前激活标签；填会话名可操作其它已打开的主机。";
+    return text;
+}
+
+// 启动/停止由 g_app.mcpEnabled 决定。interactive=true 表示用户刚点菜单，
+// 失败时可以直接弹提示；启动阶段只写状态栏，不打扰用户。
+void applyMcpSettings(bool interactive = false) {
+    if (!g_app.mcpEnabled) {
+        if (g_app.mcpServer && g_app.mcpServer->running()) {
+            g_app.mcpServer->stop();
+            setStatus(L"MCP 服务已关闭");
+        }
+        return;
+    }
+    if (!g_app.main || (g_app.mcpServer && g_app.mcpServer->running())) return;
+
+    bool newToken = false;
+    if (g_app.mcpToken.empty()) {
+        g_app.mcpToken = makeMcpToken();
+        newToken = true;
+    }
+    if (!g_app.mcpServer) g_app.mcpServer = std::make_unique<McpServer>();
+
+    McpServerConfig config;
+    config.port = g_app.mcpPort;
+    config.token = g_app.mcpToken;
+    config.allowWrite = g_app.mcpAllowWrite;
+    config.allowCommand = g_app.mcpAllowCommand;
+    config.approveHighRisk = approveMcpOperation;
+
+    std::string error;
+    if (!g_app.mcpServer->start(config, resolveMcpHost, error)) {
+        g_app.mcpEnabled = false;
+        const std::wstring message = L"MCP 服务启动失败：" + toWide(error);
+        setStatus(message, true);
+        if (interactive) messageWarn(L"MCP 服务启动失败", message);
+        return;
+    }
+
+    const std::wstring info = mcpClientInfo();
+    setStatus(L"MCP 服务已开启：http://127.0.0.1:" +
+              std::to_wstring(g_app.mcpServer->port()) + L"/mcp");
+    if (newToken) saveUiLayout();  // 令牌要落盘，下次启动才能保持同一份配置
+    if (interactive) {
+        copyTextToClipboard(info + L"\n\n（已复制到剪贴板）");
+        messageInfo(L"MCP 服务已开启", info + L"\n\n连接信息已复制到剪贴板。");
+    }
+}
+
+void toggleMcpServer() {
+    g_app.mcpEnabled = !g_app.mcpEnabled;
+    applyMcpSettings(true);
+    saveUiLayout();
+}
+
+void toggleMcpPermission(bool& flag) {
+    flag = !flag;
+    // 权限在启动时读入工具列表，改动后要重开监听才会生效。
+    if (g_app.mcpEnabled) {
+        if (g_app.mcpServer) g_app.mcpServer->stop();
+        applyMcpSettings(false);
+    }
+    saveUiLayout();
+    setStatus(g_app.mcpEnabled ? L"MCP 权限已更新" : L"已保存，MCP 服务未开启");
+}
+
+void copyMcpConnectionInfo() {
+    if (!g_app.mcpServer || !g_app.mcpServer->running()) {
+        messageInfo(L"MCP 服务未开启", L"先在「工具」菜单里打开 MCP 服务。");
+        return;
+    }
+    const std::wstring info = mcpClientInfo();
+    const bool copied = copyTextToClipboard(info);
+    messageInfo(L"MCP 连接信息",
+                info + (copied ? L"\n\n已复制到剪贴板。" : L"\n\n复制失败，请手动抄写。"));
 }
 
 ai::AiTab* ensureAiPanel() {
@@ -11069,6 +11278,10 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             switch (id) {
                 case IDM_NEW_TAB: newSessionTab(); openSessionManager(); return 0;
         case IDM_AI_PANEL: toggleAiPanel(); return 0;
+                case IDM_MCP: toggleMcpServer(); return 0;
+                case IDM_MCP_COPY: copyMcpConnectionInfo(); return 0;
+                case IDM_MCP_WRITE: toggleMcpPermission(g_app.mcpAllowWrite); return 0;
+                case IDM_MCP_COMMAND: toggleMcpPermission(g_app.mcpAllowCommand); return 0;
                 case IDM_CLOSE_TAB: closeSessionTab(g_activeTab); return 0;
                 case IDM_NEXT_TAB: cycleSessionTab(1); return 0;
                 case IDM_PREV_TAB: cycleSessionTab(-1); return 0;
@@ -11508,8 +11721,75 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_MCP_APPROVE: {
+            auto* request = reinterpret_cast<McpApprovalRequest*>(lp);
+            if (!request) return 0;
+            if (g_applicationClosing.load()) {
+                request->approved = false;
+                return 0;
+            }
+            MessageSpec spec;
+            spec.kind = 3;
+            spec.title = request->dangerous ? L"MCP 危险操作确认" : L"MCP 高危操作确认";
+            std::wstring text = L"目标主机：" + request->host + L"\n";
+            if (!request->intent.empty()) text += L"操作意图：" + request->intent + L"\n";
+            text += L"外部 MCP 客户端请求执行以下操作：\n\n" + request->summary;
+            spec.text = std::move(text);
+            spec.detail = request->detail;
+            spec.buttons = {L"允许执行", L"拒绝"};
+            spec.defaultIndex = 1;  // 默认停在「拒绝」，避免误按回车放行
+            request->approved = showMessage(spec) == 0;
+            return 1;
+        }
+        case WM_MCP_RESOLVE_HOST: {
+            auto* request = reinterpret_cast<McpResolveRequest*>(lp);
+            if (!request) return 0;
+            if (g_applicationClosing.load()) {
+                request->error = "rshell 正在退出";
+                return 0;
+            }
+            const auto hosts = aiHostList();
+            std::string available;
+            for (const auto& host : hosts) {
+                if (!available.empty()) available += "、";
+                available += toUtf8(host.label);
+            }
+            for (const auto& host : hosts) {
+                const std::string label = toUtf8(host.label);
+                const bool match =
+                    request->host.empty() ? host.id == g_app.tabId : label == request->host;
+                if (!match) continue;
+                if (!host.store) {
+                    request->error = "会话「" + label + "」还没有建立文件连接";
+                    return 0;
+                }
+                request->binding.backend = host.store;
+                request->binding.keepAlive = host.keepAlive;
+                request->binding.label = label;
+                return 1;
+            }
+            if (request->host.empty()) {
+                // 没有激活连接时退到第一个可用会话，客户端不传 host 也能工作。
+                for (const auto& host : hosts) {
+                    if (!host.store) continue;
+                    request->binding.backend = host.store;
+                    request->binding.keepAlive = host.keepAlive;
+                    request->binding.label = toUtf8(host.label);
+                    return 1;
+                }
+                request->error = "当前没有已连接的主机（先在 rshell 里连上主机）";
+            } else {
+                request->error = "没有名为「" + request->host + "」的已连接会话。可用：" +
+                                 (available.empty() ? "（无）" : available);
+            }
+            return 0;
+        }
         case WM_DESTROY:
             saveUiLayout();  // 退出前记住窗口位置/尺寸和分栏宽度
+            if (g_app.mcpServer) {
+                g_app.mcpServer->stop();
+                g_app.mcpServer.reset();
+            }
             KillTimer(hwnd, 1);
             finishUiAnimations();
             g_mainBackBuffer.reset();
@@ -11774,6 +12054,9 @@ int runGui(HINSTANCE inst, int showCommand) {
         ShowWindow(window, showCommand);
     }
     UpdateWindow(window);
+
+    // 内置 MCP 服务：上次开启过就随窗口一起启动（ui.ini 里 mcp=1）
+    applyMcpSettings();
 
     // 布局定稿前会经历几次临时 resize（10x10 → 极小 → 正常），
     // 被顶出的空白行会写进回滚历史，表现为一启动就有“历史”和滚动条。

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(rshell VERSION 1.3.3 LANGUAGES CXX)
+project(rshell VERSION 1.3.4 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -237,6 +237,9 @@ if(WIN32)
         src/ai_search.cpp
         src/ai_settings.cpp
         src/md.cpp
+        src/mcp_protocol.cpp
+        src/mcp_http.cpp
+        src/mcp_server.cpp
     )
 
     add_executable(rshell_gui WIN32
@@ -345,6 +348,13 @@ if(RSHELL_BUILD_TESTS)
             src/remote_fs.cpp src/ai_ssh_backend.cpp ${RSHELL_AI_SOURCES})
         target_link_libraries(rshell_remote_cancel_probe PRIVATE rshell_core winhttp)
         add_test(NAME rshell_remote_cancel COMMAND rshell_remote_cancel_probe)
+
+        # 内置 MCP 服务：回环 HTTP + 假后端，验证握手、权限开关和认证。
+        add_executable(rshell_mcp_probe tests/mcp_http_probe.cpp ${RSHELL_AI_SOURCES})
+        target_compile_definitions(rshell_mcp_probe PRIVATE
+            RSHELL_VERSION="${PROJECT_VERSION}")
+        target_link_libraries(rshell_mcp_probe PRIVATE rshell_core winhttp)
+        add_test(NAME rshell_mcp COMMAND rshell_mcp_probe)
 
         # 限速本地 fixture 验证传输期间同一连接上的交互/FIFO/取消隔离。
         # python tests/transfer_interaction_e2e.py --exe <此目标路径>

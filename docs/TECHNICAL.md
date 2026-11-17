@@ -797,6 +797,21 @@ build\diagnostics\rshell-gui.exe --ai-welcome out.bmp    # 空状态
 - 只作用于交互终端会话（`SshShell` 的读线程空闲分支里发送）；文件/AI 通道本来就有 5 秒一次的状态采样。
 - 用途：穿过 NAT/防火墙的空闲超时，并尽早发现半开连接（want_reply 拿不到回应会暴露断链）。
 - CLI 对应 `--keepalive <秒>`；会话配置存在 `sessions.ini` 的 `keepalive=`。
+## MCP 服务（内置 HTTP）
+
+目标：让外部 MCP 客户端（Claude Code、Cursor、VS Code 等）直接复用 GUI 已经建立的 SSH/SFTP 会话和凭据，不必再配一遍连接。
+
+- 分层：
+  - `mcp_protocol.{h,cpp}`：JSON-RPC 2.0 与 MCP 方法子集（`initialize` / `ping` / `tools/list` / `tools/call` 及通知），不碰 socket，可离线单测；版本协商支持 2024-11-05 / 2025-03-26 / 2025-06-18 / 2025-11-25，不认识的请求回退到 2025-06-18。
+  - `mcp_http.{h,cpp}`：Streamable HTTP 的无状态子集，`POST /mcp` + `application/json`，不做 SSE 和会话 ID；只绑 `127.0.0.1`，Bearer token 定长比较，请求体上限 4 MiB。
+  - `mcp_server.{h,cpp}`：把 `ai::ToolRegistry` 包成 `mcp::ToolHost`；`RoutedBackend` 把工具参数里的 `host` 解析成 GUI 的 `RemoteFs`，空值表示当前激活标签。
+- 线程模型：HTTP 连接线程 → 协议/工具调用（HTTP 层互斥，一次一个）→ `ToolRegistry::execute` 设置取消作用域 → `RemoteFs` 把实际操作排进自己的文件线程。调用期间同时持有 `RemoteFs` 的 `shared_ptr`，关闭标签不会让对象在调用中途析构。
+- 停止顺序：先把 `running` 置 false（工具的 `CancelCheck` 会中断长命令），再关监听。连接线程不 join 而是 detach：`stop()` 常由界面线程发起，而工具可能正通过 `SendMessage` 等界面线程，join 会互相卡死；`State` 用 `shared_ptr` 保活，线程自己收尾。
+- 工具面：`list_dir` / `read_file` 默认开放；`write_file` / `run_command` 由「工具」菜单里的两个开关决定是否出现在 `tools/list`，`tools/call` 时再校验一次。命令权限等价于远程执行能力，默认关闭。
+- 审批：写类工具先走 `ToolRegistry::describe`，风险规则与 AI 面板完全相同（`dangerousCommandPatterns`、`highRiskPatterns`、`highRiskWritePaths`、`risk=high`）。`run_command` 强制要求非空 `intent`，缺失或全空白直接拒绝、不进入审批。工具调用会先解析目标会话（`McpHostBinding::label`），只有 `highRisk` 才通过 `McpApproval` 回宿主，由 GUI 用自绘确认框（写明主机名、操作意图，默认「拒绝」）询问；低风险操作直接执行。`McpApproval` 为空时高危操作一律拒绝。审批通过后用 `RoutedBackend::pin` 固定这次调用解析到的连接，用户中途切换标签不会让命令落到别的机器上。
+- 配置：`~/.rshell/ui.ini` 的 `mcp=` / `mcpport=` / `mcpwrite=` / `mcpcommand=` / `mcptoken=`；启动前可用 `RSHELL_MCP` / `RSHELL_MCP_PORT` / `RSHELL_MCP_TOKEN` / `RSHELL_MCP_WRITE` / `RSHELL_MCP_COMMAND` 覆盖。token 由 CNG 随机数生成，首次开启时写盘。
+- 测试：`tests/mcp_http_probe.cpp` 用假后端在回环上走真实 HTTP，覆盖握手、工具列表、权限开关、401/404/405、未知会话；`.\build.ps1 -Test` 会自动运行。
+
 ## 代理连接
 
 SSH 可以经 SOCKS5 或 HTTP CONNECT 代理连出，终端、SFTP 面板和 AI 工具都生效（它们共用 `SshSession`）。

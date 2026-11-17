@@ -38,6 +38,7 @@
 #include "ai_session.h"
 #include "ai_tools.h"
 #include "md.h"
+#include "mcp_protocol.h"
 #include "proxy.h"
 #include "dnd_virtual_file.h"
 #include "win_compat.h"
@@ -2530,6 +2531,104 @@ void testAiToolRegistry() {    FakeToolBackend backend;
     CHECK_EQ(backend.commands.size(), static_cast<std::size_t>(2));  // uptime + cat
 }
 
+void testMcpProtocol() {
+    using ai::Json;
+
+    struct FakeHost : mcp::ToolHost {
+        std::vector<mcp::ToolDef> tools() const override {
+            mcp::ToolDef read;
+            read.name = "list_dir";
+            read.description = "list";
+            read.inputSchema = Json::object();
+            read.readOnly = true;
+            mcp::ToolDef run;
+            run.name = "run_command";
+            run.description = "run";
+            run.inputSchema = Json::object();
+            run.readOnly = false;
+            return {read, run};
+        }
+        std::string call(const std::string& name, const Json& arguments,
+                         bool& isError) override {
+            isError = false;
+            if (name == "run_command" && arguments.find("fail")) isError = true;
+            return std::string("{\"tool\":\"") + name + "\"}";
+        }
+    };
+
+    FakeHost host;
+    mcp::Protocol protocol(host, "1.2.3");
+
+    const std::string init = protocol.handle(
+        R"({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"1"}}})");
+    Json response;
+    CHECK(Json::parse(init, response));
+    CHECK(response.find("error") == nullptr);
+    const Json* result = response.find("result");
+    CHECK(result != nullptr);
+    if (result) {
+        CHECK_EQ(result->find("protocolVersion")->asString(), std::string("2025-06-18"));
+        CHECK_EQ(result->find("serverInfo")->find("name")->asString(), std::string("rshell"));
+        CHECK(result->find("capabilities")->find("tools") != nullptr);
+    }
+
+    // 通知不回包
+    CHECK(protocol.handle(R"({"jsonrpc":"2.0","method":"notifications/initialized"})").empty());
+
+    // tools/list：schema、只读标记都带出去
+    const std::string listed =
+        protocol.handle(R"({"jsonrpc":"2.0","id":2,"method":"tools/list"})");
+    CHECK(Json::parse(listed, response));
+    const Json* tools = response.find("result")->find("tools");
+    CHECK(tools != nullptr && tools->size() == 2);
+    if (tools && tools->size() == 2) {
+        CHECK_EQ(tools->items()[0].find("name")->asString(), std::string("list_dir"));
+        CHECK(tools->items()[0].find("annotations")->find("readOnlyHint")->asBool());
+        CHECK(!tools->items()[1].find("annotations")->find("readOnlyHint")->asBool());
+    }
+
+    // tools/call：结果放进 content[type=text]
+    const std::string called = protocol.handle(
+        R"({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_dir","arguments":{"path":"/tmp"}}})");
+    CHECK(Json::parse(called, response));
+    const Json* content = response.find("result")->find("content");
+    CHECK(content != nullptr && content->size() == 1);
+    if (content && content->size() == 1) {
+        CHECK_EQ(content->items()[0].find("type")->asString(), std::string("text"));
+        CHECK(content->items()[0].find("text")->asString().find("list_dir") !=
+              std::string::npos);
+    }
+    CHECK(!response.find("result")->find("isError")->asBool());
+
+    // arguments 被序列化成字符串的客户端也要兼容
+    CHECK(Json::parse(
+        protocol.handle(
+            R"({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_command","arguments":"{\"fail\":true}"}})"),
+        response));
+    CHECK(response.find("result")->find("isError")->asBool());
+
+    // 未知方法 / 无效 JSON / 非对象
+    const std::string unknown =
+        protocol.handle(R"({"jsonrpc":"2.0","id":5,"method":"nope"})");
+    CHECK(Json::parse(unknown, response));
+    CHECK_EQ(response.find("error")->find("code")->asInt(), -32601);
+
+    const std::string broken = protocol.handle("{oops");
+    CHECK(Json::parse(broken, response));
+    CHECK_EQ(response.find("error")->find("code")->asInt(), -32700);
+
+    const std::string notObject = protocol.handle("[]");
+    CHECK(Json::parse(notObject, response));
+    CHECK_EQ(response.find("error")->find("code")->asInt(), -32600);
+
+    // 客户端请求了不认识的版本：回退到实现支持的版本
+    CHECK(Json::parse(protocol.handle(
+                          R"({"jsonrpc":"2.0","id":6,"method":"initialize","params":{"protocolVersion":"1999-01-01"}})"),
+                      response));
+    CHECK_EQ(response.find("result")->find("protocolVersion")->asString(),
+             std::string(mcp::Protocol::kFallbackVersion));
+}
+
 void testAiAgentReadsWithoutApproval() {
     FakeToolBackend backend;
     backend.files["/tmp/a.txt"] = "hello";
@@ -3107,6 +3206,7 @@ int main() {
     testAiSearch();
     testAiSessions();
     testAiToolRegistry();
+    testMcpProtocol();
     testAiAgentReadsWithoutApproval();
     testAiAgentWriteNeedsApproval();
     testAiAgentAutoApprove();

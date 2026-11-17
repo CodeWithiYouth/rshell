@@ -2601,10 +2601,9 @@ void testMcpProtocol() {
     CHECK(!response.find("result")->find("isError")->asBool());
 
     // arguments 被序列化成字符串的客户端也要兼容
-    CHECK(Json::parse(
-        protocol.handle(
-            R"({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_command","arguments":"{\"fail\":true}"}})"),
-        response));
+    const std::string stringArgs =
+        protocol.handle(R"({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"run_command","arguments":"{\"fail\":true}"}})");
+    CHECK(Json::parse(stringArgs, response));
     CHECK(response.find("result")->find("isError")->asBool());
 
     // 未知方法 / 无效 JSON / 非对象

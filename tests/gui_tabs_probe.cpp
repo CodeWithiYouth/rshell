@@ -3227,6 +3227,88 @@ void windowPlacementRegression() {
     std::error_code error;
     std::filesystem::remove(path, error);
 }
+// 悬浮审批卡：不抢焦点、不禁用主窗口，点击按钮能把结果回传给等待的 HTTP 线程。
+void mcpApprovalCardRegression() {
+    const bool mainWasVisible = IsWindowVisible(g_app.main);
+    auto findCard = []() -> HWND {
+        HWND result = nullptr;
+        EnumWindows([](HWND hwnd, LPARAM lp) -> BOOL {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(hwnd, &pid);
+            if (pid != GetCurrentProcessId()) return TRUE;
+            wchar_t name[64]{};
+            if (GetClassNameW(hwnd, name, 64) == 0) return TRUE;
+            if (wcscmp(name, L"RshellMcpApprovalCard") != 0) return TRUE;
+            *reinterpret_cast<HWND*>(lp) = hwnd;
+            return FALSE;
+        }, reinterpret_cast<LPARAM>(&result));
+        return result;
+    };
+
+    auto runOnce = [&](bool allow, const char* what) {
+        ai::ToolRequestInfo info;
+        info.name = "run_command";
+        info.summary = "执行命令：set -e";
+        info.detail = "set -e\nsed -i 's/info/warn/' /etc/systemd/system/easytier-relay.service\nrm -rf /tmp/x";
+        info.dangerous = false;
+
+        bool approved = !allow;
+        std::atomic<bool> finished{false};
+        std::thread waiter([&] {
+            approved = approveMcpOperation(info, "8.148.6.178", "降低服务日志级别");
+            finished.store(true);
+        });
+
+        MSG msg;
+        HWND card = nullptr;
+        const ULONGLONG deadline = GetTickCount64() + 3000;
+        while (!card && GetTickCount64() < deadline) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            card = findCard();
+            if (!card) Sleep(10);
+        }
+        check(card != nullptr, what);
+        if (card) {
+            check(IsWindowVisible(card), "MCP approval card is visible");
+            check(IsWindowVisible(g_app.main),
+                  "MCP approval restores the main window when it was hidden");
+            check(IsWindowEnabled(g_app.main),
+                  "MCP approval card does not disable the main window");
+            check((GetWindowLongPtrW(card, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0,
+                  "MCP approval card floats above the main window");
+            RECT rc{};
+            GetClientRect(card, &rc);
+            const McpCardButtons buttons = mcpCardButtons(rc);
+            const RECT& target = allow ? buttons.allow : buttons.deny;
+            PostMessageW(card, WM_LBUTTONUP, 0,
+                         MAKELPARAM((target.left + target.right) / 2,
+                                    (target.top + target.bottom) / 2));
+        }
+
+        const ULONGLONG closeDeadline = GetTickCount64() + 3000;
+        while (!finished.load() && GetTickCount64() < closeDeadline) {
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+            Sleep(10);
+        }
+        if (waiter.joinable()) waiter.join();
+        check(finished.load(), "MCP approval click unblocks the waiting caller");
+        check(approved == allow, allow ? "allow click is reported back"
+                                       : "deny click is reported back");
+        check(findCard() == nullptr, "MCP approval card closes after the click");
+        check(IsWindowEnabled(g_app.main), "main window stays enabled after approval");
+    };
+
+    runOnce(false, "MCP approval card is created for deny");
+    runOnce(true, "MCP approval card is created for allow");
+    if (!mainWasVisible) ShowWindow(g_app.main, SW_HIDE);
+}
+
 // 后台触发的模态框：owner 是隐藏/最小化窗口时，对话框也必须落在可见工作区，
 // 关闭后 owner 必须恢复可用。dialog 在测试线程上跑（和真实调用一致），
 // 由旁路线程观察并关掉它。
@@ -3365,6 +3447,7 @@ int main(int argc, char** argv) {
         terminalDockReflowRegression();
         windowPlacementRegression();
         dialogPlacementRegression();
+        mcpApprovalCardRegression();
         buttonAndConnectionAnimationRegression();
         aiOpenAnimationRegression();
         mainPartialPaintRegression();

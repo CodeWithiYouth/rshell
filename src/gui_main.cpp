@@ -27,14 +27,17 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cwchar>
+#include <deque>
 #include <fstream>
 #include <iterator>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -84,7 +87,7 @@ enum : UINT {
     WM_FS_CONFLICT = WM_APP + 11,
     WM_SHELL_FLUSH = WM_APP + 12, // One pending notification per connection.
     WM_MCP_RESOLVE_HOST = WM_APP + 13,  // lParam = McpResolveRequest*（HTTP 线程同步等待）
-    WM_MCP_APPROVE = WM_APP + 14,       // lParam = McpApprovalRequest*（HTTP 线程同步等待）
+    WM_MCP_APPROVE = WM_APP + 14,       // lParam = McpApprovalPayload*（悬浮审批卡）
 };
 
 // 目录跟随分三步执行，每步由远端私有 OSC 确认；定时器只负责静默等待和超时。
@@ -3772,6 +3775,8 @@ struct MessageState {
     int result = -1;
     int hover = -1;
     int focus = 0;
+    int textHeight = 0;    // 正文实际占用的高度
+    int detailHeight = 0;  // 详情框实际高度（0 = 没有详情）
 };
 
 MessageState g_message;
@@ -3782,13 +3787,15 @@ constexpr int kMsgBtnGap = 10;
 constexpr int kMsgPad = 22;
 
 RECT msgTextRect(const RECT& rc) {
-    return RECT{dp(kMsgPad) + dp(46), dp(54), rc.right - dp(kMsgPad), rc.bottom - dp(80)};
+    const int height = g_message.textHeight > 0 ? g_message.textHeight : dp(22);
+    return RECT{dp(kMsgPad) + dp(46), dp(54), rc.right - dp(kMsgPad), dp(54) + height};
 }
 
 RECT msgDetailRect(const RECT& rc) {
     RECT text = msgTextRect(rc);
-    const int textH = std::max<int>(dp(24), (text.bottom - text.top) / 2);
-    return RECT{text.left, text.top + textH + dp(8), text.right, text.bottom};
+    const int top = text.bottom + dp(10);
+    const int height = std::max<int>(dp(28), g_message.detailHeight);
+    return RECT{text.left, top, text.right, top + height};
 }
 
 std::vector<RECT> msgButtonRects(const RECT& rc, int count) {
@@ -3971,13 +3978,15 @@ int showMessage(const MessageSpec& spec) {
     }
     const int textHeight = std::max<int>(dp(22), calcText.bottom);
 
+    int detailHeight = 0;
     int height = dp(54) + textHeight + dp(80);
     if (!spec.detail.empty()) {
         RECT calcDetail{0, 0, width - dp(kMsgPad) * 2 - dp(66), 0};
         SelectObject(dc, g_app.font);
         DrawTextW(dc, spec.detail.c_str(), static_cast<int>(spec.detail.size()), &calcDetail,
                   DT_LEFT | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX);
-        height += std::max<int>(dp(28), calcDetail.bottom) + dp(30);
+        detailHeight = std::max<int>(dp(28), calcDetail.bottom);
+        height += detailHeight + dp(10);
     }
     SelectObject(dc, oldFont);
     ReleaseDC(g_app.main ? g_app.main : nullptr, dc);
@@ -3985,6 +3994,8 @@ int showMessage(const MessageSpec& spec) {
     g_message = MessageState();
     g_message.spec = spec;
     g_message.focus = spec.defaultIndex;
+    g_message.textHeight = textHeight;
+    g_message.detailHeight = detailHeight;
 
     HWND dlg = createDialogWindow(L"RshellMessageDialog", spec.title, width, height);
     if (!dlg) return -1;
@@ -10440,36 +10451,395 @@ bool resolveMcpHost(const std::string& host, McpHostBinding& binding, std::strin
     return false;
 }
 
-// 高风险操作（删除、重启服务、写系统目录等）走和 AI 面板同一套规则，
-// 这里用宿主已有的自绘确认框，由用户点「允许执行 / 拒绝」。
-struct McpApprovalRequest {
-    std::wstring summary;
-    std::wstring detail;
-    std::wstring host;
-    std::wstring intent;
-    bool dangerous = false;
+// 高风险操作（删除、重启服务、写系统目录等）走和 AI 面板同一套规则。
+// 这里不用模态框：审批卡悬浮在最上层，不抢焦点、不禁用主窗口，用户可以
+// 继续操作 rshell；MCP 的 HTTP 线程在条件变量上等待点击结果。
+struct McpApprovalWait {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool decided = false;
     bool approved = false;
 };
+
+struct McpApprovalPayload {
+    ai::ToolRequestInfo info;
+    std::string hostLabel;
+    std::string intent;
+    std::shared_ptr<McpApprovalWait> wait;
+};
+
+struct McpApprovalCard {
+    McpApprovalPayload* payload = nullptr;
+    HWND window = nullptr;
+    HWND command = nullptr;
+    std::wstring title;
+    std::wstring subtitle;
+    std::wstring header;
+    std::wstring body;
+    int headerHeight = 0;
+    int hover = -1;  // 0=允许 1=拒绝
+    bool finished = false;
+};
+
+std::deque<McpApprovalPayload*> g_mcpApprovalQueue;
+McpApprovalCard* g_mcpApprovalCard = nullptr;
+
+void resolveMcpApproval(McpApprovalPayload* payload, bool approved) {
+    if (!payload) return;
+    {
+        std::lock_guard<std::mutex> lock(payload->wait->mutex);
+        payload->wait->decided = true;
+        payload->wait->approved = approved;
+    }
+    payload->wait->cv.notify_all();
+    delete payload;
+}
+
+LRESULT CALLBACK mcpApprovalCardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+void layoutMcpApprovalCard(McpApprovalCard* state);
+
+void finishMcpApprovalCard(bool approved) {
+    McpApprovalCard* state = g_mcpApprovalCard;
+    if (!state || state->finished) return;
+    state->finished = true;
+    McpApprovalPayload* payload = state->payload;
+    state->payload = nullptr;
+    resolveMcpApproval(payload, approved);
+    if (state->window && IsWindow(state->window)) DestroyWindow(state->window);
+}
+
+struct McpCardButtons {
+    RECT allow;
+    RECT deny;
+};
+
+McpCardButtons mcpCardButtons(const RECT& rc) {
+    const int w = dp(96);
+    const int h = dp(32);
+    const int gap = dp(10);
+    const int margin = dp(20);
+    const int y = rc.bottom - margin - h;
+    McpCardButtons buttons;
+    buttons.deny = RECT{rc.right - margin - w, y, rc.right - margin, y + h};
+    buttons.allow = RECT{buttons.deny.left - gap - w, y, buttons.deny.left - gap, y + h};
+    return buttons;
+}
+
+bool mcpCardFollowsMain() {
+    return g_app.main && IsWindow(g_app.main) && IsWindowVisible(g_app.main) &&
+           !IsIconic(g_app.main);
+}
+
+// 后台请求到达时如果主窗口最小化/隐藏，先把它恢复出来，再把卡片贴到右上角。
+// 这里不额外调用 SetForegroundWindow：卡片本身置顶，主窗口恢复后用户能看到。
+void ensureMainWindowForApproval() {
+    if (!g_app.main || !IsWindow(g_app.main)) return;
+    if (IsIconic(g_app.main)) {
+        ShowWindow(g_app.main, SW_RESTORE);
+    } else if (!IsWindowVisible(g_app.main)) {
+        ShowWindow(g_app.main, SW_SHOW);
+    }
+}
+
+RECT mcpApprovalWorkArea(bool followMain) {
+    POINT cursor{};
+    GetCursorPos(&cursor);
+    const HMONITOR monitor = followMain
+                                 ? MonitorFromWindow(g_app.main, MONITOR_DEFAULTTONEAREST)
+                                 : MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    RECT work{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    if (GetMonitorInfoW(monitor, &info)) work = info.rcWork;
+    return work;
+}
+
+// 卡片贴在主窗口右上角（标题栏下方）；主窗口不在时退回鼠标所在显示器的右上角。
+void mcpApprovalTarget(int width, int height, bool followMain, int& x, int& y, RECT& work) {
+    work = mcpApprovalWorkArea(followMain);
+    RECT anchor{};
+    if (followMain && GetWindowRect(g_app.main, &anchor)) {
+        x = std::min<int>(anchor.right, work.right) - width - dp(24);
+        y = std::max<int>(anchor.top, work.top) + dp(64);
+    } else {
+        x = static_cast<int>(work.right) - width - dp(24);
+        y = static_cast<int>(work.top) + dp(64);
+    }
+    x = std::clamp(x, static_cast<int>(work.left), static_cast<int>(work.right) - width);
+    y = std::clamp(y, static_cast<int>(work.top), static_cast<int>(work.bottom) - height);
+}
+
+void positionActiveMcpApprovalCard() {
+    McpApprovalCard* state = g_mcpApprovalCard;
+    if (!state || !state->window || !IsWindow(state->window)) return;
+    RECT rc{};
+    GetWindowRect(state->window, &rc);
+    int x = 0;
+    int y = 0;
+    RECT work{};
+    mcpApprovalTarget(rc.right - rc.left, rc.bottom - rc.top, mcpCardFollowsMain(), x, y, work);
+    SetWindowPos(state->window, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+}
+
+void paintMcpApprovalCardContent(HDC dc, HWND hwnd) {
+    auto* state = reinterpret_cast<McpApprovalCard*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (!state) return;
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    RECT textRc{dp(20), dp(56), rc.right - dp(20), dp(56) + state->headerHeight};
+    drawText(dc, state->header, textRc, ui::text, g_app.uiFont,
+             DT_LEFT | DT_TOP | DT_WORDBREAK);
+    const McpCardButtons buttons = mcpCardButtons(rc);
+    paintButton(dc, buttons.allow, L"允许执行", false, state->hover == 0, false, false, true);
+    paintButton(dc, buttons.deny, L"拒绝", true, state->hover == 1, false, false, true);
+}
+
+void paintMcpApprovalCard(HWND hwnd) {
+    auto* state = reinterpret_cast<McpApprovalCard*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (!state) return;
+    dlg::paintDialog(hwnd, state->title, state->subtitle, [&](HDC dc) {
+        paintMcpApprovalCardContent(dc, hwnd);
+    });
+}
+
+void layoutMcpApprovalCard(McpApprovalCard* state) {
+    if (!state || !state->window || !state->command) return;
+    RECT rc;
+    GetClientRect(state->window, &rc);
+    const int left = dp(20);
+    const int right = rc.right - dp(20);
+    const int top = dp(56) + state->headerHeight + dp(10);
+    const int bottom =
+        std::max<int>(top + dp(48), static_cast<int>(rc.bottom) - dp(64));
+    MoveWindow(state->command, left, top, std::max(dp(40), right - left), bottom - top, TRUE);
+}
+
+// 卡片不是模态的，也不设 owner：主窗口最小化时它仍然能显示在桌面上。
+void showMcpApprovalCard(McpApprovalPayload* payload) {
+    if (!payload) return;
+    if (g_mcpApprovalCard) {
+        g_mcpApprovalQueue.push_back(payload);
+        return;
+    }
+
+    // 主窗口最小化/隐藏时先把界面恢复出来，否则用户只能看到一个孤立的审批卡。
+    ensureMainWindowForApproval();
+
+    static bool registered = false;
+    if (!registered) {
+        WNDCLASSEXW wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpfnWndProc = mcpApprovalCardProc;
+        wc.hInstance = g_app.inst;
+        wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+        wc.hbrBackground = nullptr;
+        wc.lpszClassName = L"RshellMcpApprovalCard";
+        wc.style = CS_DROPSHADOW;
+        RegisterClassExW(&wc);
+        registered = true;
+    }
+
+    auto* state = new McpApprovalCard();
+    state->payload = payload;
+    state->title = payload->info.dangerous ? L"MCP 危险操作确认" : L"MCP 高危操作确认";
+    state->subtitle = L"确认后才会发送到远端";
+
+    const std::wstring host =
+        payload->hostLabel.empty() ? std::wstring(L"当前会话") : toWide(payload->hostLabel);
+    state->header = L"目标主机：" + host;
+    if (!payload->intent.empty()) {
+        bool intentTruncated = false;
+        const std::string intent = ai::truncateUtf8(payload->intent, 200, intentTruncated);
+        state->header += L"\n操作意图：" + toWide(intent + (intentTruncated ? "…" : ""));
+    }
+    // run_command 的 detail 就是完整命令，不再重复显示「执行命令：首行」。
+    // write_file 才需要 path/大小这种摘要。
+    if (payload->info.name == "write_file") {
+        state->header += L"\n" + toWide(payload->info.summary);
+    }
+    state->header += L"\n外部 MCP 客户端请求执行以下操作：";
+    // 只读 EDIT 只认 CRLF；命令里的 LF 直接塞进去会被拼成一行。
+    {
+        const std::wstring wide = toWide(payload->info.detail);
+        state->body.reserve(wide.size() + wide.size() / 16 + 8);
+        for (wchar_t ch : wide) {
+            if (ch == L'\n' && (state->body.empty() || state->body.back() != L'\r')) {
+                state->body.push_back(L'\r');
+            }
+            state->body.push_back(ch);
+        }
+    }
+
+    const bool followMain = mcpCardFollowsMain();
+    const RECT work = mcpApprovalWorkArea(followMain);
+    const int width = dp(560);
+    const int clampedWidth =
+        std::min(width, static_cast<int>(work.right - work.left) - dp(24));
+
+    const int textWidthPx = clampedWidth - dp(40);
+    HDC dc = GetDC(g_app.main);
+    HFONT font = g_app.uiFont ? g_app.uiFont : g_app.font;
+    RECT calc{0, 0, textWidthPx, 0};
+    HGDIOBJ oldFont = SelectObject(dc, font);
+    DrawTextW(dc, state->header.c_str(), static_cast<int>(state->header.size()), &calc,
+              DT_LEFT | DT_WORDBREAK | DT_CALCRECT | DT_NOPREFIX);
+    SelectObject(dc, oldFont);
+    ReleaseDC(g_app.main, dc);
+    state->headerHeight = std::min<int>(std::max<int>(dp(22), calc.bottom), dp(170));
+
+    int height = std::max(dp(360), dp(56) + state->headerHeight + dp(170));
+    height = std::min(height, dp(560));
+    height = std::min(height, static_cast<int>(work.bottom - work.top) - dp(24));
+    int x = 0;
+    int y = 0;
+    RECT placedWork{};
+    mcpApprovalTarget(clampedWidth, height, followMain, x, y, placedWork);
+
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                                L"RshellMcpApprovalCard", state->title.c_str(),
+                                WS_POPUP | WS_CLIPSIBLINGS | WS_CLIPCHILDREN, x, y,
+                                clampedWidth, height, nullptr, nullptr, g_app.inst, state);
+    if (!hwnd) {
+        resolveMcpApproval(payload, false);
+        delete state;
+        return;
+    }
+    g_mcpApprovalCard = state;
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+}
+
+void cancelPendingMcpApprovals() {
+    for (McpApprovalPayload* payload : g_mcpApprovalQueue) resolveMcpApproval(payload, false);
+    g_mcpApprovalQueue.clear();
+    if (g_mcpApprovalCard) finishMcpApprovalCard(false);
+}
 
 bool approveMcpOperation(const ai::ToolRequestInfo& info, const std::string& hostLabel,
                          const std::string& intent) {
     if (!g_app.main) return false;
-    McpApprovalRequest request;
-    request.summary = toWide(info.summary);
-    // 命令/文件预览可能很长：对话框只展示前 1500 字节，避免撑出屏幕。
-    bool truncated = false;
-    const std::string detail = ai::truncateUtf8(info.detail, 1500, truncated);
-    request.detail = toWide(detail + (truncated ? "\n……（内容已截断）" : ""));
-    request.dangerous = info.dangerous;
-    request.host = hostLabel.empty() ? L"当前会话" : toWide(hostLabel);
-    if (!intent.empty()) {
-        bool intentTruncated = false;
-        request.intent = toWide(ai::truncateUtf8(intent, 240, intentTruncated) +
-                                (intentTruncated ? "…" : ""));
+    auto wait = std::make_shared<McpApprovalWait>();
+    auto* payload = new McpApprovalPayload{info, hostLabel, intent, wait};
+    if (!PostMessageW(g_app.main, WM_MCP_APPROVE, 0, reinterpret_cast<LPARAM>(payload))) {
+        delete payload;
+        return false;
     }
-    const LRESULT handled =
-        SendMessageW(g_app.main, WM_MCP_APPROVE, 0, reinterpret_cast<LPARAM>(&request));
-    return handled != 0 && request.approved;
+    std::unique_lock<std::mutex> lock(wait->mutex);
+    wait->cv.wait(lock, [&wait]() { return wait->decided; });
+    return wait->approved;
+}
+
+LRESULT CALLBACK mcpApprovalCardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    auto* state = reinterpret_cast<McpApprovalCard*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+
+    if (msg == WM_CTLCOLOREDIT || msg == WM_CTLCOLORSTATIC) {
+        HDC dc = reinterpret_cast<HDC>(wp);
+        SetTextColor(dc, toColorRef(ui::text));
+        SetBkColor(dc, toColorRef(bgInput));
+        return reinterpret_cast<LRESULT>(editBrush());
+    }
+
+    switch (msg) {
+        case WM_CREATE: {
+            const auto* create = reinterpret_cast<CREATESTRUCTW*>(lp);
+            state = reinterpret_cast<McpApprovalCard*>(create->lpCreateParams);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+            state->window = hwnd;
+            state->command = CreateWindowExW(
+                0, L"EDIT", L"",
+                WS_CHILD | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_READONLY |
+                    ES_AUTOVSCROLL | ES_NOHIDESEL,
+                0, 0, 10, 10, hwnd, nullptr, g_app.inst, nullptr);
+            if (state->command) {
+                SendMessageW(state->command, WM_SETFONT,
+                             reinterpret_cast<WPARAM>(g_app.font ? g_app.font : g_app.uiFont),
+                             TRUE);
+                SetWindowTextW(state->command, state->body.c_str());
+            }
+            layoutMcpApprovalCard(state);
+            return 0;
+        }
+        case WM_SIZE:
+            layoutMcpApprovalCard(state);
+            return 0;
+        case WM_PAINT:
+            paintMcpApprovalCard(hwnd);
+            return 0;
+        case WM_PRINTCLIENT: {
+            HDC dc = reinterpret_cast<HDC>(wp);
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            fillRect(dc, rc, bgCard);
+            paintFrame(dc, rc, state ? state->title : std::wstring(),
+                       state ? state->subtitle : std::wstring(), g_closeHover[hwnd]);
+            paintMcpApprovalCardContent(dc, hwnd);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_MOUSEMOVE: {
+            if (!state) return 0;
+            trackCloseHover(hwnd, GET_X_LPARAM(lp), GET_Y_LPARAM(lp));
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            const McpCardButtons buttons = mcpCardButtons(rc);
+            const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            const int hover = PtInRect(&buttons.allow, pt) ? 0
+                              : (PtInRect(&buttons.deny, pt) ? 1 : -1);
+            if (hover != state->hover) {
+                state->hover = hover;
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            return 0;
+        }
+        case WM_LBUTTONUP: {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            const POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            if (isOnCloseButton(hwnd, pt)) {
+                finishMcpApprovalCard(false);
+                return 0;
+            }
+            const McpCardButtons buttons = mcpCardButtons(rc);
+            if (PtInRect(&buttons.deny, pt)) {
+                finishMcpApprovalCard(false);
+                return 0;
+            }
+            if (PtInRect(&buttons.allow, pt)) {
+                finishMcpApprovalCard(true);
+                return 0;
+            }
+            return 0;
+        }
+        case WM_NCHITTEST: {
+            POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ScreenToClient(hwnd, &pt);
+            if (isOnCloseButton(hwnd, pt)) return HTCLIENT;
+            if (pt.y < dp(50)) return HTCAPTION;
+            return HTCLIENT;
+        }
+        case WM_CLOSE:
+            finishMcpApprovalCard(false);
+            return 0;
+        case WM_NCDESTROY: {
+            if (state) {
+                // 系统直接销毁（退出、桌面切换）时按拒绝处理，别让 HTTP 线程悬着。
+                resolveMcpApproval(state->payload, false);
+                state->payload = nullptr;
+                if (g_mcpApprovalCard == state) g_mcpApprovalCard = nullptr;
+                delete state;
+            }
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            if (!g_mcpApprovalQueue.empty()) {
+                McpApprovalPayload* next = g_mcpApprovalQueue.front();
+                g_mcpApprovalQueue.pop_front();
+                PostMessageW(g_app.main, WM_MCP_APPROVE, 0, reinterpret_cast<LPARAM>(next));
+            }
+            return 0;
+        }
+        default:
+            break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 std::wstring mcpClientInfo() {
@@ -10487,6 +10857,7 @@ std::wstring mcpClientInfo() {
 // 失败时可以直接弹提示；启动阶段只写状态栏，不打扰用户。
 void applyMcpSettings(bool interactive = false) {
     if (!g_app.mcpEnabled) {
+        cancelPendingMcpApprovals();
         if (g_app.mcpServer && g_app.mcpServer->running()) {
             g_app.mcpServer->stop();
             setStatus(L"MCP 服务已关闭");
@@ -10538,6 +10909,7 @@ void toggleMcpPermission(bool& flag) {
     flag = !flag;
     // 权限在启动时读入工具列表，改动后要重开监听才会生效。
     if (g_app.mcpEnabled) {
+        cancelPendingMcpApprovals();
         if (g_app.mcpServer) g_app.mcpServer->stop();
         applyMcpSettings(false);
     }
@@ -11253,7 +11625,11 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.aiTab->setHostVisible(wp != SIZE_MINIMIZED && IsWindowVisible(hwnd));
             }
             layoutMain(hwnd);
+            positionActiveMcpApprovalCard();
             return 0;
+        case WM_MOVE:
+            positionActiveMcpApprovalCard();
+            break;
         case WM_SHOWWINDOW:
             if (g_app.aiTab) g_app.aiTab->setHostVisible(wp && !IsIconic(hwnd));
             if (!wp) {
@@ -11775,24 +12151,14 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         }
         case WM_MCP_APPROVE: {
-            auto* request = reinterpret_cast<McpApprovalRequest*>(lp);
-            if (!request) return 0;
+            auto* payload = reinterpret_cast<McpApprovalPayload*>(lp);
+            if (!payload) return 0;
             if (g_applicationClosing.load()) {
-                request->approved = false;
+                resolveMcpApproval(payload, false);
                 return 0;
             }
-            MessageSpec spec;
-            spec.kind = 3;
-            spec.title = request->dangerous ? L"MCP 危险操作确认" : L"MCP 高危操作确认";
-            std::wstring text = L"目标主机：" + request->host + L"\n";
-            if (!request->intent.empty()) text += L"操作意图：" + request->intent + L"\n";
-            text += L"外部 MCP 客户端请求执行以下操作：\n\n" + request->summary;
-            spec.text = std::move(text);
-            spec.detail = request->detail;
-            spec.buttons = {L"允许执行", L"拒绝"};
-            spec.defaultIndex = 1;  // 默认停在「拒绝」，避免误按回车放行
-            request->approved = showMessage(spec) == 0;
-            return 1;
+            showMcpApprovalCard(payload);
+            return 0;
         }
         case WM_MCP_RESOLVE_HOST: {
             auto* request = reinterpret_cast<McpResolveRequest*>(lp);
@@ -11839,6 +12205,7 @@ LRESULT CALLBACK mainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_DESTROY:
             saveUiLayout();  // 退出前记住窗口位置/尺寸和分栏宽度
+            cancelPendingMcpApprovals();
             if (g_app.mcpServer) {
                 g_app.mcpServer->stop();
                 g_app.mcpServer.reset();

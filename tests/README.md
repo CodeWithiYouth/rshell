@@ -9,7 +9,7 @@
 | 单元测试 | `rshell_tests.exe`（或 `.\build.ps1 -Test`） | 无 | 路径/通配符/配置解析/进度与格式化、终端模拟器（VT 解析）等纯逻辑 |
 | GUI 多标签回归 | `rshell_gui_tabs_probe.exe`（包含在 `.\build.ps1 -Test` 中） | Windows，无需 SSH | 隐藏窗口中的标签切换、后台事件分发、SFTP/传输状态隔离、关闭清理、DPI 与溢出布局；按钮/连接动画结束停计时、局部重绘像素一致、AI 滑入期间终端不重排 |
 | 远端任务取消 | `rshell_remote_cancel_probe.exe`（包含在 `.\build.ps1 -Test` 中） | Windows，无需 SSH | 跨线程取消作用域、排队任务撤销及取消状态隔离 |
-| 内置 MCP 服务 | `rshell_mcp_probe.exe`（包含在 `.\build.ps1 -Test` 中） | Windows，无需 SSH | 回环 HTTP 握手、工具列表、读写/命令权限开关、`intent` 必填、高风险审批与主机名、Bearer 认证、未知会话与方法限制 |
+| 内置 MCP 服务 | `rshell_mcp_probe.exe`（包含在 `.\build.ps1 -Test` 中） | Windows，无需 SSH | 回环 HTTP 握手、工具列表、读写/命令权限开关、`intent` 必填、高风险悬浮审批卡（非模态/置顶/允许与拒绝回传）、Bearer 认证、未知会话与方法限制 |
 | 传输停滞与 AI 工具停止 | `python tests/remote_cancel_e2e.py --exe build\modern\rshell_remote_cancel_probe.exe` | Python 3.9+、`paramiko` | 暂停 SFTP 读写、空闲超时、块间取消后复用及 AI 命令停止 |
 | 传输期间交互 | `python tests/transfer_interaction_e2e.py --exe build\modern\rshell_transfer_interaction_probe.exe`（另加 `--tight-window` 跑压力模式） | Python 3.9+、`paramiko` | 限速上传/下载时浏览、读文件、执行命令和采样，传输 FIFO、取消隔离、续传、目录树、SHA-256 与单连接验证 |
 | 自更新助手 | `python tests/update_helper_e2e.py --gui build\modern\rshell-gui.exe --fixture build\modern\rshell_update_fixture.exe`（也包含在 `.\build.ps1 -Test` 中） | Windows、Python 3 | 临时副本替换、等待旧进程退出、重新启动和非法参数；不触碰正在使用的程序 |

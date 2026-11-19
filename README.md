@@ -8,10 +8,10 @@ rshell 是一款 Windows SSH 客户端，也可以在命令行使用。连接远
 
 **Windows 10/11，64 位，按需下载：**
 
-- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.5/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
-- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.5/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
+- **[桌面版 rshell-gui.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.6/rshell-gui.exe)**：包含 SSH 终端、会话管理和 SFTP 文件面板，大多数用户选这个。
+- **[命令行版 rshell.exe](https://github.com/CodeWithiYouth/rshell/releases/download/v1.3.6/rshell.exe)**：在 PowerShell / CMD 或脚本中使用。
 
-两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.3.5 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.3.5)。
+两个程序可独立运行，下载需要的一个即可，无需解压或安装。SHA-256 校验值见 [v1.3.6 发布说明](https://github.com/CodeWithiYouth/rshell/releases/tag/v1.3.6)。
 
 > Windows 7 SP1 有兼容构建方式，但当前下载包面向 Windows 10/11。详见[高级构建说明](docs/TECHNICAL.md)。
 
@@ -92,7 +92,7 @@ rshell-gui 运行期间可以把**已经连上的会话**暴露成一个 MCP 服
 
    `host` 参数留空使用当前激活标签；填会话名可操作其它已打开的标签。
 
-   **审批规则和 AI 面板共用一份**：普通命令、普通路径写入直接执行；`rm`、`systemctl restart`、`mkfs`、写 `/etc` 或 `~/.ssh` 等命中高风险规则的请求，会在 rshell 里弹出「允许执行 / 拒绝」确认框（默认停在「拒绝」）。确认框会写明**目标主机、操作意图**和完整命令；没有人点确认就不会执行，点允许后也会锁定当时的会话，中途切换标签不会把命令发到别的机器。
+   **审批规则和 AI 面板共用一份**：普通命令、普通路径写入直接执行；`rm`、`systemctl restart`、`mkfs`、写 `/etc` 或 `~/.ssh` 等命中高风险规则的请求，会弹出**悬浮审批卡**（贴在 rshell 主窗口右上角，窗口移动/缩放时跟随；主窗口最小化或隐藏时会先自动恢复显示）。不抢焦点、不禁用主窗口，可以继续操作。卡片写明目标主机、操作意图和完整命令（命令较长时可滚动），默认高亮「拒绝」；没有人点确认就不会执行，点允许后也会锁定当时的会话，中途切换标签不会把命令发到别的机器。
 
 4. 客户端配置示例（把地址和 token 换成 rshell 显示的）：
 
